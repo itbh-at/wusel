@@ -1,0 +1,34 @@
+[package]
+name = "wusel-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+# wusel-desktop is the **Linux** OS-integration backend behind `wusel_core::desktop::Desktop`:
+# freedesktop notifications (zbus) now, and the file-manager cloud-provider
+# status (libcloudproviders / zbus) as it grows. It is a swappable module — macOS
+# (File Provider) and Windows (Cloud Filter) would be their own crates. The daemon
+# injects it via `Provider::set_desktop`; on any other platform, or when D-Bus is
+# absent, nothing here is used and the engine keeps the no-op default.
+
+[lib]
+name = "wusel_desktop"
+path = "src/lib.rs"
+
+[dependencies]
+wusel-core = { path = "../wusel-core" }
+tracing.workspace = true
+
+# The desktop backend is Linux-only (freedesktop D-Bus); elsewhere the crate is an
+# empty stub so `cargo build` stays clean without pulling any D-Bus deps.
+#
+# We talk D-Bus directly via `zbus` — one method call for notifications
+# (`org.freedesktop.Notifications.Notify`), and an exported object for the file
+# manager (`org.freedesktop.CloudProviders`). Version 4 to match the `zbus` the
+# keyring backend already pulls, so there is exactly one zbus in the build (a
+# higher-level notification crate would have dragged in a *second* zbus stack).
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = "4"

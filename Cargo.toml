@@ -1,0 +1,60 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/wusel-core",
+    "crates/wusel-fuse",
+    "crates/wusel-desktop",
+    "crates/wusel",
+    "crates/wusel-mock",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.97"
+license = "Apache-2.0"
+authors = ["Christoph D. Hermann <christoph.hermann@itbh.at>"]
+repository = "https://github.com/itbh-at/wusel"
+
+# Shared dependency versions for all crates in one place.
+[workspace.dependencies]
+# Not "full": only what the workspace actually calls (dependency minimalism).
+# rt-multi-thread — Runtime::new / #[tokio::main] / multi_thread test runtimes;
+# macros — #[tokio::main] / #[tokio::test]; net — TcpListener/TcpStream (mock,
+# in-process test servers); io-util — AsyncReadExt/AsyncWriteExt; time — sleep
+# backoffs. Crates like reqwest/tokio-rustls enable their own tokio features.
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "io-util",
+    "time",
+] }
+reqwest = { version = "0.12", default-features = false, features = [
+    # Native OS trust store (what browsers/curl use) — the right default for
+    # self-hosters who add their CA there. Custom CAs and an insecure override
+    # are layered on per client; see wusel_core::tls.
+    "rustls-tls-native-roots",
+    "json",
+    "stream",
+] }
+# WebSocket over the same reqwest client — one HTTP/TLS stack for everything
+# (WebDAV, OCS, Login, notify_push), so TLS is configured in exactly one place.
+reqwest-websocket = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+quick-xml = { version = "0.36", features = ["serialize"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+url = "2"
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bytes = "1"
+futures = "0.3"
+# 3-way text merge for the optional conflict auto-merge (opt-in at mount).
+# A small, purpose-built crate — hand-rolling a correct 3-way merge is not worth it.
+diffy = "0.4"
+
+[profile.release]
+lto = "thin"

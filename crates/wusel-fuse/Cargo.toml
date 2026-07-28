@@ -1,0 +1,35 @@
+[package]
+name = "wusel-fuse"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+# wusel-fuse is the FUSE frontend as a LIBRARY (no binary of its own anymore).
+# The daemon `wusel` pulls it in. FUSE needs the Linux kernel driver (libfuse3),
+# so this frontend is Linux-only; the `fuser` dependency is pulled in only there.
+
+[lib]
+name = "wusel_fuse"
+path = "src/lib.rs"
+
+[dependencies]
+wusel-core = { path = "../wusel-core" }
+anyhow.workspace = true
+tracing.workspace = true
+
+# `abi-7-12` enables the kernel-notification API (`Session::notifier`,
+# `Notifier::inval_entry`) used to push server-side add/removes into the kernel's
+# cache. ABI 7.12 is ancient (Linux 2.6.31) — supported everywhere we run.
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser = { version = "0.14", features = ["abi-7-12"] }
+libc = "0.2"
+
+# The mount end-to-end test drives a real FUSE mount against the in-process
+# wusel-mock server. It runs only on Linux with /dev/fuse (the podman container).
+[dev-dependencies]
+wusel-mock = { path = "../wusel-mock" }
+reqwest = { workspace = true }
+tokio = { workspace = true }

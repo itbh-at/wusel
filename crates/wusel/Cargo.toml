@@ -1,0 +1,33 @@
+[package]
+name = "wusel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+# wusel is the daemon/CLI binary — the actual product. It ties the engine
+# (wusel-core) and the OS frontends together.
+
+[[bin]]
+name = "wusel"
+path = "src/main.rs"
+
+[features]
+# Without this feature wusel builds as pure CLI/core (e.g. on macOS, or for
+# quick checks). With `--features fuse` the FUSE frontend (Linux) is added.
+# `dep:wusel-fuse` activates the optional dependency.
+default = []
+fuse = ["dep:wusel-fuse"]
+
+[dependencies]
+wusel-core = { path = "../wusel-core" }
+wusel-fuse = { path = "../wusel-fuse", optional = true }
+wusel-desktop = { path = "../wusel-desktop" }
+clap = { version = "4", features = ["derive"] }
+reqwest.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

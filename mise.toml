@@ -1,0 +1,104 @@
+# mise: single source of truth for all toolchains of this project.
+# The same file is read by the macOS host AND the Linux test container,
+# so that the Rust version is exactly identical everywhere.
+#
+#   mise install        # installs the tools pinned below
+#   mise run check       # cargo check (host: wusel-core + wusel without mount)
+#   mise run test        # cargo test (host, natively on macOS)
+#   mise run fuse-build  # build wusel with FUSE in the Linux container (podman)
+#   mise run fuse-shell  # interactive Linux shell with /dev/fuse for mounting
+
+[tools]
+rust = { version = "1.97.1", components = "rustfmt,clippy" }  # components explicit: fresh installs (CI) omit them otherwise
+node = "24"                # runtime for the Antora docs (documentation/build.sh)
+"npm:antora" = "3.1.15"    # the `antora` CLI itself — mise manages npm CLIs via the npm backend
+watchexec = "2.5.1"        # file-event watcher for `build.sh watch` (no busy-waiting)
+"npm:browser-sync" = "3.0.4"  # live-preview server for `build.sh watch` (serve + open browser + reload)
+"ubi:korandoru/hawkeye" = "6.5.1"  # license-header tool (like spotless); see licenserc.toml
+"ubi:terrastruct/d2" = "0.7.1"     # diagram renderer (local binary, no server); see mise run docs-diagrams
+
+[env]
+RUST_BACKTRACE = "1"
+
+# --- Host tasks (macOS, fast) -----------------------------------------------
+# wusel-fuse is excluded because it pulls in fuser (libfuse3) — that can only be
+# built with the Linux driver installed. wusel builds without the `mount`
+# feature as pure CLI/core and is therefore fully checkable here.
+
+[tasks.check]
+description = "cargo check (wusel-core + wusel without mount)"
+run = "cargo check --workspace --exclude wusel-fuse"
+
+[tasks.test]
+description = "cargo test (natively on macOS)"
+run = "cargo test --workspace --exclude wusel-fuse"
+
+[tasks.fmt]
+description = "Format the code"
+run = "cargo fmt --all"
+
+[tasks.fmt-check]
+description = "Check formatting without changing files (for CI)"
+run = "cargo fmt --all -- --check"
+
+[tasks.headers]
+description = "Apply the Apache-2.0 SPDX license headers (hawkeye)"
+run = "hawkeye format"
+
+[tasks.headers-check]
+description = "Check that all files carry the license header (for CI)"
+run = "hawkeye check"
+
+[tasks.clippy]
+description = "Linter"
+run = "cargo clippy --workspace --exclude wusel-fuse -- -D warnings"
+
+[tasks.mock]
+description = "Run the WebDAV mock server (wusel-mock); pass --root DIR etc."
+run = "cargo run -q -p wusel-mock --"
+
+# --- Product release build (Linux: FUSE needs the kernel driver) -------------
+# Builds the real product binary with the `fuse` feature — Linux only (on macOS
+# use the podman fuse-* tasks). The binary lands at target/release/wusel; put it
+# wherever you like. Final distribution is via RPM/DEB.
+
+[tasks.build-release]
+description = "Optimised release build of wusel with FUSE (Linux)"
+run = "cargo build --release --features fuse -p wusel"
+
+# The mount is Linux-only. On macOS, test it via podman (see the fuse-* tasks
+# below and documentation/.../trying-it-out.adoc).
+
+# --- Linux container (podman) -----------------------------------------------
+[tasks.fuse-build]
+description = "Build wusel including FUSE in the Linux container"
+run = "./scripts/podman-build.sh"
+
+[tasks.fuse-shell]
+description = "Interactive Linux shell with /dev/fuse (for testing the mount)"
+run = "./scripts/podman-shell.sh"
+
+[tasks.fuse-test]
+description = "Run the FUSE tests (real mount e2e) in the Linux container"
+run = "./scripts/podman-test.sh"
+
+# --- Packaging (Fedora RPM) -------------------------------------------------
+# Builds the .rpm in a Fedora container (for a macOS host). On a Fedora machine
+# run packaging/rpm/build-rpm.sh directly instead. Output: ./dist/*.rpm.
+[tasks.rpm]
+description = "Build the Fedora RPM in a container (output in ./dist)"
+run = "./scripts/podman-rpm.sh"
+
+# --- Documentation diagrams -------------------------------------------------
+# Render the D2 sources under documentation/diagrams/ to the committed SVGs the
+# docs embed. Only needed after editing a diagram; the docs build itself needs
+# no d2. Uses the local `d2` binary (no server, no external calls).
+[tasks.docs-diagrams]
+description = "Render documentation/diagrams/*.d2 to committed SVGs"
+run = '''
+for f in documentation/diagrams/*.d2; do
+  out="documentation/modules/ROOT/images/$(basename "${f%.d2}").svg"
+  echo ">> $f -> $out"
+  d2 --pad 8 --theme 1 "$f" "$out"   # theme 1 = Neutral Gray
+done
+'''

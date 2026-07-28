@@ -1,0 +1,216 @@
+// SPDX-License-Identifier: Apache-2.0
+= Troubleshooting
+:description: Symptom-oriented checks for the mount, the desktop integration and the cache.
+
+Symptom-oriented checklist, ordered by how often each case has bitten in
+practice. For the architecture behind these parts see
+xref:architecture.adoc[Architecture].
+
+== Where things have been tested
+
+[cols="1,1,2"]
+|===
+|Environment |File manager |Status
+
+|Fedora, GNOME (local session)
+|Nautilus
+|Reference setup: mount, notifications and cloud-provider status verified.
+
+|Fedora, GNOME via RDP, daemon started over SSH
+|Nautilus
+|Mount works; desktop integration depends on the daemon's environment — see
+<<ssh-session>>.
+
+|Debian (podman container, headless)
+|—
+|FUSE end-to-end tests (`mise run fuse-test`); no desktop.
+
+|Other distributions, KDE/Dolphin, Nemo, Thunar
+|—
+|Untested so far. Dolphin/Nemo/Thunar have no `libcloudproviders` consumer, so
+the file-manager status is expected to be absent there (per-file-manager
+plugins are a roadmap item).
+|===
+
+== The desktop integration is two independent channels
+
+Both ride the *session (user) D-Bus* and both are fail-soft — without them the
+mount itself keeps working:
+
+Notifications:: `org.freedesktop.Notifications`, shown by the desktop shell.
+Needs nothing but the user bus.
+File-manager status (cloud provider):: `libcloudproviders` — the sidebar entry
+with idle/syncing/error state in Nautilus. Needs the user bus *plus* a one-time
+system-wide registration on every machine:
++
+[source,sh]
+----
+sudo wusel desktop install-provider
+nautilus -q   # restart Nautilus so it re-reads the provider list
+----
+
+On success the daemon logs at startup:
+
+----
+INFO wusel_desktop: registered as a cloud provider (file-manager status) bus_name=…
+----
+
+[#ssh-session]
+== No notifications, no cloud entry — daemon started over SSH (or cron)
+
+A mount started from an SSH terminal on a desktop machine runs outside the
+graphical session's environment (`DBUS_SESSION_BUS_ADDRESS` is not set there).
+Since systemd distributions share one *user bus* per user, the daemon falls
+back to it automatically (`$XDG_RUNTIME_DIR/bus`; the log then shows
+`session bus found via XDG_RUNTIME_DIR`) — SSH-started mounts integrate with
+the desktop out of the box.
+
+If even that fails, the daemon warns
+(`no session D-Bus — desktop integration disabled …`); the manual override is:
+
+[source,sh]
+----
+export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus
+wusel mount
+----
+
+Verify the channel end-to-end without mounting:
+
+[source,sh]
+----
+wusel desktop notify            # sends test notifications (info/warning/error)
+----
+
+If the test notifications appear in the graphical session, conflict and error
+notices from the daemon will too.
+
+== Notifications work, but Nautilus shows only a plain mount
+
+The cloud-provider registration is missing on this machine (it is per-machine,
+not per-account-config): run the `install-provider` step from above, restart
+Nautilus, and check the startup log for the `registered as a cloud provider`
+line.
+
+== `ls` works, but `cat`/image viewers fail with `Input/output error`
+
+Historically two distinct causes; both are visible in the logs now:
+
+* *Transport errors* — the `HTTP error:` message names the full cause chain
+  (`[connect] … → connection reset`, TLS, DNS, timeout).
+* *A server or proxy that ignores `Range` requests* — the daemon warns once:
+  `server ignored a Range request and sent the full body …` and serves reads
+  correctly anyway. Every partial read then transfers the whole file, so fix
+  the server/proxy config for performance (check for header-stripping proxies,
+  response compression of media types, or server-side encryption).
+
+== Everything feels slow
+
+* Watch the actual traffic: `GET` lines (path + byte range) appear at debug
+  level, `PROPFIND` likewise. A directory listing is *one* PROPFIND per level —
+  many GETs mean file content is being read (thumbnailers included).
+* Opening a file caches it: the read is served live, and the whole file is
+  hydrated into the LRU cache in the background (emblem online-only → cached).
+  Browsing a folder with a thumbnailer therefore pulls what it reads — bounded by
+  the cache size, not by network. Exclude the mount from indexers if that traffic
+  is unwanted.
+* On a Range-ignoring server (see above) every partial read transfers the whole
+  file — the warning line tells you.
+
+== Cache vs. server problems
+
+To rule the cache out (or reset a tester's machine to a fresh-connect state)
+without touching credentials or config:
+
+[source,sh]
+----
+wusel cache clear            # whole account: metadata, content, pins
+wusel cache clear Photos     # one subtree, recursively
+----
+
+Run it while the account is not mounted. If a problem survives `cache clear`,
+it is not a caching problem.
+
+== What a conflict should look like
+
+An upload that loses against a newer server version keeps both files: the
+server version stays, the local edit is saved as
+`name (conflicted copy <timestamp>).ext` next to it. Expect
+
+* a `WARN … upload conflict — saved a conflicted copy` log line, and
+* a *warning notification* on the desktop (localized) — provided the
+  notification channel works (see <<ssh-session>>).
+
+With `text_merge` enabled a clean 3-way merge is attempted first; it needs a
+cached base version of the file, otherwise it falls back to the conflicted
+copy.
+
+== Log levels — and turning debug on in production
+
+The default is *INFO*: the production narrative (mount/unmount, the startup
+cache summary, uploads, push connection, conflicts, warnings, errors) without
+per-operation noise. More detail is opt-in via the `RUST_LOG` environment
+variable:
+
+[cols="1,3"]
+|===
+|Level |What it adds
+
+|`info` (default)
+|Lifecycle + state-changing events; quiet during pure browsing/reading.
+
+|`debug`
+|The activity narrative: every WebDAV request (GET/PUT/PROPFIND/…), `open` and
+`readdir` per path, write-buffer lifecycle, readahead escalation, background
+sync decisions. Cache-served operations appear as `open`/`readdir` lines only.
+
+|`trace`
+|Additionally the read-by-read provenance: one line per ~128 KiB kernel read
+served from the cache blob or the readahead buffer. Very chatty — use for
+short, targeted sessions.
+|===
+
+Foreground (a shell):
+
+[source,sh]
+----
+RUST_LOG=debug wusel mount
+----
+
+Production (the systemd user service): set the variable in a drop-in and
+restart —
+
+[source,sh]
+----
+systemctl --user edit wusel@default   # opens the drop-in editor; add:
+#   [Service]
+#   Environment=RUST_LOG=debug
+systemctl --user restart wusel@default
+journalctl --user -u wusel@default -f # follow the log
+----
+
+Remove the drop-in (or the `Environment=` line) and restart to return to INFO.
+
+=== Scoping to one crate
+
+`RUST_LOG` is a comma-separated list of directives. A bare level is the *global
+floor* for every crate; `crate=level` overrides one crate. Combine them to raise
+detail for one component while keeping the rest quiet — the practical way to use
+`trace` without drowning in read-by-read lines:
+
+[source,sh]
+----
+RUST_LOG=info,wusel_core=trace wusel mount   # everything at info, engine at trace
+RUST_LOG=info,wusel_fuse=debug wusel mount   # only the FUSE layer verbose
+----
+
+The crate targets are `wusel` (CLI/daemon), `wusel_core` (engine: WebDAV, cache,
+state, push), `wusel_fuse` (the mount), `wusel_desktop` (notifications + file-manager
+status).
+
+[IMPORTANT]
+====
+Always keep a global floor. `RUST_LOG=wusel_core=debug` on its own raises `wusel_core`
+but drops *every other crate to the default (off)* — so the `wusel_fuse` error you
+are chasing never prints. Write `RUST_LOG=info,wusel_core=debug` (or simply
+`RUST_LOG=debug`) instead.
+====

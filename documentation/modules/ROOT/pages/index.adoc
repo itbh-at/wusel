@@ -1,0 +1,53 @@
+= Wusel
+:description: Virtual Nextcloud file system in Rust — VFS-first.
+
+_Nextcloud, woven into your desktop._
+
+*Wusel* is a virtual file system for Nextcloud, written in Rust (referred to
+technically as `wusel`).
+
+*VFS-first:* Files are "online only" by default and are only loaded on
+access (on-demand hydration), instead of mirroring everything locally. This
+lets `wusel` offer on Linux what the official client still does not deliver.
+
+`wusel` is deliberately *more than just FUSE*. FUSE only makes the files appear;
+on top of that engine Wusel is a *full GNOME desktop integration*, so your
+Nextcloud behaves like a native part of the desktop rather than a mounted drive:
+
+* *Files (Nautilus)* — a *Wusel (Nextcloud)* entry in the sidebar
+  (`libcloudproviders`), a per-file status emblem (online-only, cached,
+  pinned/always-offline, pending upload) and a right-click *Make Available
+  Offline* / *Free Up Space* toggle. Emblems refresh live as files hydrate.
+* *GNOME Shell search* — start typing in the Activities overview and your
+  Nextcloud files appear (Unified Search), opening straight from `~/Wusel`.
+* *Notifications* — sync events surface as native, localized desktop
+  notifications (the one place Wusel speaks the user's language).
+* *Runs like a system component* — a systemd *user* service mounts at login, it
+  stays out of desktop indexers, and the whole thing installs from an
+  xref:installation.adoc[RPM].
+
+FUSE is thus only the first of several frontends on the same engine. Native
+frontends without any FUSE dependency — a macOS *File Provider* and a Windows
+one — remain planned; see xref:roadmap.adoc[the roadmap].
+
+*Wusel is opinionated.* It prefers to use what the OS and desktop environment
+already provide — the file manager's sidebar and emblems, the shell's search,
+the system's notifications, the OS keyring — rather than reinventing them inside
+a bespoke app window or a tray icon. That means fewer moving parts to maintain,
+and an experience that feels native because it *is* native. Where the desktop
+offers a good home for something, Wusel lives there instead of building its own.
+
+== At a glance
+
+[cols="1,3",options="header"]
+|===
+| Crate | Role
+| `wusel-core` | Engine: Login Flow v2, WebDAV, sync, state (platform-independent)
+| `wusel-fuse` | FUSE frontend as a library (Linux)
+| `wusel-desktop` | Linux/GNOME integration behind `desktop::Desktop`: cloud-provider sidebar, Nautilus emblems + menu, GNOME Shell search provider, localized notifications
+| `wusel` | Daemon/CLI — the product
+|===
+
+Next: xref:installation.adoc[Installation] · xref:file-manager.adoc[File-manager
+integration] · xref:architecture.adoc[Architecture] ·
+xref:roadmap.adoc[Roadmap] · xref:development.adoc[Development & Testing].

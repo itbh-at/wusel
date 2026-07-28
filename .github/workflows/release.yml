@@ -1,0 +1,68 @@
+# SPDX-License-Identifier: Apache-2.0
+# Build the Fedora RPM for x86_64 and aarch64 and attach both to a GitHub
+# Release. Triggered by a version tag:
+#   git tag v0.1.0 && git push github v0.1.0
+# The RPM version comes from Cargo.toml (build-rpm.sh), so keep the tag in sync.
+# These are the unsigned community RPMs; signed store builds are separate.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # create the release and upload the RPM assets
+
+jobs:
+  rpm:
+    name: build RPM (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, arch: x86_64 }
+          - { runner: ubuntu-24.04-arm, arch: aarch64 }
+    runs-on: ${{ matrix.runner }}
+    container: fedora:44
+    env:
+      MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
+    steps:
+      # Native Fedora build deps (git for checkout; the rest for build-rpm.sh).
+      - name: Install build dependencies
+        run: >
+          dnf -y install
+          git gcc make pkgconf-pkg-config
+          nautilus-devel glib2-devel fuse3-devel
+          rpm-build curl ca-certificates
+      - uses: actions/checkout@v5
+      - uses: jdx/mise-action@v2
+        with:
+          install: false
+      - name: Install the pinned Rust toolchain
+        run: mise install rust
+      - name: Build the RPM
+        run: ./packaging/rpm/build-rpm.sh
+      - name: Upload the RPM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpm-${{ matrix.arch }}
+          path: dist/*.rpm
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: rpm
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download the built RPMs
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: rpm-*
+          merge-multiple: true
+      - name: Create the GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.rpm
+          fail_on_unmatched_files: true
+          generate_release_notes: true

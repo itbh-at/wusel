@@ -1,0 +1,145 @@
+= Roadmap
+
+Where Wusel stands, and where it is going. It is built incrementally — each step
+ends with something runnable. Today it is a working, VFS-first Nextcloud client
+on Linux with a full GNOME desktop integration, installable from a
+xref:installation.adoc[Fedora RPM].
+
+Legend: ✅ done · ◐ works, refinement pending · ⬜ planned
+
+== What works today
+
+=== Engine & CLI
+
+* ✅ Cargo workspace (`wusel-core` · `wusel-fuse` · `wusel-desktop` · `wusel` ·
+  `wusel-mock`); mise-pinned toolchain (Rust 1.97.1); the Linux/FUSE build and
+  real-mount tests run in a podman container. `wusel-core` tests run natively on
+  Linux and macOS.
+* ✅ `wusel` CLI: `login`, `mount`, `service`, `pin` / `unpin` / `pins`,
+  `accounts` / `account`, `desktop`, `cache`, `search-provider`.
+* ✅ Per-account configuration (`config.toml`) and multiple named accounts, each
+  with its own credentials, state, cache and mountpoint. Scoped logging via
+  `RUST_LOG`.
+
+=== Authentication
+
+* ✅ Nextcloud Login Flow v2 (browser-based, no plaintext password); the app
+  password persists and is reused across restarts.
+* ✅ Credentials in the OS keyring by default (freedesktop Secret Service — works
+  with gnome-keyring, KWallet, KeePassXC), fail-soft to a `0600` file; opt out
+  with `[auth] keyring = false`. See xref:architecture.adoc[_Credential storage_].
+
+=== The virtual filesystem (VFS-first)
+
+* ✅ Directory tree from WebDAV PROPFIND into SQLite state; `getattr` / `lookup` /
+  `readdir` answered from state, with real mtimes and read-only permissions
+  reflected. Subdirectories load lazily; not a byte of content loads until read.
+* ✅ Live reads: `open` / `read` stream from the server per range through the
+  `ContentSource` seam; a reverse proxy that strips `Range` is handled
+  transparently (the requested window is sliced from the full body).
+* ✅ Caching: whole-file blob cache, keyed by file id and ETag-validated, bounded
+  by an LRU size budget + max age; concurrent reads coalesce; oversized and
+  id-less files stay live.
+* ✅ Pinning ("always keep offline"): path-based pins, hydrated proactively and
+  exempt from eviction; driven from the CLI or straight from the file manager.
+* ✅ Writing (write-back): a read-write mount — create / write / flush / unlink /
+  rename / mkdir / truncate — with chunked upload for large files, conflict
+  detection via `If-Match` (a conflicted copy by default, opt-in 3-way text
+  merge), read-only entries rejected, and mtime propagated.
+* ✅ Change detection: `notify_push` (WebSocket) for instant invalidation, with
+  TTL + ETag revalidation as the fallback.
+
+=== Linux desktop integration (GNOME) — confirmed on Fedora/Nautilus
+
+* ✅ Cloud-provider sidebar entry with live sync status (`libcloudproviders`).
+* ✅ Per-file status emblems and a pin/unpin context menu — a native
+  `libnautilus-extension` module reading the `user.wusel.state` xattr — with live
+  emblem refresh via a daemon → extension D-Bus push.
+* ✅ Localized desktop notifications for conflicts and upload failures.
+* ✅ GNOME Shell search over Nextcloud Unified Search, opening results from the
+  local mount.
+* ✅ The mount is excluded from desktop indexers by default (synthetic marker
+  files), so a crawler cannot trigger a hydrate-everything storm.
+* ✅ Runs as a systemd *user* service (mounts at login, logs to the journal, no
+  root); installable from a Fedora RPM (`packaging/rpm/`).
+
+== Refinements (near-term)
+
+* ◐ The 3-way text merge is implemented and covered by mock end-to-end tests, but
+  not yet verified against a live Nextcloud — treat it as experimental until it is.
+* ◐ Emblem refresh is best-effort (it fires when hydration completes, so a
+  large/queued download delays it); a transient "syncing" emblem at the moment an
+  open starts would make it immediate. The emblem is always correct on the next
+  view reload.
+* ⬜ Proper gettext i18n (`.po`/`.mo`) for the file-manager labels — currently a
+  small built-in de/en table.
+* ⬜ Re-crawl a pinned directory to pick up files added after the pin; prefetch
+  policy and exclusion patterns.
+* ⬜ Refresh pinned files proactively when the server copy changes. Today the
+  sync walk only updates the state ETag, which marks the pinned blob stale; the
+  fresh content arrives on the *next read* — until then, a user going offline
+  keeps the old version. The walk already sees exactly which entries changed,
+  so it could trigger re-hydration for pinned paths directly (full-file
+  downloads by design: WebDAV offers no delta transfer, only per-file change
+  detection via ETag).
+* ⬜ Read-ahead/prefetch for sequential reads; optional sparse/range caching for
+  huge, partially-read files (whole-file-per-file stays the model).
+* ⬜ Advisory locking (WebDAV LOCK) to warn on the web-editor vs. local-editor case.
+* ⬜ Native inotify for local changes (remote invalidation is already
+  kernel-coherent).
+* ⬜ Multi-account search; a propagating-root-ETag `Depth: 0` optimisation to skip
+  unchanged subtrees.
+
+== Later
+
+* ⬜ *KDE — the same feature set*: the cloud folder via KIO, per-file overlays via
+  a C++ `KOverlayIconPlugin` reading the same `user.wusel.state` xattr, pin/unpin
+  via KDE ServiceMenus, a Baloo config exclude, and a KRunner/Milou search
+  provider (Nemo/Thunar read the same xattr where cheap).
+* ⬜ *A small configuration UI on top of the CLI*: an optional graphical helper to
+  log in, add accounts and change options without the terminal — deliberately
+  *not* a permanent system-tray applet. Status and notifications already live in
+  the desktop's own mechanisms (the file-manager sidebar and emblems, freedesktop
+  notifications), so there is nothing to re-model in a tray.
+* ⬜ *Smart open* (`wusel open <file>`, surfaced as a file-manager *context-menu*
+  action — not a double-click override): route a file to the right handler.
+  Double-click stays the desktop's own default (a file in `~/Wusel` behaves like
+  any other), because activation is chosen by MIME association, not per-mount; the
+  collaborative path is therefore an explicit menu entry / CLI. Where Wusel has
+  its own handler — an Office document opens in the
+  instance's collaborative editor (Collabora Online, OnlyOffice,
+  https://github.com/Euro-Office/eurooffice-nextcloud[EuroOffice]) in a
+  chrome-less WebView, without the surrounding Nextcloud web UI — it uses that;
+  for everything else it hands the file to the OS opener — on Linux the XDG
+  Desktop Portal (`org.freedesktop.portal.OpenURI`, the modern cross-desktop,
+  sandbox-aware route we already reach over zbus), falling back to `xdg-open`.
+  Opening is not editing: once it is open, the user decides what to do.
++
+This is the opinionated stance again. You already have a desktop you like, with
+the tools you like, so for anything Wusel has no special handler for, the OS's own
+"open" is exactly right — no second desktop rendered inside a browser. Wusel only
+interposes where it adds something the desktop cannot: live *collaborative*
+editing, which is genuinely hard to get natively (Collabora's desktop build never
+became a first-class citizen, and where native desktop co-editing is heading is
+unclear). A chrome-less editor emulates a "local office" that can still co-edit
+with colleagues — enough for Office files, for now. For plain text, the opt-in
+xref:architecture.adoc[3-way merge] already gives a familiar, git-style middle
+ground.
+* ⬜ *macOS frontend (far-future experiment)*: a native File Provider extension, an
+  adapter over the `Provider` facade — not FUSE.
+* ⬜ *Windows frontend (far-future experiment)*: the Cloud Filter API via
+  `windows-rs` — native placeholders + Explorer status, on the official API (no
+  FUSE-style shim).
+
+[#licensing]
+== Licensing
+
+Wusel is licensed under *Apache-2.0*. It lets the free sources also ship as
+signed, commercial store builds (the distribution model), carries an explicit
+patent grant, and cleanly covers outside contributions (inbound = outbound). A
+copyleft licence would conflict with the Apple App Store / Microsoft Store terms
+and force direct-sale signed binaries only — so Apache-2.0 is what keeps the
+store path open. Wusel is an independent client and shares no code with
+Nextcloud's own server (AGPL-3.0) or desktop client (GPL-2.0-or-later). Who
+develops, distributes and sells it is in xref:distribution.adoc[Project, licence
+& distribution].

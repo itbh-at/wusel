@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Wusel (Nextcloud)
+Comment=Nextcloud files via Wusel
+Icon=folder-remote
+# Launching (grid icon or the search header) opens the DEFAULT mount point
+# (~/Wusel). A .desktop Exec cannot read config.toml, so with a custom
+# `[mount] point` there, adjust the path below to match.
+Exec=sh -c 'xdg-open "$HOME/Wusel"'
+Terminal=false
+Categories=Network;Utility;

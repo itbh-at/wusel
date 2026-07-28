@@ -1,0 +1,23 @@
+[package]
+name = "wusel-mock"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+# Test-only tool: a tiny Nextcloud-style WebDAV server for container e2e runs.
+# Never published; keeps the mock in Rust so we maintain one language, not two.
+publish = false
+
+[dependencies]
+# Deliberately dependency-lean: only tokio (async runtime + TCP). The HTTP/1.1
+# handling and percent-coding are hand-rolled — a mock needs only PROPFIND +
+# GET, and it doubles as Rust learning material.
+tokio.workspace = true
+
+[dev-dependencies]
+# The integration test drives the real client against this mock — pure Rust,
+# no Nextcloud, no Python — proving the two stay contract-compatible.
+wusel-core = { path = "../wusel-core" }
+reqwest.workspace = true

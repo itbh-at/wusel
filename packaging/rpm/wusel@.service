@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 IT Beratung Hermann GmbH
+#
+# Packaged systemd *user* service template. One instance per account:
+#   systemctl --user enable --now wusel@default
+# The %i instance name is the account ("default" for the implicit account).
+# This is the packaged twin of the unit `wusel service enable` writes for a
+# dev/`cargo install` build — here the ExecStart is the packaged path /usr/bin/wusel.
+
+[Unit]
+Description=Wusel — virtual Nextcloud filesystem (%i)
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/wusel mount --account %i
+Restart=on-failure
+RestartSec=5
+# No sandboxing directives: mounting uses the setuid fusermount3 helper, which
+# NoNewPrivileges=yes blocks. The hardening options that would apply here
+# (LockPersonality, RestrictRealtime, ProtectKernelModules, …) all imply
+# NoNewPrivileges=yes, so any of them breaks the mount with
+# "fusermount3: Operation not permitted".
+
+[Install]
+WantedBy=default.target

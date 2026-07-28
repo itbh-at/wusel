@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
+  <!-- modified: local edit pending upload (white up-arrow on amber) -->
+  <circle cx="8" cy="8" r="7" fill="#e5a50a"/>
+  <path d="M8 11.4V4.9M5.4 7.3 8 4.6 10.6 7.3" fill="none" stroke="#ffffff"
+        stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

@@ -1,0 +1,13 @@
+# License-header management via hawkeye (https://github.com/korandoru/hawkeye).
+#   mise run headers        # apply headers (hawkeye format)
+#   mise run headers-check  # verify every file has one (hawkeye check) — for CI
+
+inlineHeader = """SPDX-License-Identifier: Apache-2.0
+Copyright 2026 IT Beratung Hermann GmbH"""
+
+includes = [
+  "crates/**/*.rs",
+  "scripts/*.sh",
+  "packaging/rpm/*.sh",
+  "documentation/build.sh",
+]

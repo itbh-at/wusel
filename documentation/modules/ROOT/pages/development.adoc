@@ -1,0 +1,133 @@
+= Development & Testing
+
+All toolchains are managed via *mise* (`mise.toml`, Rust pinned).
+
+[source,sh]
+----
+mise install        # install Rust 1.97.1
+----
+
+== Engine + CLI (natively on macOS)
+
+`wusel-core` and `wusel` (without the `fuse` feature) build without a FUSE driver:
+
+[source,sh]
+----
+mise run check      # cargo check (wusel-core + wusel, no FUSE)
+mise run test       # cargo test
+mise run clippy
+----
+
+== Testing strategy
+
+A pyramid — we do not boot a Nextcloud for every run.
+
+* *Unit tests (no server).* Pure logic: PROPFIND parsing, SQLite state, sync-state
+  decisions, three-way merge, path handling. Fast, deterministic, run everywhere.
+* *Mock WebDAV server (no Nextcloud).* An in-process HTTP server (`wiremock`)
+  returns canned WebDAV/OCS responses to exercise the client: auth poll loop,
+  PROPFIND, range GET, chunked upload, error paths. Where server behaviour matters,
+  capture real responses once as fixtures and replay them here (record-replay).
+* *Standalone WebDAV mock (`wusel-mock`).* A tiny binary crate that serves a **real
+  directory** as a Nextcloud-style user root (PROPFIND Depth 0/1, range GET). It is
+  pure Rust with a single dependency (`tokio`) — deliberately no Python, to keep the
+  project to one language. Because it mirrors a directory on disk, exercising change
+  detection is just `echo`/`rm` in that directory. Start it with `mise run mock`
+  (`--root DIR`), point a mount at it, or let the `roundtrip` integration test drive
+  the real client against it.
+
+All three tiers run under `mise run test` — they are ordinary `cargo test` cases
+(the standalone mock via an integration test; `wusel-mock` is also a library, so
+tests can drive it in-process).
+
+* *Real FUSE mount (Linux, `/dev/fuse`).* `mise run fuse-test` mounts the full
+  stack — engine + FUSE — against the in-process `wusel-mock` and drives it through
+  the kernel: `ls`, `cat`, `stat`, `statfs`, then unmount. It needs a Linux
+  container, so it is not part of the native `mise run test`; run it via podman
+  (see below). This is the automated counterpart to the manual mount check.
+* *Real Nextcloud — manual.* We have a real instance and test against it by hand
+  (see xref:trying-it-out.adoc[Trying it out]); needed only for behaviour a mock
+  cannot reproduce (ETag propagation, chunked-upload NG, live `notify_push`).
+
+== Mounting on Linux (podman container)
+
+FUSE needs a kernel driver → Linux container with `/dev/fuse`:
+
+[source,sh]
+----
+mise run fuse-build   # build wusel including FUSE
+mise run fuse-test    # run the real-mount e2e test (headless)
+mise run fuse-shell   # interactive shell with /dev/fuse
+# in the shell:
+mise exec -- cargo run -p wusel --features fuse -- mount /mnt/nc
+----
+
+[NOTE]
+====
+The `podman-*.sh` scripts probe where the podman VM can see the repo
+(`scripts/podman-lib.sh`), in this order:
+
+. The repo path itself — always true under podman's standard macOS shares
+  (`/Users`, `/private`, `/var/folders`) and on a Linux host.
+. A disk share: a repo under `/Volumes/<disk>` that the VM mounts at
+  `/var/mnt/<disk>` (setup below). The build then runs in place; the build
+  cache (`target-linux/`, gitignored) lives with the repo and stays
+  incremental, off the boot disk.
+. Fallback: an `rsync` mirror at `/private/tmp/wusel-linux`. Container-side
+  changes never reach the original tree, and `podman-build.sh` deletes the
+  mirror's build cache after each build so it cannot fill the boot disk.
+====
+
+=== Building from an external disk (one-time VM setup)
+
+To let the VM see a repo on an external disk (e.g. `/Volumes/<disk>`),
+share the disk into the podman machine — two steps, surviving VM restarts:
+
+. Add the disk to the `Mounts` array of
+  `~/.config/containers/podman/machine/libkrun/podman-machine-default.json`
+  (copy an existing entry; `Source`/`Target` = `/Volumes/<disk>`, a unique
+  `Tag`), then `podman machine stop && podman machine start`.
+. Mount it inside the guest (Fedora CoreOS: `/` is immutable, so the target is
+  `/var/mnt`; the SELinux context matches podman's own shares — without it,
+  containers get `Permission denied`):
++
+[source,sh]
+----
+podman machine ssh "sudo mkdir -p /var/mnt/<disk> && \
+  echo '<tag> /var/mnt/<disk> virtiofs rw,nofail,context=system_u:object_r:nfs_t:s0 0 0' \
+  | sudo tee -a /etc/fstab && sudo systemctl daemon-reload && sudo mount /var/mnt/<disk>"
+----
+
+`podman machine init` recreates the VM from scratch — redo both steps then (the
+scripts fall back to mirroring automatically until you do).
+
+The mount is Linux-only, so on macOS use the same podman container. Native macOS
+support (a File Provider frontend, not FUSE) is far-future, experimental work.
+See xref:trying-it-out.adoc[Trying it out] for a step-by-step guide.
+
+== Release build (Linux)
+
+To run `wusel` as a normal binary instead of through cargo, build it in release
+mode *on Linux* (the `fuse` feature needs the kernel driver):
+
+[source,sh]
+----
+mise run build-release      # cargo build --release --features fuse -p wusel
+----
+
+The binary is then at **`target/release/wusel`** — run it from there, or put it
+on your `PATH` wherever you like. Final distribution will be via RPM/DEB packages.
+
+The file manager's cloud-provider registration is a separate step (it goes into a
+*system* data dir, which a file manager scans but `~/.local/share` is not), run as
+root: `wusel desktop install-provider`. For the full file-manager story
+(sidebar status, per-file emblems, context-menu actions, and the build
+prerequisites for the native extension), see
+xref:file-manager.adoc[File-manager integration].
+
+== Why this separation?
+
+The FUSE driver is kernel-dependent; the rest of the logic (auth, WebDAV, sync,
+state) is not. That is why it lives in `wusel-core` and is tested natively on macOS
+in seconds. Only the thin mount adapter needs Linux — and you rarely touch it
+once it stands.

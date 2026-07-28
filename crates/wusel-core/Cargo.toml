@@ -1,0 +1,54 @@
+[package]
+name = "wusel-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+# wusel-core contains NO platform-dependent FUSE logic. Pure protocol, auth,
+# sync engine and state — builds and tests natively on macOS.
+
+[dependencies]
+tokio.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml = "0.8"
+quick-xml.workspace = true
+rusqlite.workspace = true
+url.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+bytes.workspace = true
+futures.workspace = true
+reqwest-websocket.workspace = true
+diffy.workspace = true
+
+# OS keyring (freedesktop Secret Service) is a Linux-desktop concern; the mount is
+# Linux-only too. Elsewhere `keyring.rs` uses a stub, so no dependency is pulled.
+# The pure-Rust zbus backend (`async-secret-service`) needs no system libdbus/C
+# headers; `async-io` bridges it to our synchronous API and `crypto-rust` avoids
+# an OpenSSL/cmake build requirement — so `cargo build` needs no extra system deps.
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", default-features = false, features = [
+    "async-secret-service",
+    "async-io",
+    "crypto-rust",
+] }
+
+[dev-dependencies]
+tokio = { workspace = true }
+reqwest = { workspace = true }
+wiremock = "0.6"
+# Only for the notify_push test's fake server (accept side). Not in the product.
+tokio-tungstenite = "0.24"
+# TLS end-to-end test: a self-signed cert (rcgen) served over a rustls server
+# (tokio-rustls). Pinned to the `ring` provider so no aws-lc-rs / cmake is pulled.
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "ring",
+    "logging",
+    "tls12",
+] }

@@ -1,0 +1,26 @@
+# Rust
+/target
+/target-linux
+/target-rpm
+# Cargo.lock is committed: wusel is a binary (reproducible builds).
+
+# RPM build output
+/dist
+
+# mise
+.mise.local.toml
+
+# Antora build output
+documentation/build/
+
+# Editor/OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Claude Code working dirs (git worktrees for isolated agents)
+.claude/worktrees/
+
+# Native Nautilus extension build output
+integration/nautilus/*.so

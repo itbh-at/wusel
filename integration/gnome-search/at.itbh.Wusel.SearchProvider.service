@@ -1,0 +1,5 @@
+[D-BUS Service]
+Name=at.itbh.Wusel.SearchProvider
+# Absolute path required for D-Bus activation. Adjust to where wusel is
+# installed (packaging uses /usr/bin). GNOME Shell starts this on demand.
+Exec=/usr/local/bin/wusel search-provider

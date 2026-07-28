@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 IT Beratung Hermann GmbH
+#
+# Source for the architecture overview diagram. Render to a committed SVG with:
+#   mise run docs-diagrams
+# The docs build itself embeds the pre-rendered SVG — it needs no d2 or server.
+#
+# Palette: soft pastels with light-grey strokes (see the per-shape style blocks).
+
+direction: down
+
+fm: "File manager  (Nautilus / Dolphin / Nemo / Thunar)\nemblems · sidebar · context menu (\"keep online\")" {
+  shape: rectangle
+  style: {fill: "#EAF1FB"; stroke: "#B7BECC"}
+}
+
+daemon: "wusel daemon" {
+  style: {fill: "#FBFBFD"; stroke: "#C6CBD6"}
+
+  fuse: "FUSE layer\n(wusel-fuse)" {
+    style: {fill: "#EAF1FB"; stroke: "#B7BECC"}
+  }
+  core: "wusel-core" {
+    style: {fill: "#F4F5F9"; stroke: "#C6CBD6"}
+
+    sync: "Sync engine\nstate machine" {
+      style: {fill: "#E9F6EE"; stroke: "#B7CBBE"}
+    }
+    client: "Nextcloud client\nWebDAV · OCS · notify_push (WS)" {
+      style: {fill: "#F0EBFA"; stroke: "#C4B9D8"}
+    }
+    db: "Metadata DB (SQLite)\ninode↔path · etag" {
+      style: {fill: "#FBF3E3"; stroke: "#D8CBA9"}
+    }
+    cache: "Blob cache\n(content)" {
+      style: {fill: "#FBEAF0"; stroke: "#D8B6C4"}
+    }
+  }
+  fuse <-> core.sync
+  core.sync <-> core.client
+  fuse -> core.db
+  core.client -> core.cache
+}
+
+fm -> daemon: "libcloudproviders (D-Bus) · file-manager plugin"

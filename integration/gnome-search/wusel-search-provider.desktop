@@ -1,0 +1,5 @@
+[Shell Search Provider]
+DesktopId=at.itbh.Wusel.desktop
+BusName=at.itbh.Wusel.SearchProvider
+ObjectPath=/at/itbh/Wusel/SearchProvider
+Version=2

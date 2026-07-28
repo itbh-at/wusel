@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
+  <!-- cached: a cloud file (still on-demand / evictable) that is downloaded now,
+       so it keeps the cloud but gains a check badge -->
+  <path d="M3.7 10.3a2.5 2.5 0 0 1-.3-4.98A3.4 3.4 0 0 1 10.2 5.5a2.35 2.35 0 0 1-.25 4.8z"
+        fill="#ffffff" stroke="#5e6a75" stroke-width="1.05" stroke-linejoin="round"/>
+  <circle cx="11.7" cy="11.7" r="3.8" fill="#3584e4"/>
+  <path d="M9.9 11.8 11.05 12.95 13.4 10.35" fill="none" stroke="#ffffff"
+        stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

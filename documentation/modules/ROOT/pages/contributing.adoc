@@ -1,0 +1,54 @@
+= Contributing
+
+Wusel is developed by https://itbh.at/[*IT Beratung Hermann GmbH (ITBH)*] and is
+open under Apache-2.0. Contributions are welcome — on a simple, honest basis.
+
+We would genuinely like to make Wusel better, and we are glad for help. The one
+thing we will not do is let the project be buried in noise; if that is where it
+heads, we will simply go back to developing it internally. So the guidelines
+below are less about process and more about good manners and real interest in
+moving the project forward.
+
+[NOTE]
+====
+For full transparency: Wusel itself is built *with AI assistance* — and that is
+not a euphemism for cutting corners. People still do the thinking. The design is
+reasoned out, specified, reviewed, tested, revised and re-validated by humans;
+the AI assists that work, it does not replace the judgement or the testing behind
+it. That is exactly the bar we ask of any contribution — whoever, or whatever,
+helped write it.
+====
+
+== Code
+
+* *AI-assisted code is as welcome as human-written code.* We do not care how a
+  change was produced — only whether it is correct, carefully *tested*, and fits
+  the project. That bar is the same for everyone; there is no separate, lower one
+  for either.
+* *It has to be yours to give.* Correct and tested is not enough — the code must
+  also be legally clean: your own work or compatibly licensed, and offered under
+  this project's Apache-2.0 licence. Code copied from a proprietary or
+  licence-incompatible source is not acceptable no matter how well it works, and
+  regardless of whether a person or a machine produced it. By contributing you
+  confirm you have the right to.
+* *ITBH decides what to review and integrate.* We may leave a contribution lying,
+  or not act on it at all — there is no obligation to merge, or even to respond to,
+  everything that arrives. Please do not read silence as anything more than
+  limited attention.
+* *Not to your taste? Fork it.* That is exactly what the open licence is for — take
+  it, run with it, make it yours. Good luck, and have fun with it.
+
+== Issues & bug reports
+
+* *Reports are very welcome* — they are how the project gets better, and using AI
+  to help write a clear one is completely fine.
+* *A human must stand behind every report* — someone who understands what it is
+  about, what the actual problem is, and can engage in a conversation about it.
+* *Low-effort noise is ignored.* Pseudo-findings, duplicate pile-ons, automated
+  mass submissions, or a steady stream of unreviewed AI-generated reports will be
+  ignored from that source onward.
+
+== In short
+
+Behave decently and genuinely want to help move Wusel forward, and you are
+welcome here. We want to make it better; we just will not be buried in noise.

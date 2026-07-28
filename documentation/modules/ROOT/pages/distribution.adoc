@@ -1,0 +1,114 @@
+= Project, licence & distribution
+
+This page states plainly who is behind `wusel`, what is free, and where money
+is involved. We would rather be upfront about the commercial side than pretend it
+isn't there — the project is genuinely open, *and* its distribution is a
+business. Both are true; neither is hidden.
+
+== Who is behind it
+
+* https://itbh.at/[*IT Beratung Hermann GmbH (ITBH)*] develops `wusel` and
+  holds the copyright and the product brand.
+* https://ke-online.at/[*KE-Online FlexCo*] distributes the commercial store
+  builds and provides commercial support.
+
+The source in this repository is the whole product. The company earns from
+*distributing* it conveniently, not from withholding any of it.
+
+== What is free (the open promise)
+
+Everything in this repository is licensed under *Apache-2.0*. That is the entire
+client — `wusel-core` plus every OS frontend (FUSE today; macOS File Provider and
+Windows Cloud Filter as they land) — and it is *fully functional*:
+
+* *No licence check, no activation, no phone-home.* There is deliberately no
+  licensing logic anywhere in the code, and there never will be. A gate in open
+  source enforces nothing (anyone may remove it and rebuild — that is the
+  freedom Apache-2.0 grants) and would only erode the trust the open core exists
+  to earn.
+* *No paid tier inside the client.* No feature is held back, time-limited, or
+  unlocked by a key. What you build from source is the same software the stores
+  sell.
+* You may *clone, build, run, fork, and redistribute* it under Apache-2.0, for
+  free — including on Linux via the RPM/DEB packages built from this repository.
+
+Self-hosters and the community get a complete client with nothing crippled. This
+is the promise, and the gate-free core is how it stays credible.
+
+== What is commercial (what you actually pay for)
+
+Not the code — the *convenience and assurance of distribution*:
+
+[cols="1a,1a",options="header"]
+|===
+| Free — build it yourself | Paid — via KE-Online FlexCo
+
+|
+* Full source, Apache-2.0
+* Linux RPM/DEB from this repo
+* Self-service, community support
+|
+* Signed & *notarized* store builds (Microsoft Store, Mac App Store)
+* Automatic updates through the store
+* Commercial support / SLAs, enterprise deployment (e.g. Intune)
+|===
+
+On macOS and Windows the store build spares you the toolchain, the code signing,
+and Apple's notarization — the friction that makes a self-built desktop client
+awkward for non-developers and unmanageable at company scale. That convenience,
+and the support behind it, is the product KE-Online sells.
+
+== What stays out of this repository
+
+Only the *private packaging layer* — and it holds no product code:
+
+* signing secrets, notarization credentials, and store accounts;
+* store-submission and build automation that carries those secrets;
+* any future *closed enterprise module* kept strictly separate (e.g. MDM
+  policies, central configuration, fleet reporting) — never a gate bolted onto
+  the open core.
+
+No frontend or engine code lives there. Losing that layer would cost a
+signature, never a feature. Consequently the open core is always independently
+buildable and *reproducible*: a store build is this repository plus packaging,
+nothing that changes behaviour.
+
+== Packaging (the technical side)
+
+The commercial layer adds no code — only packaging on top of what this
+repository already builds. That packaging is standard ground: `cargo-wix` / WiX
+(MSI) or MSIX on Windows; `codesign` + `notarytool` + `create-dmg` (or `.pkg`)
+on macOS; `cargo-deb` / `cargo-generate-rpm` on Linux — or the hand-written spec
+under `packaging/rpm/` that the xref:installation.adoc[Fedora RPM] is built from.
+Apache-2.0 works with the Apple and Microsoft stores.
+
+A bonus of the native frontends: the macOS File Provider and Windows Cloud
+Filter are built into the OS, so there is *no external driver to bundle* (a
+FUSE-style shim would need one — which is a further reason we stay on the native
+frameworks). The installers are self-contained and dependency provisioning is
+minimal.
+
+== Naming & brand
+
+The *code* is Apache-2.0 and free to use, including in derived builds. The
+*product name and branding* under which commercial builds are sold belong to
+ITBH: please do not market a fork under our name or branding. You may build and
+share the software freely — just not as if it were our official product.
+
+`wusel` is the current technical working name; the eventual product brand is
+separate and not yet chosen. It is *not a registered trademark* — ITBH intends to
+register the final name, and only then would "™"/"®" or the term "trademark"
+apply to it.
+
+`wusel` is an independent project. "for Nextcloud" is a compatibility
+statement only — the project is not affiliated with, sponsored by, or endorsed
+by Nextcloud GmbH, and "Nextcloud" is their registered trademark.
+
+== Why say all this
+
+Open-source sync clients live or die on trust: users hand them their files. A
+hidden commercial hook, or a paywall disguised as "free", would poison that.
+So the deal is explicit — the core is free and complete, the company sells the
+signed, supported, auto-updating package, and the two are cleanly separated.
+The licence rationale (why Apache-2.0, not copyleft) is in the
+xref:roadmap.adoc#licensing[_Licensing_] section.

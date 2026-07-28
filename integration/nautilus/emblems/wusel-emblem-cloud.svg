@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
+  <!-- online-only: a plain cloud (lives on the server, not downloaded) -->
+  <path d="M4.6 12.2a3 3 0 0 1-.35-5.98A4 4 0 0 1 12 6.35a2.75 2.75 0 0 1-.3 5.85z"
+        fill="#ffffff" stroke="#5e6a75" stroke-width="1.1" stroke-linejoin="round"/>
+</svg>

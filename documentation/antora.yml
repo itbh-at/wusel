@@ -1,0 +1,9 @@
+# Antora component descriptor. This file marks `documentation/` as the
+# documentation component. The playbook (antora-playbook.yml) and the UI bundle
+# (ui-bundle/) live in this directory, checked into this repo.
+name: wusel
+title: Wusel
+version: ~        # unversioned (follows the repo state), adjust for releases
+start_page: ROOT:index.adoc
+nav:
+  - modules/ROOT/nav.adoc

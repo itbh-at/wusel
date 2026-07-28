@@ -1,0 +1,162 @@
+// SPDX-License-Identifier: Apache-2.0
+= File-manager integration
+:description: Sidebar status, per-file emblems and context-menu actions in the graphical file manager — what they need and how to build/install them.
+
+Wusel integrates with the graphical file manager on two independent channels,
+both fail-soft (the mount works without either). For the design behind them see
+the xref:architecture.adoc[Architecture]; this page is the practical build and
+install guide, per file manager.
+
+== The two channels
+
+Sidebar entry + sync status:: `libcloudproviders` (D-Bus). Built into the
+daemon — no extra component to compile. Needs the session bus and a one-time
+*system* registration per machine (xref:development.adoc[`desktop
+install-provider`]). Consumed by GNOME Files; KDE/others do not consume it.
+Per-file emblems + context-menu actions:: a *native file-manager extension*
+(one per file manager, see below). It reads each file's state from the FUSE
+xattr `user.wusel.state` and draws emblems / offers "make offline / free
+space". No scripting runtime.
+
+[#xattr]
+== The state xattr (the shared contract)
+
+Every integration reads one extended attribute, so you can inspect it directly
+and any file manager's plugin reads the same thing:
+
+[source,sh]
+----
+getfattr -n user.wusel.state ~/Wusel/Photos/Birdie.jpg
+----
+
+[cols="1,3"]
+|===
+|Value |Meaning
+
+|`online-only` |No local copy yet; opening it fetches from the server (and caches).
+|`cached`      |Opened before: a whole copy is in the LRU cache, but evictable.
+|`pinned`      |Kept offline on purpose (pinned, or under a pinned dir/root).
+|`modified`    |A local edit not yet uploaded.
+|===
+
+The engine guarantees this read is local and network-free, so a file manager
+may query it for every visible file. Directories report a value only when
+pinned.
+
+== GNOME / Nautilus
+
+A native C `libnautilus-extension` module in `integration/nautilus/` (source +
+`Makefile` + README). It adds a per-file emblem and the context-menu actions
+*Make Available Offline* / *Free Up Space* (which call `wusel pin`/`unpin`).
+
+NOTE: `libnautilus-extension` has no hook for file *activation* (double-click) —
+Nautilus opens files via their MIME default, regardless of folder, so a mount
+cannot special-case it. Wusel therefore never overrides double-click; a file in
+`~/Wusel` opens like any other. The planned collaborative open
+(xref:roadmap.adoc[`wusel open`]) is a *context-menu* action, not a double-click
+override.
+
+Every state gets a distinct, always-visible emblem (the OneDrive model). Current
+Adwaita has pruned its stock emblem set, so the extension ships its own icons
+(installed into the hicolor theme):
+
+[cols="1,3"]
+|===
+|State |Emblem
+
+|`online-only` |A cloud — lives on the server, not downloaded.
+|`cached`      |A cloud with a check — downloaded now, but still evictable.
+|`pinned`      |A green check — kept offline, always available.
+|`modified`    |An up-arrow — a local edit awaiting upload.
+|===
+
+.Prerequisites (compiler + Nautilus & GLib development files)
+[cols="1,3"]
+|===
+|Distribution |Packages
+
+|Fedora
+|`sudo dnf install nautilus-devel glib2-devel gcc make`
+
+|Debian / Ubuntu
+|`sudo apt install libnautilus-extension-dev libglib2.0-dev gcc make`
+|===
+
+Build and install:
+
+[source,sh]
+----
+cd integration/nautilus
+make
+sudo make install     # the .so into the extension dir, emblem SVGs into hicolor
+nautilus -q           # restart Nautilus so it loads the extension
+----
+
+`make install` also installs the emblem icons and refreshes the icon cache.
+`make uninstall` removes both. `wusel` must be on `PATH` for the menu actions.
+
+[NOTE]
+====
+The `.so` is tied to the Nautilus *major* version (`extensions-4/` for Nautilus
+4 / GTK4); it is built against the target's own Nautilus. Distribution packages
+(RPM/DEB) build and install it, so end users install the package and it works —
+no `make`, no scripting runtime, no version/venv surface. This "native, not
+Python" choice is deliberate.
+====
+
+Emblem refresh (live, no F5): a menu pin/unpin re-reads the file when the command
+finishes (`invalidate_extension_info`). A *background* hydration (opening a file →
+cached) is pushed by the daemon: it emits a D-Bus signal
+`at.itbh.Wusel.FileChanged(path)`, which the extension subscribes to and turns
+into the same re-read. The daemon reaches the session bus even when started over
+SSH (it falls back to `$XDG_RUNTIME_DIR/bus`).
+
+[NOTE]
+.Known limitation — live refresh is best-effort
+====
+The push refreshes reliably *once the signal fires*, i.e. when hydration
+completes — so a large or queued download delays it, and a very light open that
+reads below the hydration floor never triggers hydration (so no refresh) until
+the file is opened more. The emblem is always correct on the next view reload
+(F5). Making it fully immediate (e.g. show a transient "syncing" emblem the
+moment an open starts, and parallelize hydration) is a future improvement.
+====
+
+Menu labels follow the session locale (built-in de/en; proper gettext is a
+roadmap item).
+
+=== Desktop indexers (default: excluded)
+
+Since opening a file caches it, letting GNOME Tracker/LocalSearch index the mount
+would hydrate everything it walks — a traffic storm. So `exclude_from_indexers`
+is *on by default*: the FUSE root serves synthetic, local-only
+`.trackerignore`/`.nomedia` markers (never uploaded to Nextcloud) that Tracker
+honours to skip the whole subtree. Opt back in with `[desktop]
+exclude_from_indexers = false` in `config.toml`. KDE Baloo ignores such markers —
+exclude `~/Wusel` in its own settings instead.
+
+== Desktop search (GNOME)
+
+Instead of letting a local indexer walk the mount (a download storm, since
+opening a file caches it), the GNOME *Activities overview* searches Nextcloud
+directly: `wusel search-provider` is a D-Bus service
+(`org.gnome.Shell.SearchProvider2`) that GNOME Shell activates on demand and
+answers from the server's Unified Search (`/ocs/v2.php/search/providers/files/
+search`) — including server-side full text where the `fulltextsearch` app is
+present. Clicking a result opens the file locally in the mount when the path
+resolves, else the Nextcloud web page. Registration lives in
+`integration/gnome-search/` (`install.sh`, system-wide); it needs no running
+mount (it loads the account credentials itself). A KDE KRunner equivalent is a
+later addition.
+
+== Other file managers (planned)
+
+All read the same xref:xattr[`user.wusel.state`] xattr; only the presentation
+plugin differs — there is no single mechanism across desktops:
+
+* *KDE Dolphin*: a C++ `KOverlayIconPlugin` (emblems) built against KIO/KF6, plus
+  *declarative* KDE ServiceMenus (`.desktop` files, no code) for the actions.
+  Dolphin does not consume `libcloudproviders`, so account-level sync status is
+  not surfaced in the file manager there — per-file emblems and freedesktop
+  notifications carry it instead.
+* *Nemo / Thunar*: their own extension interfaces, reading the same xattr.

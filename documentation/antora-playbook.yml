@@ -1,0 +1,30 @@
+# Antora playbook for the wusel docs.
+# Run from the documentation directory:  ./build.sh   (or ./build.sh watch)
+#
+# The UI bundle under ./ui-bundle is checked in unpacked. It is adapted from
+# the Antora Default UI and licensed MPL-2.0 (see ui-bundle/LICENSE and
+# ui-bundle/NOTICE).
+site:
+  title: Wusel
+  start_page: wusel::index.adoc
+
+content:
+  sources:
+    # Repo root (one level above this playbook); the component lives in
+    # documentation/. `branches: HEAD` uses the current working tree including
+    # unsaved changes of the checked-out branch.
+    - url: ..
+      branches: HEAD
+      start_path: documentation
+
+runtime:
+  log:
+    format: json
+
+ui:
+  bundle:
+    url: ui-bundle
+
+asciidoc:
+  attributes:
+    attribute-missing: warn@

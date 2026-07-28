@@ -1,0 +1,39 @@
+# Fedora build environment for the Wusel RPM. Matches the target (Fedora), so the
+# binary links against a compatible glibc and rpmbuild is native. The Rust
+# toolchain comes from mise (same mise.toml / pinned version as everywhere else),
+# not a rust: base image — one source of truth for the toolchain.
+
+FROM fedora:44
+
+ENV LANG=C.UTF-8
+
+# Build deps: the C toolchain + headers for the Nautilus extension, fuse3 headers
+# for the FUSE binary, and rpm-build for packaging. curl/git for mise.
+RUN dnf -y install \
+        curl ca-certificates git \
+        gcc make pkgconf-pkg-config \
+        nautilus-devel glib2-devel fuse3-devel \
+        rpm-build \
+    && dnf clean all
+
+# mise for the pinned Rust toolchain (same role as on the host / in the Debian
+# FUSE image). Pinned via MISE_VERSION: mise pins every other tool, so the
+# installer must not be the one floating piece. Keep in sync with the host
+# (`mise version`).
+RUN curl -fsSL https://mise.run | MISE_VERSION=v2026.6.10 sh
+ENV PATH="/root/.local/bin:/root/.local/share/mise/shims:${PATH}"
+ENV MISE_TRUSTED_CONFIG_PATHS="/work"
+RUN printf 'export PATH="/root/.local/bin:/root/.local/share/mise/shims:$PATH"\n' \
+        > /etc/profile.d/mise.sh
+
+WORKDIR /work
+
+# Pre-install just the Rust toolchain from the pinned mise.toml → layer caching
+# (the RPM build needs none of the docs tools).
+COPY mise.toml /work/mise.toml
+RUN mise trust /work/mise.toml && mise install rust
+
+# RPM build output goes to its own target dir, separate from the macOS/Linux ones.
+ENV CARGO_TARGET_DIR="/work/target-rpm"
+
+CMD ["bash"]
