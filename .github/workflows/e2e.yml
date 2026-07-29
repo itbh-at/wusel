@@ -1,0 +1,97 @@
+# SPDX-License-Identifier: Apache-2.0
+# Nightly end-to-end test against a real Nextcloud (FUSE mount + 3-way merge).
+# Runs only when the CODE has changed since the last successful run — tracked by
+# a durable git ref refs/e2e-tested/<code-hash> (not the evictable Actions cache).
+# workflow_dispatch always runs (and can be pointed at any branch for iteration).
+name: E2E
+
+on:
+  schedule:
+    - cron: "0 3 * * *" # nightly, 03:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write # push/delete the refs/e2e-tested/* marker
+
+env:
+  # Paths whose content decides whether an E2E run is warranted (docs excluded).
+  CODE_PATHS: "crates Cargo.toml Cargo.lock packaging integration mise.toml scripts"
+
+jobs:
+  gate:
+    name: gate (run only if code changed)
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
+      hash: ${{ steps.hash.outputs.hash }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: hash
+        run: |
+          h=$(git ls-tree -r HEAD -- $CODE_PATHS | sha256sum | cut -d' ' -f1)
+          echo "hash=$h" >> "$GITHUB_OUTPUT"
+          echo "code hash: $h"
+      - id: decide
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"; echo "manual dispatch -> run"; exit 0
+          fi
+          if git ls-remote --exit-code origin "refs/e2e-tested/${{ steps.hash.outputs.hash }}" >/dev/null 2>&1; then
+            echo "run=false" >> "$GITHUB_OUTPUT"; echo "this code state was already tested -> skip"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"; echo "code changed since last run -> run"
+          fi
+
+  e2e:
+    name: FUSE + real Nextcloud
+    needs: gate
+    if: needs.gate.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    services:
+      nextcloud:
+        image: nextcloud:latest
+        env:
+          SQLITE_DATABASE: nextcloud
+          NEXTCLOUD_ADMIN_USER: admin
+          NEXTCLOUD_ADMIN_PASSWORD: adminpass
+          NEXTCLOUD_TRUSTED_DOMAINS: localhost 127.0.0.1
+        ports:
+          - 8080:80
+    env:
+      NC_URL: http://localhost:8080
+      NC_USER: admin
+      NC_PASS: adminpass
+      WUSEL: target/debug/wusel
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install FUSE + headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends fuse3 libfuse3-dev pkg-config
+      - uses: jdx/mise-action@v2
+        with:
+          install: false
+      - name: Install the pinned Rust toolchain
+        run: mise install rust
+      - name: Build wusel (with FUSE)
+        run: mise exec -- cargo build -p wusel --features fuse
+      - name: Run the E2E test
+        run: bash scripts/e2e-nextcloud.sh
+
+  mark:
+    name: record tested code state
+    needs: [gate, e2e]
+    if: needs.gate.outputs.run == 'true' && needs.e2e.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Mark this code hash as tested
+        env:
+          HASH: ${{ needs.gate.outputs.hash }}
+        run: |
+          # Keep exactly one marker: drop the others, then record this one.
+          git ls-remote origin 'refs/e2e-tested/*' | awk '{print $2}' | while read -r ref; do
+            [ "$ref" = "refs/e2e-tested/$HASH" ] || git push origin ":$ref" || true
+          done
+          git push origin "HEAD:refs/e2e-tested/$HASH"
+          echo "recorded refs/e2e-tested/$HASH"
