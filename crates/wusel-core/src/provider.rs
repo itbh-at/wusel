@@ -19,7 +19,7 @@ use std::sync::Arc;
 use crate::content::{CachingSource, ContentSource, LiveWebDav};
 use crate::desktop::{self, Desktop, Notice, Status};
 use crate::ignore::is_ignored;
-use crate::model::RemoteEntry;
+use crate::model::{basename, RemoteEntry};
 use crate::state::{NodeRow, StateDb, ROOT_INODE};
 use crate::webdav::WebDavClient;
 use crate::{Error, Result};
@@ -378,11 +378,6 @@ fn walk_dir(
         }
     }
     Ok(())
-}
-
-/// The last path segment (a child's name).
-fn basename(path: &str) -> &str {
-    path.rsplit('/').next().unwrap_or(path)
 }
 
 /// Count and total size of the cached content blobs (files without an
@@ -850,20 +845,22 @@ impl Provider {
         base_etag: &str,
     ) -> Result<()> {
         let mtime = self.pending_mtime.get(&inode).copied();
+        // What we may legitimately assert about the server. A file id means the
+        // file already exists there, which is what separates a deferred create
+        // (`If-None-Match: *`) from a plain save whose ETag we happen not to know
+        // — the latter must go out unconditionally rather than claim the file is
+        // absent. See [`crate::webdav::Precondition`].
+        let pre = crate::webdav::Precondition::for_upload(base_etag, node.file_id.is_some());
         // Conditional upload — chunked for large files (bounded memory), else a
-        // plain PUT. Both reject with 412 if the server changed under us (or, for
-        // a deferred create's empty base ETag, if a same-named file appeared on
-        // the server — `If-None-Match: *`). Note we do NOT `?` the upload: a
-        // transient failure must keep the buffer.
+        // plain PUT. Both reject with 412 when the precondition fails. Note we do
+        // NOT `?` the upload: a transient failure must keep the buffer.
         let result = if size > crate::webdav::CHUNK_SIZE {
-            self.rt.block_on(
-                self.dav
-                    .put_chunked(&node.path, path, size, base_etag, mtime),
-            )
+            self.rt
+                .block_on(self.dav.put_chunked(&node.path, path, size, &pre, mtime))
         } else {
             let bytes = std::fs::read(path)?;
             self.rt
-                .block_on(self.dav.put_if_match(&node.path, bytes, base_etag, mtime))
+                .block_on(self.dav.put_conditional(&node.path, bytes, &pre, mtime))
         };
         match result {
             Ok(crate::webdav::PutResult::Uploaded(new_etag)) => {
@@ -923,37 +920,56 @@ impl Provider {
     ) -> Result<()> {
         if self.text_merge {
             let local = std::fs::read(scratch)?;
-            if let Some(merged) = self.try_text_merge(node, &local, base_etag)? {
-                let new_etag = self
-                    .rt
-                    .block_on(self.dav.put(&node.path, merged.clone()))?
-                    .unwrap_or_default();
-                let size = merged.len() as u64;
-                self.state.set_etag_size(node.inode, &new_etag, size)?;
-                let mut updated = node.clone();
-                updated.etag = new_etag.clone();
-                updated.size = size;
-                self.content.store(&updated, &merged, &new_etag)?;
-                tracing::info!(path = %node.path, "conflict auto-merged");
-                return Ok(());
+            if let Some((merged, theirs)) = self.try_text_merge(node, &local, base_etag)? {
+                // Upload the merge **conditionally against the very version it
+                // was merged from**. The merge result is only correct for that
+                // "theirs"; an unconditional PUT here would silently discard a
+                // third change that landed between our GET and this PUT — the
+                // exact lost update the whole 412 machinery exists to prevent.
+                let result = self.rt.block_on(self.dav.put_conditional(
+                    &node.path,
+                    merged.clone(),
+                    &theirs,
+                    None,
+                ))?;
+                match result {
+                    crate::webdav::PutResult::Uploaded(new_etag) => {
+                        let new_etag = new_etag.unwrap_or_default();
+                        let size = merged.len() as u64;
+                        self.state.set_etag_size(node.inode, &new_etag, size)?;
+                        let mut updated = node.clone();
+                        updated.etag = new_etag.clone();
+                        updated.size = size;
+                        self.content.store(&updated, &merged, &new_etag)?;
+                        tracing::info!(path = %node.path, "conflict auto-merged");
+                        return Ok(());
+                    }
+                    crate::webdav::PutResult::Conflict => {
+                        // The server moved on again while we were merging, so the
+                        // merge is stale. Fall through to the conflicted copy —
+                        // the user's bytes survive either way.
+                        tracing::debug!(path = %node.path, "merge raced another server change — falling back to a conflicted copy");
+                    }
+                }
             }
         }
         // Conflict copy: the server version stays; our edit lands beside it
-        // (chunked for large files). The copy uploads with an empty base ETag —
-        // `If-None-Match: *` — because its timestamped name has 1-second
+        // (chunked for large files). The copy uploads with `MustNotExist`
+        // (`If-None-Match: *`) because its timestamped name has 1-second
         // resolution: a second conflict in the same second would otherwise
         // silently overwrite the first copy. On a 412, retry under a
         // de-duplicated name, a small bounded number of times.
         const MAX_COPY_ATTEMPTS: u32 = 4;
+        let fresh = crate::webdav::Precondition::MustNotExist;
         let mut copy = conflict_copy_path(&node.path, 0);
         for attempt in 0..MAX_COPY_ATTEMPTS {
             let result = if size > crate::webdav::CHUNK_SIZE {
                 self.rt
-                    .block_on(self.dav.put_chunked(&copy, scratch, size, "", None))?
+                    .block_on(self.dav.put_chunked(&copy, scratch, size, &fresh, None))?
             } else {
                 let local = std::fs::read(scratch)?;
                 self.rt
-                    .block_on(self.dav.put_if_match(&copy, local, "", None))?
+                    .block_on(self.dav.put_conditional(&copy, local, &fresh, None))?
             };
             match result {
                 crate::webdav::PutResult::Uploaded(_) => break,
@@ -987,25 +1003,35 @@ impl Provider {
     /// Attempt a 3-way text merge (base = cached last-known, ours = local,
     /// theirs = current server). `None` if a merge is not possible (no clean
     /// base, non-UTF-8, or a merge conflict).
+    ///
+    /// On success it returns the merged bytes **and** the precondition naming the
+    /// "theirs" it merged against, so the caller can upload the result
+    /// conditionally on exactly that version (see [`Self::resolve_conflict`]).
     fn try_text_merge(
         &mut self,
         node: &NodeRow,
         local: &[u8],
         _base_etag: &str,
-    ) -> Result<Option<Vec<u8>>> {
+    ) -> Result<Option<(Vec<u8>, crate::webdav::Precondition)>> {
         let Some(base) = self.content.cached_bytes(node) else {
             return Ok(None); // no clean base to merge against
         };
-        let theirs = self.rt.block_on(self.dav.get(&node.path, None))?.to_vec();
+        let (theirs, theirs_etag) = self.rt.block_on(self.dav.get_with_etag(&node.path))?;
+        // The file demonstrably exists (we just read it), so an absent ETag means
+        // "version unknown" → upload unconditionally, never `If-None-Match: *`.
+        let pre = crate::webdav::Precondition::for_upload(
+            theirs_etag.as_deref().unwrap_or_default(),
+            true,
+        );
         let (Ok(base), Ok(ours), Ok(theirs)) = (
             String::from_utf8(base),
             String::from_utf8(local.to_vec()),
-            String::from_utf8(theirs),
+            String::from_utf8(theirs.to_vec()),
         ) else {
             return Ok(None); // binary content → cannot text-merge
         };
         match diffy::merge(&base, &ours, &theirs) {
-            Ok(merged) => Ok(Some(merged.into_bytes())),
+            Ok(merged) => Ok(Some((merged.into_bytes(), pre))),
             Err(_conflicted) => Ok(None), // real conflict → fall back to a copy
         }
     }
@@ -1086,8 +1112,52 @@ impl Provider {
         self.drop_scratch(node.inode);
         self.pending_mtime.remove(&node.inode);
         self.ignored.remove(&node.inode);
+        self.unpin_removed_subtree(&node)?;
         self.state.remove_subtree(node.inode)?;
         self.bump_write_epoch(); // a child vanished — an in-flight PROPFIND must not re-add it
+        Ok(())
+    }
+
+    /// Drop the pins a deleted subtree carried, and the eviction markers beside
+    /// its cache blobs.
+    ///
+    /// Both are path-keyed promises about files that no longer exist. A leftover
+    /// `.pin` marker is not merely untidy: eviction skips a pinned blob **and**
+    /// does not count it against `cache_max_bytes`, so those bytes would be
+    /// exempt from the cache budget forever — and a later file handed the same
+    /// Nextcloud file id would inherit the protection.
+    ///
+    /// Called before the rows go away, since the file ids come from them. The
+    /// scan over the node table only happens when a pin actually covers this
+    /// subtree — a plain `rm` of unpinned files stays a pure local delete.
+    fn unpin_removed_subtree(&mut self, node: &NodeRow) -> Result<()> {
+        // An ancestor (or root) pin covers this path without being *under* it.
+        let covered = self.state.is_pinned(&node.path)?;
+        let removed = self.state.remove_pins_under(&node.path)?;
+        if !covered && removed == 0 {
+            return Ok(());
+        }
+        for (_, file_id) in self.state.descendant_file_ids(&node.path)? {
+            self.content.unpin_file(file_id);
+        }
+        Ok(())
+    }
+
+    /// Drop the eviction markers of a destination that a rename is about to
+    /// replace — **without** touching the pin rows.
+    ///
+    /// The distinction matters: on a delete the path goes away, so its pins go
+    /// with it ([`unpin_removed_subtree`](Self::unpin_removed_subtree)). On an
+    /// overwrite the path survives and carries new content, so a pin on it must
+    /// stay and now cover the *new* object. What must not survive is the
+    /// replaced object's `.pin` marker: its blob is keyed by the old file id
+    /// and is about to become unreachable, yet a pin marker would keep it
+    /// exempt from eviction — a leak that never shrinks, since the eviction
+    /// budget deliberately does not count pinned blobs.
+    fn drop_replaced_eviction_markers(&mut self, replaced: &NodeRow) -> Result<()> {
+        for (_, file_id) in self.state.descendant_file_ids(&replaced.path)? {
+            self.content.unpin_file(file_id);
+        }
         Ok(())
     }
 
@@ -1114,6 +1184,7 @@ impl Provider {
                 if existing.inode != node.inode {
                     self.drop_scratch(existing.inode);
                     self.ignored.remove(&existing.inode);
+                    self.drop_replaced_eviction_markers(&existing)?;
                     self.state.remove_subtree(existing.inode)?;
                     // The promotion MUST overwrite the replaced destination —
                     // this is the office-suite atomic save (write an ignored
@@ -1141,7 +1212,32 @@ impl Provider {
                 if let Some(s) = self.scratch.get_mut(&node.inode) {
                     s.dirty = true;
                 }
-                self.flush(node.inode)?;
+                // A failed upload must NOT fail the rename. The local rename is
+                // already committed above, so returning an error here would tell
+                // the kernel "the rename did not happen" while our state says it
+                // did — and the kernel's dentry cache would keep the old name,
+                // permanently out of step with us. It is also the wrong answer
+                // for the user: this is the office-suite atomic save, where EIO
+                // on the rename reads as "your document could not be saved",
+                // although the content is safe in the scratch and only the
+                // upload is outstanding.
+                //
+                // So the rename succeeds locally and the upload is retried by
+                // the next flush/fsync/release (`flush` keeps the buffer on
+                // failure). The user is not left in the dark: `flush` has
+                // already put the desktop indicator on Error and sent the
+                // `UploadFailed` notification.
+                if let Err(e) = self.flush(node.inode) {
+                    let path = self
+                        .state
+                        .node_by_inode(node.inode)?
+                        .map(|n| n.path)
+                        .unwrap_or_default();
+                    tracing::warn!(
+                        %path, %e,
+                        "promotion upload failed — the rename stands locally, the buffer is kept for a later retry"
+                    );
+                }
             }
             return Ok(());
         }
@@ -1160,6 +1256,7 @@ impl Provider {
             if existing.inode != node.inode {
                 self.drop_scratch(existing.inode);
                 self.ignored.remove(&existing.inode);
+                self.drop_replaced_eviction_markers(&existing)?;
                 self.state.remove_subtree(existing.inode)?;
             }
         }

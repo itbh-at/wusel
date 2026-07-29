@@ -296,6 +296,27 @@ impl ReadWindow {
     }
 }
 
+/// A window that goes away takes its unfinished spill file with it.
+///
+/// ## Rust learning note: RAII instead of cleanup at every exit
+/// `read_windowed` takes the window *out* of the map and then does network I/O
+/// with `?`. Every such early return drops the window, and without this impl the
+/// spill file would survive as an orphan — invisible to eviction (it has an
+/// extension, so [`evict`] skips it) and removed only by the next process
+/// start's sweep. One orphan per failed read is an unbounded leak, because each
+/// window gets its own `<file_id>.<seq>.ra` path. Tying the cleanup to the
+/// value's lifetime covers *all* exits, including a panic, which no amount of
+/// hand-written cleanup at each `?` can.
+///
+/// The paths that legitimately keep the file take the spill out first
+/// ([`CachingSource::publish_window`] does `w.part.take()` before renaming), so
+/// `part` is already `None` here and a published blob is never touched.
+impl Drop for ReadWindow {
+    fn drop(&mut self) {
+        self.drop_part();
+    }
+}
+
 /// Caching decorator: caches whole files on disk, keyed by their Nextcloud file
 /// id and validated by ETag. A changed ETag invalidates the cached copy. A size
 /// budget (LRU eviction) and an optional max age keep the cache bounded.
@@ -411,10 +432,13 @@ impl CachingSource {
             let _ = std::fs::remove_file(&part); // incomplete — do not publish
             return Err(e);
         }
-        // Publish atomically, then record the ETag so a crashed download is not
-        // mistaken for a complete one.
-        std::fs::rename(&part, blob)?;
-        std::fs::write(etag_path(blob), &node.etag)?;
+        // Publish atomically — sidecar first, then the bytes (see `publish_blob`
+        // for why that order matters), so a crashed download is never mistaken
+        // for a complete one. A failed publish leaves no temp behind either.
+        if let Err(e) = publish_blob(&part, blob, &node.etag) {
+            let _ = std::fs::remove_file(&part);
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -445,9 +469,9 @@ impl CachingSource {
             match windows.remove(&file_id) {
                 Some(w) if w.etag == node.etag && offset == w.next => w,
                 prior => {
-                    if let Some(mut w) = prior {
-                        w.drop_part(); // broken run — the spill can never complete
-                    }
+                    // Broken run — its spill can never complete, and dropping
+                    // the old window deletes it (see `Drop for ReadWindow`).
+                    drop(prior);
                     // The spill writes into the cache dir; on a fresh account it
                     // may not exist yet and the spill would then fail silently on
                     // every run (fetch_whole/store create it, reads never did).
@@ -503,11 +527,19 @@ impl CachingSource {
                 let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
                 let total = seen.entry(file_id).or_insert(0);
                 *total = total.saturating_add(out.len() as u64);
-                if *total >= hydrate_trigger(node.size) {
-                    seen.remove(&file_id);
-                    if seen.len() > MAX_SEEN {
-                        seen.clear(); // backstop against unbounded growth
-                    }
+                let reached = *total >= hydrate_trigger(node.size);
+                if reached {
+                    seen.remove(&file_id); // hydration requested — stop tallying it
+                }
+                // The backstop has to sit *outside* the branch above: the map
+                // only grows on the reads that do **not** reach the trigger — a
+                // scanner peeking at very many files adds an entry each time and
+                // removes none. Checking it only where an entry is removed made
+                // the cap unreachable (see `MAX_SEEN`).
+                if seen.len() > MAX_SEEN {
+                    seen.clear(); // crude, but it bounds the map
+                }
+                if reached {
                     drop(seen);
                     hydrator.request(node);
                 }
@@ -523,19 +555,29 @@ impl CachingSource {
             return;
         };
         let blob = self.dir.join(file_id.to_string());
-        if std::fs::rename(&part, &blob)
-            .and_then(|()| std::fs::write(etag_path(&blob), &node.etag))
-            .is_ok()
-        {
-            tracing::debug!(path = %node.path, "cached whole file after sequential read");
-            self.enforce_budget();
-        } else {
-            let _ = std::fs::remove_file(&part);
-            let _ = std::fs::remove_file(&blob);
+        match publish_blob(&part, &blob, &node.etag) {
+            Ok(()) => {
+                tracing::debug!(path = %node.path, "cached whole file after sequential read");
+                self.enforce_budget();
+            }
+            Err(e) => {
+                tracing::debug!(%e, path = %node.path, "publishing the read spill failed");
+                // Only our own temp is ours to remove. The blob may already hold
+                // valid bytes — ours (the rename succeeded and only the sidecar
+                // write failed) or those of a publisher that won a concurrent
+                // race; deleting it would throw away a correct cache entry. With
+                // no matching sidecar it simply reads as "not fresh" and is a
+                // normal eviction candidate.
+                let _ = std::fs::remove_file(&part);
+            }
         }
     }
 
     /// Retain a window, evicting the least-recently-used one over the cap.
+    ///
+    /// Both removals below abandon the evicted window's spill file implicitly:
+    /// the returned value is dropped right away, and `Drop for ReadWindow`
+    /// deletes the spill — no explicit `drop_part` needed.
     fn keep_window(windows: &mut HashMap<u64, ReadWindow>, file_id: u64, w: ReadWindow) {
         if windows.len() >= MAX_WINDOWS {
             if let Some(oldest) = windows
@@ -543,17 +585,13 @@ impl CachingSource {
                 .min_by_key(|(_, w)| w.last_use)
                 .map(|(id, _)| *id)
             {
-                if let Some(mut old) = windows.remove(&oldest) {
-                    old.drop_part();
-                }
+                windows.remove(&oldest);
             }
         }
         // A concurrent reader of the same file may have inserted its own window
         // while ours was out of the map (reads run unlocked); last one wins,
         // the loser's spill is abandoned.
-        if let Some(mut old) = windows.insert(file_id, w) {
-            old.drop_part();
-        }
+        windows.insert(file_id, w);
     }
 
     /// Best-effort eviction: age-based expiry, then LRU down to the size budget.
@@ -593,8 +631,12 @@ fn download_whole(
         return Err(e);
     }
     let blob = dir.join(file_id.to_string());
-    std::fs::rename(&part, &blob)?;
-    std::fs::write(etag_path(&blob), &node.etag)?;
+    // Same publish protocol as everywhere else (see `publish_blob`); the `.dl`
+    // temp is cleaned up on a failed publish too, not just on a failed download.
+    if let Err(e) = publish_blob(&part, &blob, &node.etag) {
+        let _ = std::fs::remove_file(&part);
+        return Err(e);
+    }
     Ok(())
 }
 
@@ -904,10 +946,16 @@ impl ContentSource for CachingSource {
                 return Ok(());
             }
         }
-        // Otherwise stream through `read` (which serves live per range and does
-        // not cache), bounding memory to one chunk and never capping the size.
-        // The caller decides whether to also cache this base (see the write path,
-        // which stores it for a later 3-way merge).
+        // Otherwise stream it through `read`, bounding memory to one chunk and
+        // never capping the size. Note that this is not necessarily cache-free:
+        // a file smaller than `FETCH_CHUNK` is fetched by a single read from
+        // offset 0, which opens a spill window that immediately completes and
+        // publishes a blob (see `read_windowed`). That is welcome — the bytes
+        // are on disk anyway — but it means the cache may be warm afterwards.
+        // Larger files read in exact `FETCH_CHUNK` strides, which bypass the
+        // window entirely and cache nothing. Either way the caller decides
+        // whether to *deliberately* cache this base (see the write path, which
+        // stores it for a later 3-way merge).
         let mut out = File::create(dest)?;
         if let Err(e) = stream_full(self, node, &mut out) {
             drop(out);
@@ -1179,6 +1227,254 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Put a directory where a blob belongs, so any attempt to rename new bytes
+    /// onto it fails — the cheapest way to exercise a publish that dies *after*
+    /// the content is staged. Returns nothing; the caller knows the path.
+    fn block_blob_path(blob: &Path) {
+        let _ = std::fs::remove_file(blob);
+        std::fs::create_dir_all(blob.join("in-the-way")).unwrap();
+    }
+
+    #[test]
+    fn publish_blob_removes_the_stale_sidecar_before_renaming() {
+        // The ordering contract itself: the old ETag must be gone before the new
+        // bytes appear. With the rename made impossible, a "rename first, write
+        // the sidecar after" implementation would leave the old ETag in place.
+        let dir = std::env::temp_dir().join(format!("wusel-publish-order-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let blob = dir.join("42");
+        std::fs::write(&blob, b"old").unwrap();
+        std::fs::write(etag_path(&blob), "etag-old").unwrap();
+        block_blob_path(&blob);
+
+        let tmp = dir.join("42.part"); // deliberately absent → the rename fails
+        assert!(
+            publish_blob(&tmp, &blob, "etag-new").is_err(),
+            "an impossible rename must be reported"
+        );
+        assert!(
+            !etag_path(&blob).exists(),
+            "the stale sidecar must be removed before the rename is attempted"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn fetch_whole_publishes_through_the_atomic_helper() {
+        let dir = std::env::temp_dir().join(format!("wusel-fetch-publish-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // An older cached copy of the same file id, still carrying its old ETag.
+        let blob = dir.join("42");
+        std::fs::write(&blob, b"old").unwrap();
+        std::fs::write(etag_path(&blob), "etag-old").unwrap();
+
+        let data = vec![3u8; 1000];
+        let inner = Counting {
+            calls: Arc::new(AtomicUsize::new(0)),
+            data: data.clone(),
+        };
+        let cache = CachingSource::new(Box::new(inner), dir.clone(), None, None, None);
+        let n = node(1000, "etag-new");
+
+        // Pinning forces a full fetch: bytes and sidecar must agree afterwards.
+        cache.pin_file(&n).unwrap();
+        assert_eq!(std::fs::read(&blob).unwrap(), data, "new bytes published");
+        assert_eq!(
+            std::fs::read_to_string(etag_path(&blob)).unwrap(),
+            "etag-new"
+        );
+
+        // Now let the publish fail after the download is staged. The stale ETag
+        // must be gone all the same — surviving it would validate the *next*
+        // publisher's bytes against a dead ETag.
+        block_blob_path(&blob);
+        std::fs::write(etag_path(&blob), "etag-old").unwrap();
+        assert!(
+            cache.pin_file(&node(1000, "etag-newer")).is_err(),
+            "publishing onto a directory must fail"
+        );
+        assert!(
+            !etag_path(&blob).exists(),
+            "the stale sidecar must not survive a failed publish"
+        );
+        assert!(
+            !dir.join("42.part").exists(),
+            "the staged download must be cleaned up"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn download_whole_publishes_through_the_atomic_helper() {
+        let dir = std::env::temp_dir().join(format!("wusel-dl-publish-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let blob = dir.join("42");
+        std::fs::write(&blob, b"old").unwrap();
+        std::fs::write(etag_path(&blob), "etag-old").unwrap();
+
+        let data = vec![5u8; 1000];
+        let source = Counting {
+            calls: Arc::new(AtomicUsize::new(0)),
+            data: data.clone(),
+        };
+        download_whole(&source, &node(1000, "etag-new"), &dir, 42).unwrap();
+        assert_eq!(std::fs::read(&blob).unwrap(), data, "new bytes published");
+        assert_eq!(
+            std::fs::read_to_string(etag_path(&blob)).unwrap(),
+            "etag-new"
+        );
+
+        block_blob_path(&blob);
+        std::fs::write(etag_path(&blob), "etag-old").unwrap();
+        assert!(
+            download_whole(&source, &node(1000, "etag-newer"), &dir, 42).is_err(),
+            "publishing onto a directory must fail"
+        );
+        assert!(
+            !etag_path(&blob).exists(),
+            "the stale sidecar must not survive a failed publish"
+        );
+        assert!(
+            !dir.join("42.dl").exists(),
+            "the staged download must be cleaned up"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Read `n` end to end in kernel-sized steps — the `cp` pattern that makes a
+    /// from-0 run spill to disk and publish itself as a cache blob.
+    fn sequential_pass(cache: &CachingSource, n: &NodeRow) {
+        let step: u32 = 128 * 1024;
+        let mut got = 0u64;
+        while got < n.size {
+            let chunk = cache.read(n, got, step).unwrap();
+            assert!(!chunk.is_empty(), "no premature EOF");
+            got += chunk.len() as u64;
+        }
+    }
+
+    #[test]
+    fn publish_window_publishes_through_the_atomic_helper() {
+        let dir = std::env::temp_dir().join(format!("wusel-window-publish-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let blob = dir.join("42");
+        std::fs::write(&blob, b"old").unwrap();
+        std::fs::write(etag_path(&blob), "etag-old").unwrap();
+
+        let size: usize = 600 * 1024; // past READAHEAD_AFTER, so the run escalates
+        let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+        let inner = Counting {
+            calls: Arc::new(AtomicUsize::new(0)),
+            data: data.clone(),
+        };
+        let cache = CachingSource::new(Box::new(inner), dir.clone(), None, None, None);
+        let n = node(size as u64, "etag-new");
+
+        sequential_pass(&cache, &n);
+        assert_eq!(std::fs::read(&blob).unwrap(), data, "spill published");
+        assert_eq!(
+            std::fs::read_to_string(etag_path(&blob)).unwrap(),
+            "etag-new"
+        );
+
+        block_blob_path(&blob);
+        std::fs::write(etag_path(&blob), "etag-old").unwrap();
+        sequential_pass(&cache, &node(size as u64, "etag-newer"));
+        assert!(
+            !etag_path(&blob).exists(),
+            "the stale sidecar must not survive a failed publish"
+        );
+        assert!(
+            spill_files(&dir).is_empty(),
+            "a failed publish must not orphan the spill, leftovers: {:?}",
+            spill_files(&dir)
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_failed_sidecar_write_does_not_destroy_the_published_blob() {
+        // Rename succeeds, the sidecar write cannot (its path is a directory).
+        // The blob at that point holds valid bytes — ours, or those of a
+        // publisher that won a concurrent race. Deleting it throws away a
+        // correct cache entry; without a sidecar it merely reads as "not fresh".
+        let dir = std::env::temp_dir().join(format!("wusel-sidecar-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let blob = dir.join("42");
+        std::fs::create_dir_all(etag_path(&blob).join("in-the-way")).unwrap();
+
+        let size: usize = 600 * 1024;
+        let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+        let inner = Counting {
+            calls: Arc::new(AtomicUsize::new(0)),
+            data: data.clone(),
+        };
+        let cache = CachingSource::new(Box::new(inner), dir.clone(), None, None, None);
+
+        sequential_pass(&cache, &node(size as u64, "etag-1"));
+
+        assert!(blob.exists(), "a valid blob must not be deleted");
+        assert_eq!(std::fs::read(&blob).unwrap(), data, "and stays intact");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_seen_tally_stays_bounded_when_many_files_are_only_peeked_at() {
+        // A scanner touching a little of very many files: no file ever reaches
+        // its hydration trigger, so no entry is ever removed. MAX_SEEN is the
+        // documented backstop against the map growing without bound.
+        let dir = std::env::temp_dir().join(format!("wusel-seen-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let size: usize = 100 * 1024; // trigger = the whole file; a 1 KiB peek is far below
+        let counting = |data: Vec<u8>| Counting {
+            calls: Arc::new(AtomicUsize::new(0)),
+            data,
+        };
+        // The tally only runs when background hydration is configured.
+        let hydrate = HydrationConfig {
+            source: Box::new(counting(vec![1u8; size])),
+            invalidations: None,
+        };
+        let cache = CachingSource::new(
+            Box::new(counting(vec![1u8; size])),
+            dir.clone(),
+            None,
+            None,
+            Some(hydrate),
+        );
+
+        let mut n = node(size as u64, "etag-1");
+        for fid in 1..=(MAX_SEEN as u64 + 2) {
+            n.file_id = Some(fid);
+            // Offset > 0: no spill file, so the read counts toward hydration.
+            assert_eq!(cache.read(&n, 4096, 1024).unwrap().len(), 1024);
+        }
+
+        let len = cache.seen.lock().unwrap().len();
+        assert!(
+            len <= MAX_SEEN,
+            "the read tally must stay bounded, holds {len} entries"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn hydrate_trigger_separates_opens_from_peeks() {
         // Large file: the floor (not a fraction), so a single open — which reads
@@ -1431,6 +1727,66 @@ mod tests {
             ((FETCH_CHUNK as u64) % 251) as u8
         );
         assert_eq!(got[size as usize - 1], (((size - 1) % 251) as u8));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A source that serves `ok_reads` reads and fails afterwards — for
+    /// exercising the read path's error branches (a dropped connection mid-run).
+    struct FailAfter {
+        ok_reads: AtomicUsize,
+        data: Vec<u8>,
+    }
+    impl ContentSource for FailAfter {
+        fn read(&self, _node: &NodeRow, offset: u64, len: u32) -> Result<Vec<u8>> {
+            if self.ok_reads.load(Ordering::SeqCst) == 0 {
+                return Err(crate::Error::Other("connection reset".into()));
+            }
+            self.ok_reads.fetch_sub(1, Ordering::SeqCst);
+            let start = (offset as usize).min(self.data.len());
+            let end = std::cmp::min(start + len as usize, self.data.len());
+            Ok(self.data[start..end].to_vec())
+        }
+    }
+
+    /// The names of all readahead spill files left in `dir` — so a leak assertion
+    /// can name the orphans instead of just failing.
+    fn spill_files(dir: &Path) -> Vec<String> {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        rd.flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "ra"))
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn a_failed_read_leaves_no_spill_file_behind() {
+        let dir = std::env::temp_dir().join(format!("wusel-cache-spill-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let size: usize = 4096;
+        let inner = FailAfter {
+            ok_reads: AtomicUsize::new(1), // the first read works, the next fails
+            data: vec![9u8; size],
+        };
+        let cache = CachingSource::new(Box::new(inner), dir.clone(), None, None, None);
+        let n = node(size as u64, "etag-1");
+
+        // A run from byte 0 opens a spill file; the follow-up read fails, so the
+        // window is dropped without ever completing.
+        assert_eq!(cache.read(&n, 0, 512).unwrap().len(), 512);
+        assert!(cache.read(&n, 512, 512).is_err(), "the second read fails");
+
+        // Spill files carry an extension, so eviction never counts or removes
+        // them: one orphan per failed attempt would grow the cache dir forever.
+        assert!(
+            spill_files(&dir).is_empty(),
+            "the spill must be cleaned up on the error path, leftovers: {:?}",
+            spill_files(&dir)
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

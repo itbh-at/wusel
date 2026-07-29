@@ -1,3 +1,8 @@
+////
+  // SPDX-License-Identifier: Apache-2.0
+  // Copyright 2026 IT Beratung Hermann GmbH
+////
+
 = Contributing
 
 Wusel is developed by https://itbh.at/[*IT Beratung Hermann GmbH (ITBH)*] and is
@@ -47,6 +52,14 @@ helped write it.
 * *Low-effort noise is ignored.* Pseudo-findings, duplicate pile-ons, automated
   mass submissions, or a steady stream of unreviewed AI-generated reports will be
   ignored from that source onward.
+
+== Security reports go elsewhere
+
+A suspected *vulnerability* does not belong in a public issue. Report it
+privately — GitHub's "Report a vulnerability" form on the repository, or
+mailto:christoph.hermann@itbh.at[christoph.hermann@itbh.at]. Scope, what counts
+as out of scope, and the response times you can expect are in `SECURITY.md` in
+the repository root.
 
 == In short
 

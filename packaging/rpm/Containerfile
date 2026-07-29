@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 IT Beratung Hermann GmbH
+
 # Fedora build environment for the Wusel RPM. Matches the target (Fedora), so the
 # binary links against a compatible glibc and rpmbuild is native. The Rust
 # toolchain comes from mise (same mise.toml / pinned version as everywhere else),

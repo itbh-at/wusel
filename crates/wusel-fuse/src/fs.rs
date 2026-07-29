@@ -47,10 +47,20 @@ fn system_time_from_unix(secs: i64) -> SystemTime {
 /// [`system_time_from_unix`]. `duration_since(UNIX_EPOCH)` errs for pre-epoch
 /// instants; the error carries the backwards distance, which is our negative
 /// timestamp.
+///
+/// Both directions **saturate**. The distance is a `Duration`, i.e. unsigned
+/// and up to `u64::MAX` seconds, while our timestamp is an `i64`: a plain
+/// `as i64` would wrap. An application can hand us exactly that through
+/// `utimensat` with `tv_sec = i64::MIN` — the backwards distance is then 2^63
+/// seconds, `as i64` wraps to `i64::MIN`, and negating *that* panics in a debug
+/// build (and wraps silently in release). Clamping to the `i64` ends keeps the
+/// timestamp as close to the request as it can be represented.
 fn unix_from_system_time(t: SystemTime) -> i64 {
     match t.duration_since(UNIX_EPOCH) {
-        Ok(d) => d.as_secs() as i64,
-        Err(e) => -(e.duration().as_secs() as i64),
+        Ok(d) => i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
+        // `-i64::MIN` has no positive counterpart, so the negation is done on
+        // the checked value: anything past it clamps to `i64::MIN`.
+        Err(e) => i64::try_from(e.duration().as_secs()).map_or(i64::MIN, |s| -s),
     }
 }
 
@@ -114,6 +124,37 @@ fn marker_attr(ino: u64) -> FileAttr {
     }
 }
 
+/// Where a `readdir` chunk starts in the listing.
+///
+/// FUSE carries the offset as `i64`, and as in `read`/`write` a negative one is
+/// never valid. It has to be rejected explicitly: `offset as usize` would wrap
+/// it into a huge number, `skip` would swallow the whole listing, and the reply
+/// would be an empty — i.e. "end of directory" — answer to a bogus request.
+fn dir_offset(offset: i64) -> Result<usize, i32> {
+    if offset < 0 {
+        Err(libc::EINVAL)
+    } else {
+        Ok(offset as usize)
+    }
+}
+
+/// How many directory streams may keep a snapshot at the same time.
+///
+/// A snapshot is a full copy of one directory's entries, so N open handles on
+/// the same huge directory cost N copies of its names — an amplification with
+/// no natural bound, since a process may hold as many dirfds as its `RLIMIT_NOFILE`
+/// allows. Past the cap a stream is simply not registered and `readdir` falls
+/// back to a fresh listing per chunk (see there): correct, and what every
+/// unknown handle already got, only without the intra-stream stability the
+/// snapshot buys. Real workloads stay far below — a file manager, an indexer
+/// and a shell together hold a handful of directories open, not sixty.
+const MAX_DIR_STREAMS: usize = 64;
+
+/// The listing served when a handle has no snapshot and none could be built —
+/// unreachable by construction, and an empty listing (i.e. "end of directory")
+/// is the harmless answer if it ever were reached.
+const NO_ENTRIES: &[(u64, FileType, String)] = &[];
+
 pub struct NcFs {
     provider: Provider,
     /// Expose the synthetic indexer-exclusion markers at the root (opt-in).
@@ -122,13 +163,16 @@ pub struct NcFs {
     /// out in `opendir`. A directory stream arrives as several `readdir`
     /// chunks indexed by offset; recomputing the listing per chunk would let a
     /// background revalidation between two chunks shift the offsets and skip
-    /// or duplicate entries. Snapshotting once per `opendir` keeps one stream
-    /// internally consistent. FUSE requests are served on a single thread
-    /// (like everything else in this adapter), so a plain map needs no lock.
+    /// or duplicate entries. One snapshot per *traversal* keeps a stream
+    /// internally consistent — it is taken when the stream starts (`readdir`
+    /// at offset 0, see there) and reused for every continuation chunk.
+    /// FUSE requests are served on a single thread (like everything else in
+    /// this adapter), so a plain map needs no lock. Capped at
+    /// [`MAX_DIR_STREAMS`] entries, so the copies cannot pile up unbounded.
     dir_streams: std::collections::HashMap<u64, Vec<(u64, FileType, String)>>,
     /// Last file handle handed out by `opendir`. Starts at 0 so the first
-    /// handle is 1 — `fh == 0` stays free to mean "no opendir snapshot"
-    /// (readdir then falls back to a fresh listing).
+    /// handle is 1 — `fh == 0` stays free to mean "no registered stream"
+    /// (readdir then falls back to a throwaway listing).
     next_dir_fh: u64,
 }
 
@@ -172,19 +216,27 @@ impl Filesystem for NcFs {
         }
     }
 
-    /// Open a directory stream: snapshot the listing once and key it by a fresh
-    /// file handle, so every `readdir` chunk of this stream serves from the
-    /// same listing (see the `dir_streams` field for the why).
-    fn opendir(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
-        match self.dir_entries(ino) {
-            Ok(entries) => {
-                self.next_dir_fh += 1;
-                let fh = self.next_dir_fh;
-                self.dir_streams.insert(fh, entries);
-                reply.opened(fh, 0);
-            }
-            Err(errno) => reply.error(errno),
+    /// Open a directory stream: hand out a fresh file handle and register the
+    /// stream. The listing itself is *not* taken here — `readdir` takes it when
+    /// the stream starts (offset 0), which is also where a `rewinddir` lands
+    /// (see `readdir`). Snapshotting here as well would only build every
+    /// listing twice per `ls`.
+    ///
+    /// Beyond [`MAX_DIR_STREAMS`] open streams the handle is still valid but
+    /// stays unregistered: the open must not fail, it just loses the snapshot
+    /// and is served like any unknown handle.
+    fn opendir(&mut self, _req: &Request<'_>, _ino: u64, _flags: i32, reply: ReplyOpen) {
+        self.next_dir_fh += 1;
+        let fh = self.next_dir_fh;
+        if self.dir_streams.len() < MAX_DIR_STREAMS {
+            self.dir_streams.insert(fh, Vec::new());
+        } else {
+            tracing::debug!(
+                open_streams = self.dir_streams.len(),
+                "directory-stream cap reached — serving this handle without a snapshot"
+            );
         }
+        reply.opened(fh, 0);
     }
 
     fn readdir(
@@ -195,20 +247,56 @@ impl Filesystem for NcFs {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
-        // Serve from the snapshot taken in `opendir`. An unknown fh (e.g. 0,
-        // when no opendir preceded) falls back to a fresh listing — correct for
-        // that one chunk, just without the cross-chunk stability guarantee.
-        let fresh = if self.dir_streams.contains_key(&fh) {
-            None
+        let start = match dir_offset(offset) {
+            Ok(start) => start,
+            Err(errno) => return reply.error(errno),
+        };
+
+        // A stream starting at offset 0 gets a fresh listing; its continuation
+        // chunks (offset > 0) are served from that snapshot.
+        //
+        // Both halves matter. The snapshot keeps *one* traversal consistent: a
+        // background revalidation landing between two chunks must not shift the
+        // offsets and thereby skip or duplicate entries. Refreshing at offset 0
+        // is what POSIX demands of `rewinddir` — the stream must then "refer to
+        // the current state of the directory". glibc implements `rewinddir` as
+        // `lseek(fd, 0, SEEK_SET)` on the *same* descriptor, so the kernel
+        // re-issues READDIR at offset 0 with the same `fh` and never a second
+        // OPENDIR. Without the refresh, a long-lived dirfd (a watcher, an
+        // indexer, a file manager sitting in the directory) would keep serving
+        // its opendir-time listing for the lifetime of that handle — blind to
+        // every later addition, even after push invalidation fired.
+        //
+        // An unknown fh — 0 when no opendir preceded, or a handle past
+        // [`MAX_DIR_STREAMS`] — gets a throwaway listing rather than an entry
+        // in the map: for fh 0 no `releasedir` will ever arrive, so storing one
+        // would leak, and past the cap storing is exactly what we are avoiding.
+        let mut throwaway = None;
+        if self.dir_streams.contains_key(&fh) {
+            if start == 0 {
+                match self.dir_entries(ino) {
+                    Ok(entries) => {
+                        self.dir_streams.insert(fh, entries);
+                    }
+                    Err(errno) => return reply.error(errno),
+                }
+            }
         } else {
             match self.dir_entries(ino) {
-                Ok(entries) => Some(entries),
+                Ok(entries) => throwaway = Some(entries),
                 Err(errno) => return reply.error(errno),
             }
+        }
+        // `get`, never `self.dir_streams[&fh]`: indexing panics on a missing
+        // key, and a panic in a FUSE callback takes the whole mount down. The
+        // key is present by construction here — that is precisely why it must
+        // not be enforced by a panic.
+        let entries: &[(u64, FileType, String)] = match &throwaway {
+            Some(entries) => entries,
+            None => self.dir_streams.get(&fh).map_or(NO_ENTRIES, Vec::as_slice),
         };
-        let entries = fresh.as_ref().unwrap_or_else(|| &self.dir_streams[&fh]);
 
-        for (i, (inode, kind, name)) in entries.iter().enumerate().skip(offset as usize) {
+        for (i, (inode, kind, name)) in entries.iter().enumerate().skip(start) {
             // `offset` is the *next* entry to read; hence i + 1.
             if reply.add(*inode, (i + 1) as i64, *kind, name) {
                 break; // reply buffer full
@@ -629,18 +717,27 @@ extern "C" fn on_signal(_sig: libc::c_int) {
 
 /// Unmount cleanly on Ctrl-C / `systemctl --user stop`.
 ///
-/// `fuser` unmounts when the `Session` is dropped, but the default action for
+/// `fuser` unmounts when the `Mount` is dropped, but the default action for
 /// SIGINT/SIGTERM terminates the process before that runs, leaving a dangling
 /// `ENOTCONN` mount that needs a manual `fusermount3 -u`. We therefore catch
 /// both signals (the handler only flags a shutdown) and let a small thread turn
 /// that flag into an unmount, which makes the blocking `Session::run` return so
-/// `Session::drop` can clean up the mountpoint.
+/// [`Teardown`] can clean up the mountpoint.
+///
+/// The thread also stops once `finished` is set — the session ended on its own
+/// and [`Teardown`] does the unmount. That matters for more than tidiness: a
+/// `SessionUnmounter` holds a *clone* of the `Arc<Mutex<Option<Mount>>>`, so a
+/// thread parked in this loop forever would keep the mount alive no matter what
+/// the rest of the process does.
 ///
 /// We deliberately do *not* use `MountOption::AutoUnmount`: `fuser` implements it
 /// via a `fusermount` helper that forces `allow_other`, which in turn requires
 /// `user_allow_other` in `/etc/fuse.conf` and would expose a personal cloud
 /// mount to every local user. Owning the unmount ourselves avoids both.
-fn unmount_on_signal(mut unmounter: fuser::SessionUnmounter) {
+fn unmount_on_signal(
+    mut unmounter: fuser::SessionUnmounter,
+    finished: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
     // SAFETY: `on_signal` only stores to an atomic — async-signal-safe. glibc's
     // `signal` re-arms the handler and restarts syscalls (BSD semantics), which
     // is fine: we drive the unmount from the thread below, not from EINTR.
@@ -652,6 +749,9 @@ fn unmount_on_signal(mut unmounter: fuser::SessionUnmounter) {
         .name("wusel-fuse-unmount".into())
         .spawn(move || {
             while !SHUTDOWN.load(std::sync::atomic::Ordering::SeqCst) {
+                if finished.load(std::sync::atomic::Ordering::SeqCst) {
+                    return; // the session loop returned — nothing left to unmount
+                }
                 std::thread::sleep(Duration::from_millis(200));
             }
             tracing::info!("signal received — unmounting");
@@ -660,6 +760,37 @@ fn unmount_on_signal(mut unmounter: fuser::SessionUnmounter) {
             let _ = unmounter.unmount();
         })
         .expect("spawn fuse unmount thread");
+}
+
+/// Tears the kernel mount down when [`mount`] returns — on *every* path out of
+/// it, which is the whole point of it being a `Drop` type.
+///
+/// `fuser` ties the unmount to dropping the `Mount`, which lives behind an
+/// `Arc<Mutex<Option<Mount>>>` shared with every `SessionUnmounter`; dropping
+/// the `Session` does **not** take it. So as long as the signal thread holds
+/// its clone, nothing unmounts on its own — and a session that ends by itself
+/// (`Session::run` returning an error: a kernel connection error, a failed read
+/// from `/dev/fuse`) would leave the mountpoint attached as a
+/// `Transport endpoint is not connected` stump. systemd then restarts the unit,
+/// the new instance finds the stale mount, refuses, and three of those in 60 s
+/// put the unit in `failed` — with the user left to run `fusermount3 -u` by
+/// hand. Taking the `Mount` here, unconditionally, is what keeps a crash of the
+/// session from becoming a broken desktop.
+struct Teardown {
+    unmounter: fuser::SessionUnmounter,
+    finished: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for Teardown {
+    fn drop(&mut self) {
+        // First let the signal thread go: it is only there to turn a signal
+        // into an unmount, and we are already unmounting.
+        self.finished
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // An error means it was already unmounted (the signal path got there
+        // first, or someone ran `fusermount3 -u`) — nothing left to do.
+        let _ = self.unmounter.unmount();
+    }
 }
 
 /// Mounts the filesystem at `mountpoint` (blocks until unmount).
@@ -687,8 +818,22 @@ pub fn mount(mountpoint: &std::path::Path, mut provider: Provider) -> anyhow::Re
     };
     let mut session = fuser::Session::new(fs, mountpoint, &options)?;
 
-    // Without AutoUnmount we own the teardown: unmount on SIGINT/SIGTERM.
-    unmount_on_signal(session.unmount_callable());
+    // Without AutoUnmount we own the teardown, twice over: `Teardown` drops the
+    // kernel mount however `mount()` returns, and the signal thread turns a
+    // SIGINT/SIGTERM into the same unmount while the session is still running.
+    //
+    // `SHUTDOWN` and the signal dispositions are process-global, so a *second*
+    // mount in one process would otherwise start out already flagged. Clearing
+    // it here, before the handlers go in, keeps sequential mounts working; two
+    // *concurrent* mounts in one process would still share the flag, which the
+    // CLI never does (one mount per daemon).
+    SHUTDOWN.store(false, std::sync::atomic::Ordering::SeqCst);
+    let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _teardown = Teardown {
+        unmounter: session.unmount_callable(),
+        finished: finished.clone(),
+    };
+    unmount_on_signal(session.unmount_callable(), finished);
     if let Some(rx) = invalidations {
         let notifier = session.notifier();
         std::thread::Builder::new()
@@ -709,6 +854,56 @@ pub fn mount(mountpoint: &std::path::Path, mut provider: Provider) -> anyhow::Re
             })
             .expect("spawn fuse invalidation thread");
     }
+    // `_teardown` drops after this returns — including on the `?` — so the
+    // mountpoint is released whether the session ended by unmount or by error.
     session.run()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A negative offset must become EINVAL, not a silent "end of directory".
+    /// The kernel never sends one, but the FUSE wire format allows it, and this
+    /// is the same contract `read`/`write` already enforce. (The `readdir`
+    /// callback itself needs a live mount to drive — the end-to-end coverage
+    /// lives in `tests/rewinddir_e2e.rs`.)
+    #[test]
+    fn negative_readdir_offsets_are_rejected() {
+        assert_eq!(dir_offset(-1), Err(libc::EINVAL));
+        assert_eq!(dir_offset(i64::MIN), Err(libc::EINVAL));
+    }
+
+    #[test]
+    fn non_negative_readdir_offsets_pass_through() {
+        assert_eq!(dir_offset(0), Ok(0));
+        assert_eq!(dir_offset(42), Ok(42));
+    }
+
+    /// The timestamp conversion must survive both ends of the `i64` range.
+    /// `utimensat(…, tv_sec = i64::MIN)` reaches `setattr` as exactly this
+    /// `SystemTime`; the backwards distance is then 2^63 seconds, which does
+    /// not fit a positive `i64` — the old `-(secs as i64)` wrapped to
+    /// `i64::MIN` and panicked on the negation in a debug build.
+    #[test]
+    fn extreme_timestamps_saturate_instead_of_overflowing() {
+        assert_eq!(
+            unix_from_system_time(system_time_from_unix(i64::MIN)),
+            i64::MIN
+        );
+        assert_eq!(
+            unix_from_system_time(system_time_from_unix(i64::MAX)),
+            i64::MAX
+        );
+    }
+
+    /// Ordinary and just-pre-epoch values still round-trip exactly — the
+    /// saturation must not cost precision anywhere a real file lives.
+    #[test]
+    fn ordinary_timestamps_round_trip() {
+        for secs in [0, 1, -1, 1_700_000_000, -2_208_988_800] {
+            assert_eq!(unix_from_system_time(system_time_from_unix(secs)), secs);
+        }
+    }
 }

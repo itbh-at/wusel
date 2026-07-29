@@ -30,6 +30,9 @@ vm_sees() {
     podman machine ssh "test -e $quoted" >/dev/null 2>&1
 }
 
+# WORK and MIRRORED are this function's *output* — read by the sourcing
+# podman-*.sh script, which shellcheck cannot see from here.
+# shellcheck disable=SC2034
 resolve_work() {
     if [ "$(uname -s)" = "Linux" ]; then
         WORK="$REPO" MIRRORED=0

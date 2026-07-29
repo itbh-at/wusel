@@ -16,11 +16,19 @@ documentation/build/
 # Editor/OS
 .DS_Store
 *.swp
+*~
 .idea/
 .vscode/
 
-# Claude Code working dirs (git worktrees for isolated agents)
-.claude/worktrees/
+# Merge/patch leftovers
+*.orig
+*.rej
+
+# Claude Code working dirs: agent worktrees and machine-local settings
+# (settings.local.json). Nothing under .claude/ is part of the project — ignore
+# the whole directory, not just the worktrees, so a stray local file cannot be
+# committed by accident.
+.claude/
 
 # Native Nautilus extension build output
 integration/nautilus/*.so

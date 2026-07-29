@@ -467,11 +467,18 @@ fn cmd_mount(account: &Account, mountpoint: Option<&str>) -> anyhow::Result<()> 
     // Same instance in two accounts is allowed but rarely intended — warn.
     warn_if_duplicate_instance(account, &creds.server, &creds.login_name);
 
-    wusel_fuse::mount(&target, provider)
+    // Record where we actually mount — which may be none of the paths another
+    // command could derive, since `mountpoint` overrides config and default.
+    // `cache clear` reads this to notice a live daemon (see
+    // `live_mount_for_account`); the marker goes away again on clean exit.
+    write_mount_marker(account, &target);
+    let result = wusel_fuse::mount(&target, provider);
+    remove_mount_marker(account);
+    result
 }
 
 /// Warn (do not block) if another account already syncs the same server + user:
-/// harmless while read-only, but a footgun once writing lands.
+/// two mounts of one account race each other's uploads, exactly like two machines.
 #[cfg(feature = "fuse")]
 fn warn_if_duplicate_instance(account: &Account, server: &str, login: &str) {
     for name in config::list_accounts() {
@@ -487,7 +494,7 @@ fn warn_if_duplicate_instance(account: &Account, server: &str, login: &str) {
             if other_server == server && other_login == login {
                 tracing::warn!(
                     "account '{name}' already syncs {login}@{server} — mounting the same \
-                     instance twice is redundant and will churn once writing lands"
+                     instance twice is redundant and makes the two mounts race each other's uploads"
                 );
             }
         }
@@ -495,9 +502,10 @@ fn warn_if_duplicate_instance(account: &Account, server: &str, login: &str) {
 }
 
 /// Active mounts from `/proc/self/mountinfo`: (all mountpoints, ours = wusel).
-/// Gated on Linux only (not on the `fuse` feature): `cmd_cache_clear` needs it
-/// too, and even a non-fuse build must recognise a mount made by another build.
-#[cfg(target_os = "linux")]
+/// Not gated on the `fuse` feature: `cmd_cache_clear` needs it too, and even a
+/// non-fuse build must recognise a mount made by another build. Nor on the
+/// platform: `/proc/self/mountinfo` simply does not exist off Linux, which
+/// yields two empty lists — the honest answer there, since only Linux mounts.
 fn read_active_mounts() -> (Vec<std::path::PathBuf>, Vec<std::path::PathBuf>) {
     let mut all = Vec::new();
     let mut ours = Vec::new();
@@ -521,7 +529,6 @@ fn read_active_mounts() -> (Vec<std::path::PathBuf>, Vec<std::path::PathBuf>) {
 }
 
 /// Decode the octal escapes `mountinfo` uses (space/tab/newline/backslash).
-#[cfg(target_os = "linux")]
 fn unescape_mountpoint(s: &str) -> String {
     s.replace("\\040", " ")
         .replace("\\011", "\t")
@@ -544,7 +551,23 @@ fn cmd_mount(_account: &Account, _mountpoint: Option<&str>) -> anyhow::Result<()
 /// systemd expands `%x` specifiers even inside quotes, and `%%` is the literal
 /// percent. Inside double quotes systemd honours C-style backslash escapes, so
 /// `\` and `"` themselves are escaped too.
-fn systemd_exec_escape(path: &str) -> String {
+///
+/// A control character is **refused**, not escaped. A unit file is
+/// line-oriented: a raw newline would end the `ExecStart=` line and turn the
+/// rest of the path into directives of its own — a unit forged from the
+/// binary's own path. systemd does understand `\n` inside quotes, so escaping
+/// would be possible, but a path containing a newline (or a NUL, a tab, an
+/// ESC …) is pathological; refusing with a clear message is the answer the user
+/// can act on, and it cannot produce a subtly wrong unit.
+fn systemd_exec_escape(path: &str) -> anyhow::Result<String> {
+    if let Some(c) = path.chars().find(|c| c.is_control()) {
+        bail!(
+            "refusing to write a systemd unit: the path of this binary contains the \
+             control character U+{:04X}, which cannot appear in an ExecStart= line. \
+             Move the binary to a path without control characters and re-run.",
+            c as u32,
+        );
+    }
     let mut out = String::with_capacity(path.len() + 2);
     out.push('"');
     for c in path.chars() {
@@ -556,16 +579,16 @@ fn systemd_exec_escape(path: &str) -> String {
         }
     }
     out.push('"');
-    out
+    Ok(out)
 }
 
 /// The templated unit's contents. `%i` is the account name, filled in by systemd
 /// when the instance `wusel@<account>` is started. `exec` is this binary's
 /// absolute path, so it works for packaged, `cargo install`ed and dev builds.
 /// Keep this in sync with the packaged twin `packaging/rpm/wusel@.service`.
-fn unit_contents(exec: &str) -> String {
-    let exec = systemd_exec_escape(exec);
-    format!(
+fn unit_contents(exec: &str) -> anyhow::Result<String> {
+    let exec = systemd_exec_escape(exec)?;
+    Ok(format!(
         "[Unit]\n\
          Description=wusel — virtual Nextcloud filesystem (%i)\n\
          StartLimitIntervalSec=60\n\
@@ -584,13 +607,124 @@ fn unit_contents(exec: &str) -> String {
          \n\
          [Install]\n\
          WantedBy=default.target\n"
-    )
+    ))
+}
+
+/// The unit template's file name; the same in every unit directory.
+const UNIT_FILE: &str = "wusel@.service";
+
+/// Where a *packaged* unit can live, in systemd's own precedence order (all of
+/// them below `$XDG_CONFIG_HOME/systemd/user`, which is why a file we write
+/// there shadows every one of them). `/etc` and `/run` are the admin's, the
+/// `lib` dirs the distribution package's — for us they are the same case: a
+/// unit somebody else installed and maintains.
+const PACKAGED_UNIT_DIRS: [&str; 4] = [
+    "/etc/systemd/user",
+    "/run/systemd/user",
+    "/usr/local/lib/systemd/user",
+    "/usr/lib/systemd/user",
+];
+
+/// The packaged unit, if the system has one (RPM/DEB install it into
+/// `/usr/lib/systemd/user`).
+fn packaged_unit() -> Option<std::path::PathBuf> {
+    PACKAGED_UNIT_DIRS
+        .iter()
+        .map(|d| std::path::Path::new(d).join(UNIT_FILE))
+        .find(|p| p.exists())
+}
+
+/// The systemd unit instance for an account (`wusel@<account>.service`).
+fn service_instance(account: &Account) -> anyhow::Result<String> {
+    instance_name(account.name())
+}
+
+/// Turn an account name into a unit instance, rejecting what systemd cannot
+/// name.
+///
+/// The name goes into the unit name verbatim, so it has to *be* a valid
+/// instance: systemd's unit names are ASCII letters, digits and `:-_.` only.
+/// `Account::new` already maps path-hostile characters to `_`, but its filter
+/// is `char::is_alphanumeric` — Unicode-aware — so `--account Müller` survives
+/// it and yields `wusel@Müller.service`, which `systemctl` rejects with a
+/// message far from its cause. We could instead escape the name the way
+/// `systemd-escape` does, but the unit would then have to read the instance
+/// back with `%I` (unescaped) instead of `%i`, splitting it from the packaged
+/// twin in `packaging/rpm/wusel@.service`. Rejecting right where the name
+/// becomes a unit name is the smaller, clearer contract.
+fn instance_name(name: &str) -> anyhow::Result<String> {
+    if name.is_empty() {
+        bail!("the account name must not be empty");
+    }
+    if let Some(c) = name
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':')))
+    {
+        bail!(
+            "account '{name}' cannot be used as a systemd service: '{c}' is not allowed in a \
+             unit instance name (only ASCII letters, digits and '-', '_', '.', ':' are). \
+             Rename the account — `wusel accounts` lists them — and enable the service for \
+             the new name."
+        );
+    }
+    Ok(format!("wusel@{name}.service"))
+}
+
+/// What `service enable` should do about the unit file. Split out from
+/// [`install_unit`] so the decision is testable without touching `/usr`.
+#[derive(Debug, PartialEq, Eq)]
+enum UnitAction {
+    /// Nothing packaged (a dev build, `cargo install`): write our own unit.
+    Write,
+    /// A packaged unit exists and nothing shadows it — leave it alone.
+    UsePackaged,
+    /// A packaged unit exists *and* an older user-level copy shadows it. We do
+    /// not silently refresh that copy: it keeps pointing at whichever binary
+    /// once wrote it, so the user is told how to remove it.
+    KeepOverride,
+}
+
+/// The rule behind [`UnitAction`]: never write into `$XDG_CONFIG_HOME` when the
+/// system already provides a unit. That directory wins over every system
+/// location, so a copy written there from a dev build permanently pins
+/// `ExecStart` to that build's path — and deleting the build then breaks the
+/// service with nothing pointing at the override.
+fn unit_action(packaged: bool, override_exists: bool) -> UnitAction {
+    match (packaged, override_exists) {
+        (false, _) => UnitAction::Write,
+        (true, false) => UnitAction::UsePackaged,
+        (true, true) => UnitAction::KeepOverride,
+    }
+}
+
+/// One line naming the unit file that is actually in effect — what `service
+/// status` prints above `systemctl status`, so a shadowing override is visible
+/// instead of having to be guessed.
+fn unit_in_effect(
+    user_override: Option<&std::path::Path>,
+    packaged: Option<&std::path::Path>,
+) -> String {
+    match (user_override, packaged) {
+        (Some(u), Some(p)) => format!(
+            "Unit file: {} (your own copy — it shadows the packaged {}).\n  \
+             To go back to the packaged unit: rm {} && systemctl --user daemon-reload",
+            u.display(),
+            p.display(),
+            u.display(),
+        ),
+        (Some(u), None) => format!(
+            "Unit file: {} (written by `wusel service enable`).",
+            u.display()
+        ),
+        (None, Some(p)) => format!("Unit file: {} (packaged).", p.display()),
+        (None, None) => "Unit file: none installed — run `wusel service enable` first.".to_string(),
+    }
 }
 
 /// Manages the systemd *user* service for an account (`wusel@<account>`).
 /// Linux-only in practice (fails cleanly elsewhere: `systemctl` is absent).
 fn cmd_service(account: &Account, action: ServiceCmd) -> anyhow::Result<()> {
-    let instance = format!("wusel@{}.service", account.name());
+    let instance = service_instance(account)?;
     match action {
         ServiceCmd::Enable => {
             if !account.credentials_path().exists() {
@@ -610,6 +744,16 @@ fn cmd_service(account: &Account, action: ServiceCmd) -> anyhow::Result<()> {
             println!("Disabled {instance} (unmounted and off at login).");
         }
         ServiceCmd::Status => {
+            // Which unit file is in effect — a user-level copy shadowing the
+            // packaged one is otherwise invisible until the service misbehaves.
+            let user = systemd_user_dir().join(UNIT_FILE);
+            println!(
+                "{}",
+                unit_in_effect(
+                    user.exists().then_some(user.as_path()),
+                    packaged_unit().as_deref(),
+                )
+            );
             // `status` prints to stdout itself; ignore its non-zero exit codes.
             let _ = std::process::Command::new("systemctl")
                 .args(["--user", "--no-pager", "status", &instance])
@@ -619,15 +763,39 @@ fn cmd_service(account: &Account, action: ServiceCmd) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Write the templated unit into the user's systemd dir and reload.
+/// Make sure a unit template is in place — writing one into the user's systemd
+/// dir only when the system does not already provide one (see [`unit_action`]).
 fn install_unit() -> anyhow::Result<()> {
-    let exec = std::env::current_exe().context("could not determine own binary path")?;
     let dir = systemd_user_dir();
-    std::fs::create_dir_all(&dir).context("could not create the systemd user dir")?;
-    let path = dir.join("wusel@.service");
-    std::fs::write(&path, unit_contents(&exec.display().to_string()))
-        .with_context(|| format!("could not write {}", path.display()))?;
-    systemctl(&["daemon-reload"])?;
+    let path = dir.join(UNIT_FILE);
+    let packaged = packaged_unit();
+    match unit_action(packaged.is_some(), path.exists()) {
+        // Nothing to write, nothing to reload — the packaged unit is already
+        // known to systemd.
+        UnitAction::UsePackaged => {
+            let packaged = packaged.expect("UsePackaged implies a packaged unit");
+            println!("Using the packaged unit {}.", packaged.display());
+        }
+        UnitAction::KeepOverride => {
+            let packaged = packaged.expect("KeepOverride implies a packaged unit");
+            println!(
+                "warning: {} shadows the packaged unit {}.\n  \
+                 It keeps pointing at whichever binary installed it, so a packaged update \
+                 will not reach the service. Remove it to use the packaged unit:\n    \
+                 rm {} && systemctl --user daemon-reload",
+                path.display(),
+                packaged.display(),
+                path.display(),
+            );
+        }
+        UnitAction::Write => {
+            let exec = std::env::current_exe().context("could not determine own binary path")?;
+            std::fs::create_dir_all(&dir).context("could not create the systemd user dir")?;
+            std::fs::write(&path, unit_contents(&exec.display().to_string())?)
+                .with_context(|| format!("could not write {}", path.display()))?;
+            systemctl(&["daemon-reload"])?;
+        }
+    }
     Ok(())
 }
 
@@ -699,19 +867,19 @@ fn pin_label(path: &str) -> String {
 fn cmd_cache_clear(account: &Account, path: Option<&str>) -> anyhow::Result<()> {
     // Refuse while the account is mounted: the running daemon holds the state
     // DB and blob cache open, and deleting them under a live mount corrupts
-    // the session. (Only checkable on Linux — the only platform that mounts —
+    // the session. (Only detectable on Linux — the only platform that mounts —
     // via /proc/self/mountinfo; elsewhere the printed hint below remains.)
-    #[cfg(target_os = "linux")]
     {
-        let mount = account_mount_point(account);
-        let mount = std::fs::canonicalize(&mount).unwrap_or(mount);
+        let configured = account_mount_point(account);
+        let configured = std::fs::canonicalize(&configured).unwrap_or(configured);
+        let marker = read_mount_marker(account);
         let (_, ours) = read_active_mounts();
-        if ours.contains(&mount) {
+        if let Some(live) = live_mount_for_account(&configured, marker.as_deref(), &ours) {
             bail!(
                 "account '{}' is currently mounted at {} — unmount first \
                  (`wusel service disable{}` or stop the running `wusel mount`)",
                 account.name(),
-                mount.display(),
+                live.display(),
                 account_flag(account),
             );
         }
@@ -849,6 +1017,69 @@ fn resolve_pin_target(account: &Account, path: &str) -> anyhow::Result<(Account,
     bail!("'{path}' is not inside a wusel mount (nothing to pin)");
 }
 
+/// The live wusel mount belonging to this account, if any — the decision behind
+/// the `cache clear` guard, kept pure so it is testable without a real mount.
+///
+/// Two candidate paths, because the daemon need not sit where the config says:
+/// `wusel mount /srv/cloud` overrides both `[mount] point` and the default. So
+/// we consult the *marker* the mounting daemon wrote (its real mountpoint, see
+/// [`mount_marker_path`]) as well as the `configured` path from
+/// [`account_mount_point`], and refuse if either is currently a wusel mount.
+///
+/// `ours` — the active wusel mountpoints from `/proc/self/mountinfo` — stays the
+/// single authority on *liveness*; the marker only says where to look. That is
+/// what makes a **stale marker harmless**: after a crash (SIGKILL, OOM, power
+/// loss) the file survives, but the kernel no longer reports a mount there, so
+/// the guard proceeds instead of blocking `cache clear` forever. The reverse
+/// error — a marker lost while the daemon runs — cannot happen, since only the
+/// daemon itself removes it, on clean exit.
+fn live_mount_for_account(
+    configured: &std::path::Path,
+    marker: Option<&std::path::Path>,
+    ours: &[std::path::PathBuf],
+) -> Option<std::path::PathBuf> {
+    marker
+        .into_iter()
+        .chain(std::iter::once(configured))
+        .find(|cand| ours.iter().any(|m| m.as_path() == *cand))
+        .map(|p| p.to_path_buf())
+}
+
+/// Where a mounting daemon records the mountpoint it actually used, so other
+/// commands of the same account can find it even when it came from the command
+/// line. It lives in the account's state dir (per-account by construction, and
+/// already the daemon's own directory) and holds a single path.
+fn mount_marker_path(account: &Account) -> std::path::PathBuf {
+    account.state_dir().join("mountpoint")
+}
+
+/// The mountpoint a running daemon recorded for this account, if any. Never an
+/// error: an absent or unreadable marker simply means "nothing recorded".
+fn read_mount_marker(account: &Account) -> Option<std::path::PathBuf> {
+    let text = std::fs::read_to_string(mount_marker_path(account)).ok()?;
+    let path = text.trim();
+    (!path.is_empty()).then(|| std::path::PathBuf::from(path))
+}
+
+/// Record/clear this daemon's actual mountpoint. Both are fail-soft: the marker
+/// is an aid for other commands, never a precondition for mounting, so a
+/// read-only or full state dir must not keep the user from mounting.
+#[cfg(feature = "fuse")]
+fn write_mount_marker(account: &Account, target: &std::path::Path) {
+    let path = mount_marker_path(account);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Err(e) = std::fs::write(&path, target.to_string_lossy().as_bytes()) {
+        tracing::debug!(%e, path = %path.display(), "could not record the mountpoint marker");
+    }
+}
+
+#[cfg(feature = "fuse")]
+fn remove_mount_marker(account: &Account) {
+    let _ = std::fs::remove_file(mount_marker_path(account));
+}
+
 /// Where an account mounts: the `config.toml` override, else its default.
 fn account_mount_point(account: &Account) -> std::path::PathBuf {
     account
@@ -932,9 +1163,36 @@ fn cmd_search_provider(account: &Account) -> anyhow::Result<()> {
 
 /// Open a path or URL with the desktop's default handler (fire-and-forget).
 fn open_uri(target: &str) {
-    if let Err(e) = std::process::Command::new("xdg-open").arg(target).spawn() {
+    let mut cmd = std::process::Command::new("xdg-open");
+    cmd.arg(target);
+    if let Err(e) = spawn_and_reap(cmd) {
         tracing::debug!(%e, target, "xdg-open failed");
     }
+}
+
+/// Spawn a fire-and-forget helper **and reap it**. Returns the child's pid.
+///
+/// A child nobody waits for stays in the process table as a zombie until its
+/// parent exits. For a one-shot CLI that is invisible; `search-provider`,
+/// though, is a long-lived D-Bus service, so every activated search result
+/// would leave one behind for the whole session. We therefore hand the child to
+/// a tiny thread that blocks in `wait()` — the caller stays fire-and-forget
+/// (the D-Bus thread must not wait on `xdg-open`), and the entry is collected
+/// as soon as the helper exits. A thread per activation is affordable: it is a
+/// user-initiated, rare event, and the thread lives only as long as the helper.
+fn spawn_and_reap(mut cmd: std::process::Command) -> std::io::Result<u32> {
+    let mut child = cmd.spawn()?;
+    let pid = child.id();
+    if let Err(e) = std::thread::Builder::new()
+        .name("wusel-reap".into())
+        .spawn(move || {
+            let _ = child.wait();
+        })
+    {
+        // Out of threads: the helper still runs, we just cannot collect it.
+        tracing::debug!(%e, pid, "could not spawn the reaper thread");
+    }
+    Ok(pid)
 }
 
 /// List the pins for an account (reads only the state DB).
@@ -1048,7 +1306,7 @@ mod tests {
 
     #[test]
     fn unit_is_templated_and_uses_the_given_binary() {
-        let u = unit_contents("/usr/bin/wusel");
+        let u = unit_contents("/usr/bin/wusel").unwrap();
         assert!(u.contains("ExecStart=\"/usr/bin/wusel\" mount --account %i"));
         assert!(u.contains("WantedBy=default.target"));
         assert!(u.contains("Restart=on-failure"));
@@ -1058,15 +1316,165 @@ mod tests {
     fn exec_path_survives_spaces_and_percent() {
         // Spaces must be quoted (systemd splits ExecStart into words) and `%`
         // doubled (it introduces a systemd specifier, even inside quotes).
-        let u = unit_contents("/opt/my tools/100% wusel/wusel");
+        let u = unit_contents("/opt/my tools/100% wusel/wusel").unwrap();
         assert!(u.contains("ExecStart=\"/opt/my tools/100%% wusel/wusel\" mount --account %i"));
+    }
+
+    #[test]
+    fn a_control_character_in_the_exec_path_cannot_inject_a_directive() {
+        // A unit file is line-oriented: a raw newline in the path ends the
+        // ExecStart= line and everything after it becomes a directive of its
+        // own. (Only reachable by someone who already controls the binary's
+        // path, but the unit must never be forgeable from it.)
+        let err = unit_contents("/opt/w\nExecStart=/bin/false")
+            .expect_err("a path with a newline must be refused");
+        assert!(err.to_string().contains("control character"), "{err}");
+        // Every control character, not just the newline (NUL, tab, ESC …).
+        assert!(systemd_exec_escape("/opt/w\u{0}usel").is_err());
+        assert!(systemd_exec_escape("/opt/w\tusel").is_err());
+        // …and an ordinary path still passes.
+        assert_eq!(
+            systemd_exec_escape("/usr/bin/wusel").unwrap(),
+            "\"/usr/bin/wusel\""
+        );
+    }
+
+    #[test]
+    fn an_account_name_that_is_no_valid_unit_instance_is_rejected() {
+        // A unit name systemd cannot parse must produce a clear error here, not
+        // an opaque `systemctl` failure later.
+        assert!(instance_name("work/2").is_err());
+        assert!(instance_name("").is_err());
+        // The case that really reaches us: `Account::new` filters with the
+        // Unicode-aware `char::is_alphanumeric`, so a non-ASCII name survives
+        // it — but systemd's unit names are ASCII-only.
+        assert_eq!(Account::new("Müller").name(), "Müller");
+        assert!(service_instance(&Account::new("Müller")).is_err());
+        // Path-hostile characters are already mapped to `_` upstream; the
+        // instance name follows that sanitized name.
+        assert_eq!(
+            service_instance(&Account::new("work/2")).unwrap(),
+            "wusel@work_2.service"
+        );
+        assert_eq!(
+            service_instance(&Account::new("work-2")).unwrap(),
+            "wusel@work-2.service"
+        );
+    }
+
+    #[test]
+    fn a_packaged_unit_is_not_shadowed_by_an_override() {
+        // With an RPM-packaged unit present, `service enable` must not drop a
+        // user-level copy on top of it: that copy would pin ExecStart to the
+        // binary that happened to run the command (a dev build).
+        assert_eq!(unit_action(true, false), UnitAction::UsePackaged);
+        assert_eq!(unit_action(true, true), UnitAction::KeepOverride);
+        // Nothing packaged (cargo install, dev build): write our own.
+        assert_eq!(unit_action(false, false), UnitAction::Write);
+    }
+
+    #[test]
+    fn the_status_output_names_the_unit_in_effect() {
+        let user = p("/home/u/.config/systemd/user/wusel@.service");
+        let pkg = p("/usr/lib/systemd/user/wusel@.service");
+        let shadowed = unit_in_effect(Some(&user), Some(&pkg));
+        assert!(shadowed.contains("/home/u/.config/systemd/user/wusel@.service"));
+        assert!(shadowed.contains("/usr/lib/systemd/user/wusel@.service"));
+        assert!(unit_in_effect(None, Some(&pkg)).contains("packaged"));
+        assert!(unit_in_effect(None, None).contains("service enable"));
+    }
+
+    #[test]
+    fn a_spawned_helper_is_reaped() {
+        // `open_uri` fires xdg-open and forgets it. In the long-lived
+        // search-provider daemon an unreaped child stays a zombie in the
+        // process table for the life of the session — one per activated hit.
+        let pid = spawn_and_reap(std::process::Command::new("true")).expect("spawn");
+        for _ in 0..200 {
+            if !process_exists(pid) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("pid {pid} is still in the process table — the child was never reaped");
+    }
+
+    /// Is `pid` still a process (a zombie counts — it is reaped only by a
+    /// `wait`)? `ps -p` is the portable answer on both macOS and Linux.
+    fn process_exists(pid: u32) -> bool {
+        std::process::Command::new("ps")
+            .args(["-p", &pid.to_string()])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
     }
 
     #[test]
     fn exec_escape_handles_quotes_and_backslashes() {
         assert_eq!(
-            systemd_exec_escape(r#"/odd/pa"th/w\usel"#),
+            systemd_exec_escape(r#"/odd/pa"th/w\usel"#).unwrap(),
             r#""/odd/pa\"th/w\\usel""#
+        );
+    }
+
+    // --- `cache clear` mount guard ------------------------------------------
+
+    fn p(s: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(s)
+    }
+
+    #[test]
+    fn cache_clear_refuses_while_mounted_at_the_configured_point() {
+        // The plain case: no marker (an older daemon, or none was writable) and
+        // the mount sits where the config says.
+        let ours = vec![p("/home/u/Wusel")];
+        assert_eq!(
+            live_mount_for_account(&p("/home/u/Wusel"), None, &ours),
+            Some(p("/home/u/Wusel"))
+        );
+    }
+
+    #[test]
+    fn cache_clear_refuses_while_mounted_at_an_explicit_point() {
+        // `wusel mount /srv/cloud` overrides config and default, so the live
+        // daemon sits at /srv/cloud while the configured point is ~/Wusel.
+        // Clearing the cache would pull the state DB out from under it.
+        let ours = vec![p("/srv/cloud")];
+        assert_eq!(
+            live_mount_for_account(&p("/home/u/Wusel"), Some(&p("/srv/cloud")), &ours),
+            Some(p("/srv/cloud"))
+        );
+    }
+
+    #[test]
+    fn cache_clear_proceeds_when_not_mounted() {
+        let ours = vec![p("/home/other/Wusel-work")];
+        assert_eq!(
+            live_mount_for_account(&p("/home/u/Wusel"), None, &ours),
+            None
+        );
+    }
+
+    #[test]
+    fn a_stale_marker_does_not_block_cache_clear() {
+        // The daemon was killed, so its marker survived — but the kernel lists
+        // no wusel mount any more. Liveness comes from the mount table, so the
+        // clear proceeds instead of being blocked forever.
+        assert_eq!(
+            live_mount_for_account(&p("/home/u/Wusel"), Some(&p("/srv/cloud")), &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn a_stale_marker_still_protects_a_mount_at_the_configured_point() {
+        // Marker left over from an earlier `mount /srv/cloud`, while a fresh
+        // daemon runs at the configured point: the configured path is checked
+        // too, so we still refuse.
+        let ours = vec![p("/home/u/Wusel")];
+        assert_eq!(
+            live_mount_for_account(&p("/home/u/Wusel"), Some(&p("/srv/cloud")), &ours),
+            Some(p("/home/u/Wusel"))
         );
     }
 }

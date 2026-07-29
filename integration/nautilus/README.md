@@ -30,7 +30,7 @@ sudo make install   # into $(pkg-config --variable=extensiondir libnautilus-exte
 nautilus -q         # restart Nautilus so it loads the extension
 ```
 
-`make uninstall` removes it. Packaging (RPM/DEB) builds and installs the same
+`make uninstall` removes it. Packaging (the RPM today, Debian planned) builds and installs the same
 `.so`, so end users never run `make`.
 
 ## Notes

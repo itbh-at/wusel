@@ -1,9 +1,16 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 IT Beratung Hermann GmbH
+
 # Antora component descriptor. This file marks `documentation/` as the
 # documentation component. The playbook (antora-playbook.yml) and the UI bundle
 # (ui-bundle/) live in this directory, checked into this repo.
 name: wusel
 title: Wusel
-version: ~        # unversioned (follows the repo state), adjust for releases
+# Deliberately unversioned: the site is built from `main` on every push and
+# always describes the current code, so a version selector would only offer one
+# entry. Release tags (v0.1.0, …) ship RPMs, not doc snapshots. Introduce a
+# version here only if we ever need to keep an old release's docs alive.
+version: ~
 start_page: ROOT:index.adoc
 nav:
   - modules/ROOT/nav.adoc

@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 IT Beratung Hermann GmbH
+
 # GitHub Actions CI. Inert on GitLab (which ignores .github/); runs on GitHub
 # from the first push. Uses mise so the toolchain matches local development 1:1.
 name: CI
@@ -8,6 +10,9 @@ on:
     branches: [main]
   pull_request:
 
+# Read-only, and no job here widens it: every job compiles third-party code
+# (cargo runs the build.rs and proc-macros of the whole dependency graph), so the
+# token those jobs hold must not be able to push anything back.
 permissions:
   contents: read
 
@@ -15,12 +20,42 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # The checkout is the mise config these jobs are meant to obey. Declared
+  # explicitly — as both Containerfiles already do — instead of relying on
+  # mise-action's implicit trust, because scripts in this repo invoke `mise` on
+  # their own (packaging/rpm/build-rpm.sh) outside the action's control.
+  MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
+  # Do NOT auto-install the whole [tools] table. `mise run` and `mise exec`
+  # install every pinned tool on first use, so without this a Rust job drags in
+  # the docs toolchain (node, antora, browser-sync, watchexec, d2) — wall-clock
+  # and attack surface for nothing. Each workflow installs what it actually uses.
+  MISE_AUTO_INSTALL: "false"
+
+defaults:
+  run:
+    # GitHub's `bash` shell is `bash --noprofile --norc -eo pipefail`; the
+    # implicit default omits pipefail, which hides failures inside pipelines.
+    shell: bash
+
 jobs:
   build-test:
     name: check · clippy · test (Linux, incl. FUSE)
     runs-on: ubuntu-latest
+    # Well under 10 minutes today; the cap keeps a hang from burning GitHub's
+    # 360-minute default.
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
+      # Actions are pinned to commit SHAs, not floating major tags: a tag is
+      # mutable, so `@v5` means "whatever that owner points it at today" — the
+      # audited code would not be the code that runs. Same rationale as the
+      # MISE_VERSION pin in both Containerfiles. .github/dependabot.yml keeps
+      # the pins moving.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          # This job compiles untrusted third-party build scripts; leaving the
+          # token in .git/config would hand it to any one of them.
+          persist-credentials: false
 
       # Headers so the wusel-fuse frontend compiles (libfuse3). The real mount
       # e2e (cargo test -p wusel-fuse) is not run here — it needs a privileged
@@ -31,12 +66,38 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libfuse3-dev pkg-config
 
-      - uses: jdx/mise-action@v2
+      # Without a cache every run recompiled the entire dependency graph. Keyed
+      # on Cargo.lock; the prefix restore-key still yields a warm registry and
+      # most of target/ when a single dependency moved.
+      - name: Cache the cargo registry and build artefacts
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-ci-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-ci-
+
+      - uses: jdx/mise-action@c37c93293d6b742fc901e1406b8f764f6fb19dac # v2.4.4
+        with:
+          install: false
+      # Exactly the tools this workflow uses — rust for the cargo tasks, hawkeye
+      # for headers-check, shellcheck for the script lint. The docs toolchain is
+      # pinned in the same mise.toml but has no business in a Rust job.
+      - name: Install the pinned toolchain (rust, hawkeye, shellcheck)
+        run: mise install rust "ubi:korandoru/hawkeye" shellcheck
 
       - name: Formatting
         run: mise run fmt-check
       - name: Licence headers
         run: mise run headers-check
+      # The release and E2E logic lives in shell; lint it as strictly as the Rust
+      # (the tag/version guard in build-rpm.sh is shell, too).
+      - name: Shell scripts (shellcheck)
+        run: mise run shellcheck
       - name: Clippy (-D warnings)
         run: mise run clippy
       - name: Check (engine + CLI)
@@ -44,4 +105,4 @@ jobs:
       - name: Tests (engine + CLI, native)
         run: mise run test
       - name: Build the FUSE frontend (Linux)
-        run: mise exec -- cargo build -p wusel --features fuse
+        run: mise run build-fuse

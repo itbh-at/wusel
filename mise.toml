@@ -3,7 +3,7 @@
 # so that the Rust version is exactly identical everywhere.
 #
 #   mise install        # installs the tools pinned below
-#   mise run check       # cargo check (host: wusel-core + wusel without mount)
+#   mise run check       # cargo check (host: wusel-core + wusel without the fuse feature)
 #   mise run test        # cargo test (host, natively on macOS)
 #   mise run fuse-build  # build wusel with FUSE in the Linux container (podman)
 #   mise run fuse-shell  # interactive Linux shell with /dev/fuse for mounting
@@ -16,6 +16,7 @@ watchexec = "2.5.1"        # file-event watcher for `build.sh watch` (no busy-wa
 "npm:browser-sync" = "3.0.4"  # live-preview server for `build.sh watch` (serve + open browser + reload)
 "ubi:korandoru/hawkeye" = "6.5.1"  # license-header tool (like spotless); see licenserc.toml
 "ubi:terrastruct/d2" = "0.7.1"     # diagram renderer (local binary, no server); see mise run docs-diagrams
+shellcheck = "0.11.0"      # linter for scripts/ and packaging/ — the release and E2E logic lives in shell, so it gets linted like the Rust does
 
 [env]
 RUST_BACKTRACE = "1"
@@ -26,7 +27,7 @@ RUST_BACKTRACE = "1"
 # feature as pure CLI/core and is therefore fully checkable here.
 
 [tasks.check]
-description = "cargo check (wusel-core + wusel without mount)"
+description = "cargo check (wusel-core + wusel without the fuse feature)"
 run = "cargo check --workspace --exclude wusel-fuse"
 
 [tasks.test]
@@ -53,6 +54,13 @@ run = "hawkeye check"
 description = "Linter"
 run = "cargo clippy --workspace --exclude wusel-fuse -- -D warnings"
 
+# The shell scripts carry the release and E2E logic, so they are linted as
+# strictly as the Rust: every finding is an error (-S style), and `-x` lets
+# shellcheck follow the `. podman-lib.sh` source so it sees WORK/MIRRORED.
+[tasks.shellcheck]
+description = "Lint the shell scripts (shellcheck, all findings are errors)"
+run = "shellcheck -S style -x scripts/*.sh packaging/rpm/*.sh documentation/build.sh"
+
 [tasks.mock]
 description = "Run the WebDAV mock server (wusel-mock); pass --root DIR etc."
 run = "cargo run -q -p wusel-mock --"
@@ -65,6 +73,13 @@ run = "cargo run -q -p wusel-mock --"
 [tasks.build-release]
 description = "Optimised release build of wusel with FUSE (Linux)"
 run = "cargo build --release --features fuse -p wusel"
+
+# Debug counterpart, and the single spelling of "build the product with the
+# mount". CI, the E2E workflow and the podman scripts all call this task instead
+# of repeating the cargo invocation, so the flags cannot drift between them.
+[tasks.build-fuse]
+description = "Debug build of wusel with FUSE (Linux) — used by CI and the E2E"
+run = "cargo build -p wusel --features fuse"
 
 # The mount is Linux-only. On macOS, test it via podman (see the fuse-* tasks
 # below and documentation/.../trying-it-out.adoc).

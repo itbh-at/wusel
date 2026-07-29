@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 IT Beratung Hermann GmbH
-#
+
 # Install the GNOME Shell search provider registration (system-wide → needs
 # root). GNOME Shell then D-Bus-activates `wusel search-provider` on demand,
 # which queries Nextcloud Unified Search. Requires `wusel` on an absolute path

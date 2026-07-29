@@ -1,3 +1,8 @@
+////
+  // SPDX-License-Identifier: Apache-2.0
+  // Copyright 2026 IT Beratung Hermann GmbH
+////
+
 = Roadmap
 
 Where Wusel stands, and where it is going. It is built incrementally — each step
@@ -82,6 +87,17 @@ Legend: ✅ done · ◐ works, refinement pending · ⬜ planned
   so it could trigger re-hydration for pinned paths directly (full-file
   downloads by design: WebDAV offers no delta transfer, only per-file change
   detection via ETag).
+* ⬜ **Concurrent FUSE dispatch (a worker pool)** — the largest performance win
+  available to the frontend. Today `fuser`'s session loop handles one request at
+  a time, so every blocking call serialises the whole mount: a running hydration
+  delays the file manager's per-file emblem lookups behind it, and a `cp` from
+  the mount and an `ls` elsewhere take turns for no reason. Dispatching to a pool
+  costs a blocked *worker* instead of the whole filesystem. The work is not the
+  pool but giving up the exclusive access the engine is built on — `Provider`
+  takes `&mut self`, and SQLite runs on one connection without locks precisely
+  because the loop guarantees one caller — so it needs a connection per worker or
+  a serialised state layer, plus interior synchronisation for write buffers,
+  readahead windows and pins. See xref:architecture.adoc[_FUSE ↔ async bridge_].
 * ⬜ Read-ahead/prefetch for sequential reads; optional sparse/range caching for
   huge, partially-read files (whole-file-per-file stays the model).
 * ⬜ Advisory locking (WebDAV LOCK) to warn on the web-editor vs. local-editor case.

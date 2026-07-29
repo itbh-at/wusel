@@ -1,3 +1,8 @@
+////
+  // SPDX-License-Identifier: Apache-2.0
+  // Copyright 2026 IT Beratung Hermann GmbH
+////
+
 = Installation (Fedora RPM)
 :description: Install Wusel from the RPM and enable the systemd user service, Nautilus integration and search provider.
 
@@ -7,6 +12,19 @@ from source. Building the RPM itself is covered by
 xref:distribution.adoc[Project, licence & distribution] and
 `packaging/rpm/README.md` in the repository.
 
+== Get the package
+
+Every `v*` tag builds the RPM for `x86_64` and `aarch64` and attaches both to a
+GitHub Release, so the normal route is to download one from
+https://github.com/itbh-at/wusel/releases/latest[the latest release] and install
+that file. These are the *unsigned community RPMs* — there is no Wusel dnf
+repository, so `dnf` will not update them for you; grab the next release the same
+way.
+
+You can also build the RPM yourself (`mise run rpm`, output in `dist/`); see
+xref:distribution.adoc[Project, licence & distribution] and
+`packaging/rpm/README.md`.
+
 == Install the package
 
 [source,sh]
@@ -14,9 +32,15 @@ xref:distribution.adoc[Project, licence & distribution] and
 sudo dnf install ./wusel-*.rpm
 ----
 
-`dnf` pulls in the runtime dependencies (`fuse3` for the unprivileged mount; the
-Nautilus and GNOME Shell libraries the extension and search provider need) and
-runs Fedora's icon-cache and desktop-database triggers for you.
+The one dependency the spec states explicitly is `fuse3`, for the setuid
+`fusermount3` helper the unprivileged mount needs; the shared libraries the
+binary and the Nautilus extension link against come in automatically as
+soname dependencies. The `nautilus` and `gnome-shell` *applications* are only
+`Recommends`: the package installs on a machine without them and the mount works
+— you simply get no sidebar entry, no emblems and no Shell search. The search
+provider in particular links no GNOME Shell library at all; it is the `wusel`
+binary answering D-Bus, which the Shell activates on demand. `dnf` also runs
+Fedora's icon-cache and desktop-database triggers for you.
 
 The package installs the `wusel` binary, a systemd *user* service template, the
 Nautilus extension with its emblem icons, the GNOME Shell search provider, and

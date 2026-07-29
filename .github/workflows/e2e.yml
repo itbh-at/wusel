@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 IT Beratung Hermann GmbH
+
 # Nightly end-to-end test against a real Nextcloud (FUSE mount + 3-way merge).
 # Runs only when the CODE has changed since the last successful run — tracked by
 # a durable git ref refs/e2e-tested/<code-hash> (not the evictable Actions cache).
@@ -10,49 +12,99 @@ on:
     - cron: "0 3 * * *" # nightly, 03:00 UTC
   workflow_dispatch:
 
+# Read-only by default. Only `mark` pushes the marker ref and raises this for
+# itself; `gate` and `e2e` compile and execute third-party code and must not
+# hold a token that can write to the repository.
 permissions:
-  contents: write # push/delete the refs/e2e-tested/* marker
+  contents: read
 
 env:
   # Paths whose content decides whether an E2E run is warranted (docs excluded).
-  CODE_PATHS: "crates Cargo.toml Cargo.lock packaging integration mise.toml scripts"
+  # This workflow file is in the list on purpose: without it, fixing a bug in the
+  # gate or in the E2E job itself would not re-arm the gate, and the fix would go
+  # untested until some unrelated code change happened to come along.
+  CODE_PATHS: "crates Cargo.toml Cargo.lock packaging integration mise.toml scripts .github/workflows/e2e.yml"
+  # See ci.yml for both of these.
+  MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
+  MISE_AUTO_INSTALL: "false"
+
+defaults:
+  run:
+    # `bash --noprofile --norc -eo pipefail`: the implicit default has no
+    # pipefail, so a failure inside a pipeline (the marker cleanup below is one)
+    # would pass unnoticed.
+    shell: bash
 
 jobs:
   gate:
     name: gate (run only if code changed)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       run: ${{ steps.decide.outputs.run }}
       hash: ${{ steps.hash.outputs.hash }}
     steps:
-      - uses: actions/checkout@v5
+      # Pinned to a commit SHA — see the note in ci.yml.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          # This job never writes; the `git ls-remote` below reaches the public
+          # repository unauthenticated.
+          persist-credentials: false
       - id: hash
         run: |
+          # $CODE_PATHS is deliberately unquoted — it is a list of pathspecs and
+          # must word-split into separate arguments.
           h=$(git ls-tree -r HEAD -- $CODE_PATHS | sha256sum | cut -d' ' -f1)
           echo "hash=$h" >> "$GITHUB_OUTPUT"
           echo "code hash: $h"
       - id: decide
+        env:
+          HASH: ${{ steps.hash.outputs.hash }}
+          EVENT: ${{ github.event_name }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "run=true" >> "$GITHUB_OUTPUT"; echo "manual dispatch -> run"; exit 0
-          fi
-          if git ls-remote --exit-code origin "refs/e2e-tested/${{ steps.hash.outputs.hash }}" >/dev/null 2>&1; then
-            echo "run=false" >> "$GITHUB_OUTPUT"; echo "this code state was already tested -> skip"
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            run=true;  reason="manual dispatch"
+          elif git ls-remote --exit-code origin "refs/e2e-tested/$HASH" >/dev/null 2>&1; then
+            run=false; reason="this exact code state was already tested (marker refs/e2e-tested/$HASH exists)"
           else
-            echo "run=true" >> "$GITHUB_OUTPUT"; echo "code changed since last run -> run"
+            run=true;  reason="code changed since the last successful E2E"
           fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+          echo "gate -> run=$run ($reason)"
+          # A skipped E2E and a passing E2E both leave the workflow green, so a
+          # misbehaving gate could stop testing entirely without anyone noticing.
+          # Say out loud, on the run summary, which of the two happened and why.
+          if [ "$run" = true ]; then verdict="RUNNING"; else verdict="SKIPPED"; fi
+          {
+            echo "### E2E gate: $verdict"
+            echo
+            echo "- reason: $reason"
+            echo "- code hash: \`$HASH\`"
+            echo "- watched paths: \`$CODE_PATHS\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   e2e:
     name: FUSE + real Nextcloud
     needs: gate
     if: needs.gate.outputs.run == 'true'
     runs-on: ubuntu-latest
+    # The script's own waits (Nextcloud install, mount, upload polls) add up to
+    # a few minutes; 45 leaves room for a slow runner without letting a hung
+    # FUSE request burn the 360-minute default.
+    timeout-minutes: 45
     services:
       nextcloud:
-        image: nextcloud:latest
+        # Pinned to a major tag rather than `latest`: an unpinned upstream image
+        # is the classic "green yesterday, red today, no code changed". A major
+        # tag still tracks Nextcloud's patch releases — which is what a server
+        # E2E should test against — but never upgrades a major unannounced.
+        # Keep in sync with NC_IMAGE in scripts/podman-e2e.sh.
+        image: nextcloud:34-apache
         env:
           SQLITE_DATABASE: nextcloud
           NEXTCLOUD_ADMIN_USER: admin
+          # Throw-away credential for a container that exists only for the
+          # duration of this job. It is not a secret and must never become one.
           NEXTCLOUD_ADMIN_PASSWORD: adminpass
           NEXTCLOUD_TRUSTED_DOMAINS: localhost 127.0.0.1
         ports:
@@ -60,21 +112,38 @@ jobs:
     env:
       NC_URL: http://localhost:8080
       NC_USER: admin
-      NC_PASS: adminpass
+      NC_PASS: adminpass # ditto — the ephemeral container admin above
       WUSEL: target/debug/wusel
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          # Compiles and then executes the whole dependency graph's build
+          # scripts; the token has no business being left in .git/config.
+          persist-credentials: false
       - name: Install FUSE + headers
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends fuse3 libfuse3-dev pkg-config
-      - uses: jdx/mise-action@v2
+      - name: Cache the cargo registry and build artefacts
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-e2e-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-e2e-
+      - uses: jdx/mise-action@c37c93293d6b742fc901e1406b8f764f6fb19dac # v2.4.4
         with:
           install: false
       - name: Install the pinned Rust toolchain
         run: mise install rust
+      # One spelling of the FUSE build, shared with ci.yml and the podman
+      # scripts (mise.toml is the single source of truth for it).
       - name: Build wusel (with FUSE)
-        run: mise exec -- cargo build -p wusel --features fuse
+        run: mise run build-fuse
       - name: Run the E2E test
         run: bash scripts/e2e-nextcloud.sh
 
@@ -83,15 +152,32 @@ jobs:
     needs: [gate, e2e]
     if: needs.gate.outputs.run == 'true' && needs.e2e.result == 'success'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # The only job that needs to write, and the only one that compiles nothing.
+    permissions:
+      contents: write # push/delete the refs/e2e-tested/* marker
     steps:
-      - uses: actions/checkout@v5
+      # Keeps the checkout credentials on purpose — this job pushes.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - name: Mark this code hash as tested
         env:
           HASH: ${{ needs.gate.outputs.hash }}
         run: |
+          set -euo pipefail
           # Keep exactly one marker: drop the others, then record this one.
-          git ls-remote origin 'refs/e2e-tested/*' | awk '{print $2}' | while read -r ref; do
-            [ "$ref" = "refs/e2e-tested/$HASH" ] || git push origin ":$ref" || true
+          # The list is read into an array first, so the deletions do not run in
+          # a pipeline subshell — a failing delete then fails the job instead of
+          # silently letting stale markers pile up (they used to be swallowed by
+          # `|| true`, which also masked a broken cleanup indefinitely).
+          # Listed in its own command substitution, not inside the mapfile
+          # process substitution: there a failing ls-remote would be invisible.
+          listing="$(git ls-remote origin 'refs/e2e-tested/*')"
+          mapfile -t refs < <(printf '%s' "$listing" | awk '{print $2}')
+          for ref in "${refs[@]}"; do
+            if [ "$ref" != "refs/e2e-tested/$HASH" ]; then
+              echo "dropping stale marker $ref"
+              git push origin ":$ref"
+            fi
           done
           git push origin "HEAD:refs/e2e-tested/$HASH"
           echo "recorded refs/e2e-tested/$HASH"

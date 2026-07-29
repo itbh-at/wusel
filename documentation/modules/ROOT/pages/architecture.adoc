@@ -1,3 +1,8 @@
+////
+  // SPDX-License-Identifier: Apache-2.0
+  // Copyright 2026 IT Beratung Hermann GmbH
+////
+
 = Architecture
 
 == Guiding idea
@@ -86,15 +91,22 @@ items, Windows Cloud Filter placeholders + hydration callbacks):
 
 [cols="1,3",options="header"]
 |===
-| State (`model::Hydration`) | Meaning
-| `OnlineOnly`  | Only metadata known (from PROPFIND), no byte local. Default.
-| `Downloading` | Content is currently being loaded via WebDAV GET.
-| `Local`       | Content in the blob cache.
-| `Pinned`      | Like `Local`, but protected from cache eviction.
+| State (`provider::FileState`) | Meaning
+| `online-only` | No local copy; metadata only (from PROPFIND). The default.
+| `cached`      | A whole, ETag-fresh copy sits in the blob cache — evictable.
+| `pinned`      | Kept offline on purpose (the file, an ancestor directory, or the root is pinned); exempt from eviction.
+| `modified`    | A local edit not yet uploaded (an open write buffer, or a deferred create).
 |===
 
+This is the *only* per-file state model, and it is **derived, not stored**:
+`Provider::file_state` answers from the write buffers, the `pins` table and the
+blob cache's ETag sidecars — SQLite holds no state column. The same four values
+are what the OS integrations see, as the `user.wusel.state` xattr
+(xref:file-manager.adoc[File-manager integration] documents the contract).
+
 Flow: we answer `getattr`/`readdir` from the SQLite state (without content).
-Only `open`/`read` triggers the hydration (ideally a range GET for streaming).
+Only `open`/`read` triggers the hydration (a range GET for the bytes asked for,
+plus background hydration of the whole file).
 
 == Hydration: serve the range live, cache the whole file in the background
 
@@ -181,9 +193,12 @@ avoids exactly that:
   cache (see _Cache coherence_ below), never per file operation.
 * *Read only what is asked for.* A read serves just its byte range live; it never
   downloads the whole file (see _Hydration: serve the range live, cache the
-  whole file in the background_). A pinned or
-  just-written file is served whole from the ETag-validated blob cache, so those
-  reads never hit the network.
+  whole file in the background_). A pinned, cached or just-written file is served
+  whole from the blob cache instead — but the blob is only used while its ETag
+  sidecar still matches the ETag in SQLite. Once the sync walk learns the server
+  copy changed, the blob counts as stale and the next read goes to the network
+  again (re-hydrating as it goes); proactive re-hydration of *pinned* paths is an
+  open roadmap item, see xref:roadmap.adoc[_Refinements_].
 * *Reuse connections.* The `reqwest` client keeps a persistent connection pool
   with HTTP keep-alive and HTTP/2 multiplexing — no TLS handshake per operation.
 * *Stream and prefetch.* Range GET for partial/streaming reads; read-ahead for
@@ -281,7 +296,7 @@ correctness).
 | Touchpoint | Origin | Stability
 | PROPFIND + multistatus, GET + `Range`, ETag compare, Basic auth | WebDAV / HTTP standard | very stable
 | Standard props (`getcontentlength`, `getlastmodified`, `getetag`, `resourcetype`) | WebDAV standard | very stable
-| DAV path `/remote.php/dav/files/{user}` | Nextcloud / ownCloud | stable (long-standing)
+| DAV path `+/remote.php/dav/files/{user}+` | Nextcloud / ownCloud | stable (long-standing)
 | Login Flow v2 (`/index.php/login/v2`) | Nextcloud API | stable, but not WebDAV
 | `oc:fileid`, `oc:permissions` (`owncloud.org/ns`) | ownCloud / Nextcloud extension | stable convention
 | OCS capabilities (`/ocs/v2.php/cloud/capabilities`) | Nextcloud API | stable
@@ -291,7 +306,9 @@ correctness).
 Graceful degradation, by design:
 
 * no `oc:fileid` → the file is served live, uncached (no crash);
-* no `oc:permissions` → assumed writable (the read-only mount still governs);
+* no `oc:permissions` → assumed writable, so the mount does not lock the user out
+  of a file the server would in fact accept; a write the server does not allow is
+  still rejected by the server itself;
 * no notify_push / no OCS answer → TTL revalidation;
 * an unparsable date → `mtime` 0.
 
@@ -306,69 +323,110 @@ inherently less "standard" than reading.
 
 == Sync state model (ETag-based)
 
-Three ETags per file: `local`, `server`, `last known`.
+There is **one ETag per node** — the `etag` column in SQLite, holding the last
+ETag the server reported for it. There is no separate "local" or "last known"
+ETag, and no stored sync-state enum: each of the three questions is answered
+where it is actually cheap to answer.
 
-[cols="1,1,1",options="header"]
+[cols="1,2",options="header"]
 |===
-| local vs. known | server vs. known | → `model::SyncState`
-| same     | same     | `InSync`
-| changed  | same     | `LocalDirty` (upload)
-| same     | changed  | `RemoteChanged` (download)
-| changed  | changed  | `Conflict` → conflict copy
+| Question | How it is answered
+| Do we have a local edit?
+| By the presence of a write buffer for that inode (`Provider::file_state` →
+  `modified`), not by comparing ETags. The buffer *is* the pending change.
+| Did the server copy change?
+| The reconcile walk compares the stored `etag` against the fresh one from
+  PROPFIND (see _Cache coherence_). A difference updates the metadata and makes
+  the cached blob stale, because a blob is only used while its ETag sidecar
+  matches the stored `etag`.
+| Did both change?
+| Not computed at all — it is *asked*. The upload carries a precondition, and the
+  server answers `412 Precondition Failed`. That HTTP status is the conflict
+  signal (see _Conflict handling_).
 |===
 
+Deriving the states this way avoids the classic check-then-write race: nothing we
+computed a moment ago can go stale between the decision and the `PUT`.
 Conflicts never cause a silent overwrite — see _Conflict handling_ below.
+
+NOTE: existing databases still carry `hydration` and `sync` columns from an
+earlier design. They are unused legacy — kept only so an old state DB opens
+unchanged — and nothing maps to them.
 
 == Conflict handling
 
-*Implemented today.* Uploads are conditional: `flush` sends `PUT` (or the chunked
-`MOVE`) with `If-Match` on the base ETag, so a server-side change under us is
-rejected with 412 — the conflict signal (no check-then-write race). Resolution:
-
-* *Default (like the reference client):* keep the server version at the original
-  path and save the local edit beside it as `… (conflicted copy <unix>).ext`.
-  Lossless, works for any type including binaries.
-* *Opt-in `[sync] text_merge = true`:* a 3-way merge (`diffy`) of the cached base,
-  our edit, and the current server version. Disjoint edits merge and upload
-  automatically; a real clash falls back to a conflicted copy. Off by default,
-  since it deviates from the reference client's behaviour.
-
-The rest of this section is the intended direction (descriptive copy names,
-in-file git-style markers, advisory locking) — refinements on the above.
-
 The official client treats any double-edit as a whole-file collision with an
-opaque prompt. Wusel does not. Principles:
+opaque prompt. Wusel does not, and two principles hold across everything below:
 
 * *Access is never blocked.* No modal "what to do with the difference?" on open —
   you open the file and see content.
-* *No data loss, made visible.* Both versions always survive, with names that say
-  what they are (who changed it, when) plus a plain-language note — not
-  `foo (conflicted copy …).txt`.
-* *Meet developers in their tools.* Real clashes appear as git-style conflict
-  markers (`<<<<<<<` / `=======` / `>>>>>>>`) in a clearly named copy, resolvable
-  in the VS Code merge editor — no proprietary UI.
+* *No data loss.* Both versions always survive; a conflict never resolves into a
+  silent overwrite.
 
-=== Three-way merge (anywhere a git-like merge applies)
+=== Detection (implemented)
 
-We keep the *content* of the common ancestor (`last known`), not just its ETag,
-so we can run a three-way merge wherever line-based merging works — Markdown,
-source code, config, plain text, CSV, and the like. This is *not* limited to
-Markdown; it is the default for any mergeable content.
+Uploads carry a precondition, so a server-side change under us is rejected with
+412 — the conflict signal (no check-then-write race). Which precondition depends
+on what we know about the target (`webdav::Precondition`):
 
-* Non-overlapping edits merge automatically → *no conflict at all*.
-* Only same-line clashes produce a conflict → git-style markers in a named copy.
+* *A create* (no file id yet — the file has never existed server-side):
+  `If-None-Match: *`, so losing the race against a same-named file created
+  elsewhere yields a conflict instead of clobbering it.
+* *A known base version:* `If-Match: "<etag>"` — the ordinary case.
+* *The file exists but its ETag is unknown* (the server answered an upload
+  without an `ETag` header, or a listing carried no `getetag`): **no
+  precondition**. A condition we know to be false protects nothing and would
+  turn every single save into a conflicted copy; the exposure is one save until
+  the next PROPFIND restores the ETag, and a genuine concurrent change is still
+  caught by the sync walk.
 
-Content-type policy: mergeable (line-based text) → three-way merge; everything
-else (images, office, other binaries) → keep both with descriptive names, never
-a silent overwrite.
+=== Resolution (implemented)
 
-=== Avoiding conflicts
+* *Default (like the reference client):* keep the server version at the original
+  path and save the local edit beside it as `… (conflicted copy <unix>).ext`.
+  Lossless, works for any type including binaries. A desktop notification tells
+  the user a copy was made — otherwise the rename is invisible.
+* *Opt-in `[sync] text_merge = true`:* a 3-way merge (`diffy`) before falling back
+  to that copy. Off by default, since it deviates from the reference client's
+  behaviour.
 
-* *Advisory locking:* Nextcloud supports WebDAV LOCK / file locking. When the web
-  editor (Text app) holds a lock, Wusel sees it and warns before a local write —
-  this addresses the Markdown web-editor vs. local-editor case at the source.
-* *Small sync window:* `notify_push` + fast reconciliation shrink the window in
-  which two people unknowingly diverge.
+==== The three-way merge
+
+Because a merge needs the *content* of the common ancestor and not just its ETag,
+the cached blob of the version the edit started from serves as the base — and
+when `text_merge` is on, a write seeds that base into the cache even if the read
+would not otherwise have cached it. The merge then runs base (last known) vs.
+ours (the write buffer) vs. theirs (the current server copy):
+
+* All three must decode as UTF-8; binary content is never merged. Line-based text
+  is the whole scope — Markdown, source, config, CSV and the like — with no
+  per-format special-casing.
+* Non-overlapping edits merge cleanly and upload automatically, *conditioned on
+  the exact version that was merged as "theirs"*, so a third change landing
+  between the merge's read and its write is caught rather than overwritten.
+* A same-line clash, non-UTF-8 content, or a missing base falls back to the
+  conflicted copy above.
+
+The merge is covered by mock end-to-end tests but not yet verified against a live
+Nextcloud — treat it as experimental (xref:roadmap.adoc[Roadmap]).
+
+=== Intended direction (not implemented)
+
+Everything from here on is design intent, not current behaviour:
+
+* *Descriptive copy names.* Both versions survive today, but under the reference
+  client's opaque `foo (conflicted copy <unix>).txt`. The intent is a name that
+  says who changed it and when, plus a plain-language note.
+* *In-file git-style markers.* Meet developers in their tools: a real clash would
+  appear as `<<<<<<<` / `=======` / `>>>>>>>` in a clearly named copy, resolvable
+  in any merge editor — no proprietary UI. Today a clash simply yields the
+  conflicted copy, with no markers.
+* *Advisory locking.* Nextcloud supports WebDAV LOCK / file locking. When the web
+  editor (Text app) holds a lock, Wusel would see it and warn before a local
+  write — addressing the web-editor vs. local-editor case at the source.
+
+Conflict *avoidance* is already partly real, though: `notify_push` plus fast
+reconciliation keep the window in which two people unknowingly diverge small.
 
 == Cache coherence
 
@@ -417,8 +475,9 @@ pushed to the kernel (see _Invalidating the kernel's FUSE cache_).
 PROPFIND `Depth: 1`, then per child compare local vs. server ETag:
 
 * *same* → skip.
-* *different + file* → update metadata; if the file is hydrated locally, mark its
-  content `RemoteChanged` → invalidate the blob, re-hydrate on next read.
+* *different + file* → update the stored metadata (ETag, size, mtime). A cached
+  blob thereby stops matching its ETag sidecar, so it is ignored from then on and
+  the next read re-hydrates from the server.
 * *different + directory* → mark the subtree for a lazy re-check.
 * *local but gone on the server* → deleted remotely → remove from SQLite + blob cache.
 * *on the server but not local* → new → insert.
@@ -500,6 +559,64 @@ happening:
 Only the *first* listing of a directory is synchronous, because there is nothing
 cached to serve yet.
 
+=== The single dispatch thread is a ceiling, not a design goal
+
+Both rules above are *mitigations*: they keep the known slow operations off the
+one thread. The thread itself remains a hard serialisation point — `fuser`'s
+session loop reads and dispatches one request at a time — so anything that does
+block it still blocks everything behind it. Two examples that survive the
+mitigations:
+
+* A large hydration is served in chunks, but each chunk is still a network
+  round-trip on the dispatch thread. Meanwhile the file manager's per-file
+  `getxattr` calls (the emblem lookups, individually microseconds) queue behind
+  it. The extension's assumption that reading the xattr is "cheap and local" is
+  true of the *handler* and false of the *queue*, so a big transfer can make the
+  file manager look frozen.
+* Two users of the mount cannot proceed in parallel at all: a `cp` from the
+  mount and an `ls` in another terminal take turns, however unrelated they are.
+
+The fix is genuine concurrency: dispatch each request to a **worker pool** rather
+than handling it inline, so a blocked request occupies one worker instead of the
+whole filesystem. That is the single largest performance improvement available
+to the frontend, and it would also remove the reason the mitigations above have
+to exist.
+
+The cost is not the pool — it is that the engine is currently built for exclusive
+access, deliberately: `Provider` is driven through `&mut self`, and all SQLite
+access runs on one connection with no locking precisely *because* the session
+loop guarantees one caller at a time (see _State_). Concurrency means giving that
+up: a connection per worker or a pooled/serialised state layer, and interior
+synchronisation for the write buffers, the readahead windows and the pin state —
+each of which is currently free of locks by construction. So this is a deliberate
+0.2-and-later project, not a flag to flip; the ordering of `readdir` chunks and
+the write-back invariants have to survive it. See the
+xref:roadmap.adoc[Roadmap].
+
+=== Directory streams see a stable listing
+
+Answering `readdir` straight from SQLite per chunk would collide with exactly
+that background revalidation. A directory is not delivered in one reply: the
+kernel asks for it in chunks identified by an *offset* into the listing. If a
+revalidation lands between two chunks and the second chunk is computed from the
+new listing, the offsets no longer mean the same thing — entries get skipped or
+duplicated, and `ls` silently lies.
+
+The FUSE frontend therefore takes a **snapshot per traversal**: the listing is
+built when a stream starts and every continuation chunk is served from that same
+snapshot, so one `ls` is always internally consistent. The snapshot is not taken
+at `opendir` but at the stream's start, which is also where POSIX `rewinddir`
+lands (glibc implements it as a seek to offset 0 on the same descriptor, with no
+second `opendir`). That keeps the other half of the contract: a rewound stream
+must see the directory's *current* state, so a long-lived directory handle — a
+file manager, a watcher, an indexer — is never stuck with a listing from the
+moment it opened.
+
+A snapshot is a copy of the directory's names, and a process may hold arbitrarily
+many directory handles, so the number kept at once is capped. Beyond the cap a
+stream simply re-lists per chunk again — still correct, just without the
+intra-stream stability — rather than letting memory grow unbounded.
+
 == File watching (inotify)
 
 Tools (editors, LSP servers, build watchers, file managers) watch files via the
@@ -508,10 +625,13 @@ kernel's inotify API. Wusel supports this, with one honest distinction:
 * *Local changes (through the mount)* work natively: a write through the mount
   goes through the VFS, so the kernel generates the inotify events itself.
 * *Remote changes (another client on the server)* are the known FUSE limit: cache
-  invalidation alone does not emit an inotify event. We keep the kernel cache
-  coherent via the FUSE notify API (`notify_store` / `notify_inval_inode` /
-  `notify_inval_entry`) so any re-stat/re-read reflects reality immediately, and
-  emit events where the kernel's notify path allows.
+  invalidation alone does not emit an inotify event. What we do keep coherent is
+  the *kernel's* cache — the syncer pushes added and removed entries through the
+  one notify call we use, `Notifier::inval_entry` (the kernel's
+  `notify_inval_entry`; see _Invalidating the kernel's FUSE cache_), and the short
+  attribute/entry TTL makes the kernel re-ask for everything else. A re-stat or
+  re-read therefore reflects reality immediately, but a watcher blocked on an
+  inotify event is not woken by it.
 
 We do not promise perfect remote inotify delivery — local watches are
 first-class, remote coherence is immediate.
@@ -703,6 +823,11 @@ unit so N instances run side by side:
 [source,ini]
 ----
 # /usr/lib/systemd/user/wusel@.service  (shipped by the package)
+[Unit]
+Description=Wusel — virtual Nextcloud filesystem (%i)
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
 [Service]
 Type=simple
 ExecStart=/usr/bin/wusel mount --account %i
@@ -713,11 +838,25 @@ RestartSec=5
 WantedBy=default.target
 ----
 
+*The absent sandboxing is deliberate.* The unit carries none of the systemd
+hardening directives one would normally reach for — `ProtectSystem`,
+`LockPersonality`, `RestrictRealtime`, `ProtectKernelModules` and friends —
+because every one of them implies `NoNewPrivileges=yes`, and an unprivileged FUSE
+mount goes through the **setuid** `fusermount3` helper. Under `NoNewPrivileges`
+the setuid bit is ignored and the mount dies with `fusermount3: Operation not
+permitted`. So the hardening is not missing by oversight; it is incompatible with
+the one thing the service exists to do. What limits the blast radius instead is
+that this is a *user* service holding a revocable app password, not a root
+daemon. Both shipped unit files carry this rationale as a comment, so nobody
+"fixes" it later.
+
 Two accounts must never share or nest a mountpoint (Linux would over-mount and
 hide the first), so `mount` refuses to start where its target equals, contains,
 or sits inside another active mount (`wusel_core::mount::find_conflict` against
 `/proc/self/mountinfo`). Mounting the *same* server + user under two accounts is
-allowed but warned: harmless while read-only, a footgun once writing lands.
+allowed but warned: two read-write mounts of one account edit the same server
+files through two independent caches and write buffers, so they can conflict with
+each other exactly as two different machines would.
 
 Flow for a plain user: install the package (pulls `fuse3`), `wusel login
 --account work <url>` (confirm in the browser), then `wusel --account work

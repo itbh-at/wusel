@@ -6,9 +6,16 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description.workspace = true
+keywords.workspace = true
+categories.workspace = true
 # Test-only tool: a tiny Nextcloud-style WebDAV server for container e2e runs.
 # Never published; keeps the mock in Rust so we maintain one language, not two.
-publish = false
+# (The workspace default is already `publish = false`; kept explicit here because
+# this crate is test-only by nature, not merely by packaging policy.)
+publish.workspace = true
 
 [dependencies]
 # Deliberately dependency-lean: only tokio (async runtime + TCP). The HTTP/1.1

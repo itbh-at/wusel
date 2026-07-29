@@ -38,6 +38,12 @@ contribution.
   mass submissions, or a stream of unreviewed AI-generated reports, from that
   source onward.
 
+## Security
+
+A suspected **vulnerability** never goes into a public issue. Report it
+privately — see [SECURITY.md](SECURITY.md) for the channels, the scope and the
+response times you can expect.
+
 **In short:** behave decently and genuinely want to help move Wusel forward, and
 you are welcome here.
 

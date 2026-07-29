@@ -534,12 +534,24 @@ fn read_up_to(file: &mut std::fs::File, buf: &mut [u8]) -> std::io::Result<usize
     Ok(total)
 }
 
-/// A process-unique suffix for an upload id (no external RNG dependency).
+/// A suffix that makes an upload id unique (no external RNG dependency).
+///
+/// Two parts, because neither alone is enough: the wall clock separates ids
+/// across *runs* (the pid is recycled), and a process-local counter separates
+/// them **within** a run — a clock reading is not unique at all, since two calls
+/// can land in the same nanosecond, and on a coarse clock routinely do. Two
+/// concurrent chunked uploads sharing an upload collection would interleave
+/// their chunks into one corrupt file.
 fn unique_suffix() -> u128 {
-    std::time::SystemTime::now()
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
-        .unwrap_or(0)
+        .unwrap_or(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    // Shift the timestamp clear of the counter so the two never collide.
+    (nanos << 64) | u128::from(n)
 }
 
 /// The requested window out of a full-body (200) response to a range GET, with
@@ -699,10 +711,11 @@ impl PartialEntry {
         }
     }
 
-    /// Builds the final entry; the directory itself (href == base) is dropped.
+    /// Builds the final entry; the directory itself (href == base) is dropped,
+    /// and so is any href that is not genuinely below the user root.
     fn finish(self, base_path: &str) -> Option<RemoteEntry> {
         let decoded = percent_decode(&self.href);
-        let rel = decoded.strip_prefix(base_path).unwrap_or(&decoded);
+        let rel = strip_base(&decoded, base_path)?;
         let rel = rel.trim_matches('/');
         if rel.is_empty() {
             return None; // the requested directory itself
@@ -716,6 +729,33 @@ impl PartialEntry {
             file_id: self.file_id,
             permissions: self.permissions,
         })
+    }
+}
+
+/// The part of an href below the user root, or `None` if it is not below it.
+///
+/// **Component-aware on purpose.** A plain `strip_prefix` matches characters, not
+/// path segments: with the base `/remote.php/dav/files/alice`, the href
+/// `/remote.php/dav/files/alice2/x` shares the prefix without being inside the
+/// account, and blind stripping would invent an entry named `2/x` at the account
+/// root. A well-behaved server never sends that — but this parser is deliberately
+/// hardened against hostile hrefs, so the remainder must start at a `/` (or be
+/// empty, which is the queried directory itself).
+///
+/// RFC 4918 also permits an href to be a full URI. Nextcloud sends a path, but a
+/// proxy may rewrite it; strip an optional `scheme://authority` first, so such a
+/// listing still resolves instead of collapsing to "no children" (which a
+/// reconcile would faithfully mirror as "everything was deleted").
+fn strip_base<'a>(href: &'a str, base_path: &str) -> Option<&'a str> {
+    let path = match href.split_once("://") {
+        Some((_scheme, rest)) => rest.find('/').map(|i| &rest[i..]).unwrap_or("/"),
+        None => href,
+    };
+    let rest = path.strip_prefix(base_path)?;
+    if rest.is_empty() || rest.starts_with('/') {
+        Some(rest)
+    } else {
+        None
     }
 }
 
@@ -967,6 +1007,65 @@ mod tests {
         let dir = &entries[1];
         assert_eq!(dir.path, "Sub Folder", "percent decoding must take effect");
         assert!(dir.is_dir);
+    }
+
+    #[test]
+    fn hrefs_outside_the_user_root_are_rejected() {
+        // The parser is hardened against hostile hrefs, and a raw string prefix
+        // is not: for the base `…/files/alice`, `…/files/alice2/x` shares the
+        // prefix without being below it. Stripping it blindly yields the entry
+        // path `2/x` — a phantom file at the account root.
+        let base = "https://cloud.example.org/remote.php/dav/files/alice";
+        let xml = r#"<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:">
+  <d:response>
+    <d:href>/remote.php/dav/files/alice2/x</d:href>
+    <d:propstat><d:prop><d:getetag>"a"</d:getetag></d:prop></d:propstat>
+  </d:response>
+  <d:response>
+    <d:href>/remote.php/dav/files/alice/Notes.txt</d:href>
+    <d:propstat><d:prop><d:getetag>"b"</d:getetag></d:prop></d:propstat>
+  </d:response>
+</d:multistatus>"#;
+        let entries = parse_multistatus(xml, base).unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "only the href genuinely below the user root survives: {entries:?}"
+        );
+        assert_eq!(entries[0].path, "Notes.txt");
+    }
+
+    #[test]
+    fn absolute_hrefs_are_made_relative_to_the_user_root() {
+        // RFC 4918 allows an href to be a full URI. Nextcloud sends a path, but
+        // a proxy may not — and the component check must not turn such a listing
+        // into an empty directory (which reconcile would mirror as "all gone").
+        let base = "https://cloud.example.org/remote.php/dav/files/alice";
+        let xml = r#"<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:">
+  <d:response>
+    <d:href>https://cloud.example.org/remote.php/dav/files/alice/Notes.txt</d:href>
+    <d:propstat><d:prop><d:getetag>"b"</d:getetag></d:prop></d:propstat>
+  </d:response>
+</d:multistatus>"#;
+        let entries = parse_multistatus(xml, base).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "Notes.txt");
+    }
+
+    #[test]
+    fn upload_ids_are_unique_within_the_process() {
+        // The suffix guards against two concurrent chunked uploads sharing an
+        // upload collection. A wall-clock reading alone does not: two calls can
+        // land in the same nanosecond (or on a clock with coarser resolution).
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..10_000 {
+            assert!(
+                seen.insert(unique_suffix()),
+                "unique_suffix repeated itself"
+            );
+        }
     }
 
     #[test]

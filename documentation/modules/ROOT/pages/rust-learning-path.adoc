@@ -1,3 +1,8 @@
+////
+  // SPDX-License-Identifier: Apache-2.0
+  // Copyright 2026 IT Beratung Hermann GmbH
+////
+
 = Rust Learning Path
 
 This page links Rust concepts to the concrete places in the code where they

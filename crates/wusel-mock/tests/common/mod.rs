@@ -87,7 +87,43 @@ impl Drop for Mock {
 
 /// Point the XDG base directories at a throwaway location under `base`, so the
 /// account's config/state/cache never touch the real home directory.
+///
+/// # Why `set_var` is safe *here*, and only here
+///
+/// `std::env::set_var` is documented-unsound on a multi-threaded process: the
+/// POSIX environment is a plain global with no locking, so a concurrent
+/// `getenv` in another thread may read a dangling pointer. Rust made it
+/// `unsafe` in edition 2024 for exactly that reason (this crate is on 2021, so
+/// it still compiles without the keyword — the hazard is identical). libtest is
+/// multi-threaded, and both reqwest (proxy variables) and the keyring read the
+/// environment, so this is not a theoretical concern in general.
+///
+/// The only thing that makes it sound in this harness is a *structural*
+/// property, not a lucky ordering: **each test binary that calls this has
+/// exactly one `#[test]`, and calls it as its first statement**, before any
+/// runtime, HTTP client or keyring exists. With one test, libtest has spawned
+/// one thread and is itself parked waiting for it — nobody else can be inside
+/// `getenv`. Every reader of `XDG_*` in this process is created afterwards.
+///
+/// Doing better would mean injecting the base directories into `wusel-core`
+/// instead of going through the environment, which its `config::xdg_dir` does
+/// not offer; that is an engine-side change, not a test-side one.
+///
+/// Because the argument rests entirely on "exactly one test, called first", the
+/// first half of it is *enforced* rather than trusted: a second call — which is
+/// what adding a second `#[test]` to such a file would produce — panics instead
+/// of racing. Silence would be the dangerous outcome, so this is deliberately
+/// loud.
 pub fn xdg_sandbox(base: &Path) {
+    // Per test binary: cargo compiles a private copy of this module into each.
+    static SANDBOXED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    assert!(
+        !SANDBOXED.swap(true, std::sync::atomic::Ordering::SeqCst),
+        "xdg_sandbox must be called exactly once per test binary: the env \
+         mutation below is only sound while this process is effectively \
+         single-threaded. Split the tests into separate files instead."
+    );
+
     let xdg = base.join("xdg");
     std::env::set_var("XDG_CONFIG_HOME", xdg.join("config"));
     std::env::set_var("XDG_STATE_HOME", xdg.join("state"));

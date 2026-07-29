@@ -1,3 +1,8 @@
+////
+  // SPDX-License-Identifier: Apache-2.0
+  // Copyright 2026 IT Beratung Hermann GmbH
+////
+
 = Project, licence & distribution
 
 This page states plainly who is behind `wusel`, what is free, and where money
@@ -30,7 +35,8 @@ Windows Cloud Filter as they land) — and it is *fully functional*:
   unlocked by a key. What you build from source is the same software the stores
   sell.
 * You may *clone, build, run, fork, and redistribute* it under Apache-2.0, for
-  free — including on Linux via the RPM/DEB packages built from this repository.
+  free — including on Linux via the Fedora RPM built from this repository (a
+  Debian package is planned, not yet built).
 
 Self-hosters and the community get a complete client with nothing crippled. This
 is the promise, and the gate-free core is how it stays credible.
@@ -45,7 +51,7 @@ Not the code — the *convenience and assurance of distribution*:
 
 |
 * Full source, Apache-2.0
-* Linux RPM/DEB from this repo
+* Fedora RPM from this repo (Debian: planned)
 * Self-service, community support
 |
 * Signed & *notarized* store builds (Microsoft Store, Mac App Store)
@@ -78,9 +84,12 @@ nothing that changes behaviour.
 The commercial layer adds no code — only packaging on top of what this
 repository already builds. That packaging is standard ground: `cargo-wix` / WiX
 (MSI) or MSIX on Windows; `codesign` + `notarytool` + `create-dmg` (or `.pkg`)
-on macOS; `cargo-deb` / `cargo-generate-rpm` on Linux — or the hand-written spec
-under `packaging/rpm/` that the xref:installation.adoc[Fedora RPM] is built from.
-Apache-2.0 works with the Apple and Microsoft stores.
+on macOS. On Linux the only package that exists today is the
+xref:installation.adoc[Fedora RPM], built from the hand-written spec under
+`packaging/rpm/`; the `v*` tag workflow publishes it for `x86_64` and `aarch64`
+to GitHub Releases. A Debian package would be the obvious next one (`cargo-deb`,
+or a `debian/` directory), but nothing of it is written yet. Apache-2.0 works
+with the Apple and Microsoft stores.
 
 A bonus of the native frontends: the macOS File Provider and Windows Cloud
 Filter are built into the OS, so there is *no external driver to bundle* (a

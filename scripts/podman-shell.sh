@@ -18,10 +18,13 @@ IMAGE="wusel-dev"
 
 # Locate the repo as the VM sees it (direct share, or an rsync mirror as the
 # fallback) — sets WORK and MIRRORED. Shared logic: scripts/podman-lib.sh.
+# shellcheck source=scripts/podman-lib.sh
 . "$(dirname "$0")/podman-lib.sh"
 resolve_work
 
-podman image exists "$IMAGE" || podman build -t "$IMAGE" -f "$REPO/Containerfile" "$REPO"
+# Unconditional rebuild — podman layer-caches, so this is ~free, and it keeps the
+# image from drifting behind a mise.toml toolchain bump (see podman-test.sh).
+podman build -t "$IMAGE" -f "$REPO/Containerfile" "$REPO"
 
 # Persistent home for credentials/state across `--rm` runs, so `login` is a
 # one-time step. Mapped to the XDG dirs the daemon uses (see wusel_core::config).

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 IT Beratung Hermann GmbH
-#
+
 # Build + install the native Nautilus extension. No scripting runtime: this
 # produces a single shared object Nautilus loads directly.
 #

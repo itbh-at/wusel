@@ -15,7 +15,7 @@
 
 use rusqlite::{Connection, OptionalExtension};
 
-use crate::model::RemoteEntry;
+use crate::model::{basename, RemoteEntry};
 use crate::Result;
 
 /// Root inode per FUSE convention.
@@ -116,7 +116,7 @@ impl StateDb {
 
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for c in children {
-            let name = c.path.rsplit('/').next().unwrap_or(&c.path);
+            let name = basename(&c.path);
             seen.insert(name.to_string());
             let path = if parent_path.is_empty() {
                 c.path.clone()
@@ -363,8 +363,26 @@ impl StateDb {
     /// open file handles and any pending write buffer keyed by the old inode.
     /// Descendant paths are rewritten iteratively via the parent links (no
     /// `LIKE` on the old prefix, so names containing `%`/`_` are safe).
+    ///
+    /// Pins move with the subtree (see `move_pins`) — a rename must not quietly
+    /// end a "keep offline" promise. A move **into the node's own subtree** is
+    /// refused (see `descends_from`).
     pub fn move_subtree(&mut self, inode: u64, new_parent: u64, new_name: &str) -> Result<()> {
         let tx = self.conn.transaction()?;
+        // A cyclic parent link would make the rewrite walk below push children
+        // forever (it would never pop its way out), so this is not a nicety: it
+        // is the difference between an error and an unkillable, memory-eating
+        // loop. The kernel's own `vfs_rename` rejects such a rename, so we only
+        // ever see one from a frontend that does not (or from a direct caller).
+        if descends_from(&tx, new_parent, inode)? {
+            return Err(crate::Error::Other(format!(
+                "move_subtree: refusing to move inode {inode} into its own subtree"
+            )));
+        }
+        let old_path: String =
+            tx.query_row("SELECT path FROM nodes WHERE inode = ?1", [inode], |r| {
+                r.get(0)
+            })?;
         let parent_path: String = tx.query_row(
             "SELECT path FROM nodes WHERE inode = ?1",
             [new_parent],
@@ -375,6 +393,7 @@ impl StateDb {
         } else {
             format!("{parent_path}/{new_name}")
         };
+        move_pins(&tx, &old_path, &path)?;
         tx.execute(
             "UPDATE nodes SET parent = ?2, name = ?3, path = ?4 WHERE inode = ?1",
             rusqlite::params![inode, new_parent, new_name, path],
@@ -509,25 +528,58 @@ impl StateDb {
         Ok(())
     }
 
+    /// Drop the pin on `path` **and every pin below it**, returning how many were
+    /// removed. For a subtree that no longer exists (a delete): its "keep
+    /// offline" promises are void, and a pin left behind would keep protecting
+    /// the dead files' cache blobs from eviction forever. Component-aware, so
+    /// removing `Photos` leaves `Photos2` alone. The empty path is the account
+    /// root and clears everything.
+    pub fn remove_pins_under(&self, path: &str) -> Result<usize> {
+        let path = path.trim_matches('/');
+        if path.is_empty() {
+            return Ok(self.conn.execute("DELETE FROM pins", [])?);
+        }
+        let doomed = pins_under(&self.conn, path)?;
+        for (pin, _) in &doomed {
+            self.conn
+                .execute("DELETE FROM pins WHERE path = ?1", [pin])?;
+        }
+        Ok(doomed.len())
+    }
+
     /// Whether `path` is kept offline: pinned itself, under a pinned directory,
     /// or covered by a root pin.
+    ///
+    /// This runs once per **visible entry** whenever a file manager draws a
+    /// directory (via `Provider::file_state`), so it must not scan the pins table
+    /// or allocate per row. Instead it asks the primary key directly — once for
+    /// the path itself, then once per ancestor prefix (a borrowed slice, no
+    /// `format!`), then for the root pin. That is a handful of indexed lookups
+    /// bounded by the path's depth, whatever the number of pins.
     pub fn is_pinned(&self, path: &str) -> Result<bool> {
         let path = path.trim_matches('/');
-        let mut stmt = self.conn.prepare("SELECT path, is_dir FROM pins")?;
-        let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? != 0))
-        })?;
-        for row in rows {
-            let (pin, is_dir) = row?;
-            if pin == path {
-                return Ok(true);
-            }
-            // A directory pin covers its subtree; the root pin ("") covers all.
-            if is_dir && (pin.is_empty() || path.starts_with(&format!("{pin}/"))) {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT is_dir FROM pins WHERE path = ?1")?;
+        /// The pin on exactly `p`, if any: `Some(is_dir)`.
+        fn pin_at(stmt: &mut rusqlite::CachedStatement, p: &str) -> Result<Option<bool>> {
+            Ok(stmt
+                .query_row([p], |r| r.get::<_, i64>(0))
+                .optional()?
+                .map(|v| v != 0))
+        }
+        // A pin on the entry itself counts whatever kind it is …
+        if pin_at(&mut stmt, path)?.is_some() {
+            return Ok(true);
+        }
+        // … an ancestor only if it is a *directory* pin (its subtree).
+        for (i, _) in path.match_indices('/') {
+            if pin_at(&mut stmt, &path[..i])? == Some(true) {
                 return Ok(true);
             }
         }
-        Ok(false)
+        // The root pin ("") is the legacy "keep everything offline".
+        Ok(pin_at(&mut stmt, "")? == Some(true))
     }
 
     /// All pins as `(path, is_dir)`.
@@ -568,6 +620,82 @@ impl StateDb {
 const SELECT_NODE_COLS_WHERE_PARENT: &str =
     "SELECT inode, parent, name, path, is_dir, size, etag, mtime, file_id, permissions
      FROM nodes WHERE parent = ?1 AND inode != ?1";
+
+/// How far up the parent chain [`descends_from`] is willing to walk. Far beyond
+/// any real nesting; a chain longer than this is already corrupt, and treating
+/// it as "cyclic" is the safe answer (it refuses the move instead of looping).
+const MAX_ANCESTOR_WALK: u32 = 1024;
+
+/// Whether `inode` is `ancestor` or lies below it, walking the parent links up.
+/// The root is its own parent, which is where the walk stops.
+fn descends_from(tx: &rusqlite::Transaction, inode: u64, ancestor: u64) -> Result<bool> {
+    let mut cur = inode;
+    for _ in 0..MAX_ANCESTOR_WALK {
+        if cur == ancestor {
+            return Ok(true);
+        }
+        let parent: Option<u64> = tx
+            .query_row("SELECT parent FROM nodes WHERE inode = ?1", [cur], |r| {
+                r.get::<_, i64>(0).map(|v| v as u64)
+            })
+            .optional()?;
+        match parent {
+            // A node that is its own parent is the root — the walk is done.
+            Some(p) if p != cur => cur = p,
+            _ => return Ok(false),
+        }
+    }
+    Ok(true)
+}
+
+/// Pins at or below `path` as `(path, is_dir)`. Filtered by **path component**
+/// in Rust (`Photos` must not catch `Photos2`) and without `LIKE`, so names
+/// containing `%`/`_` are safe. `path` must be non-empty and already trimmed.
+fn pins_under(conn: &Connection, path: &str) -> Result<Vec<(String, bool)>> {
+    let prefix = format!("{path}/");
+    let mut stmt = conn.prepare("SELECT path, is_dir FROM pins")?;
+    let rows = stmt.query_map([], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? != 0))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (pin, is_dir) = row?;
+        if pin == path || pin.starts_with(&prefix) {
+            out.push((pin, is_dir));
+        }
+    }
+    Ok(out)
+}
+
+/// Rewrite every pin at or below `old_path` onto `new_path`, so a rename carries
+/// the "keep offline" promise with it. Without this, renaming a pinned directory
+/// silently unpins it: [`StateDb::is_pinned`] is path-keyed, so it answers `false`
+/// for the new path — newly added files are never hydrated, the file manager
+/// shows the wrong emblem, and the stale `.pin` markers keep their blobs out of
+/// the cache budget forever.
+fn move_pins(tx: &rusqlite::Transaction, old_path: &str, new_path: &str) -> Result<()> {
+    if old_path.is_empty() || old_path == new_path {
+        return Ok(()); // the root never moves, and a no-op move changes nothing
+    }
+    let moved = pins_under(tx, old_path)?;
+    // Delete first, then insert: the destination may itself carry a pin (a
+    // rename that overwrites), and doing it in two passes keeps that from
+    // depending on the order rows come back in.
+    for (pin, _) in &moved {
+        tx.execute("DELETE FROM pins WHERE path = ?1", [pin])?;
+    }
+    for (pin, is_dir) in &moved {
+        // The remainder is either empty (the moved node itself) or starts with
+        // the separator, so simple concatenation rebuilds the path.
+        let rest = &pin[old_path.len()..];
+        tx.execute(
+            "INSERT INTO pins(path, is_dir) VALUES(?1, ?2)
+             ON CONFLICT(path) DO UPDATE SET is_dir = excluded.is_dir",
+            rusqlite::params![format!("{new_path}{rest}"), *is_dir as i64],
+        )?;
+    }
+    Ok(())
+}
 
 /// Delete `inode` and its entire subtree, iteratively and by inode (no `LIKE`,
 /// so file names containing `%` or `_` are safe). Returns the rows deleted.
@@ -771,6 +899,112 @@ mod tests {
             .unwrap();
         let after = db.node_by_path("Archive/Papers").unwrap().unwrap();
         assert_eq!(after.inode, docs.inode, "reconcile keeps the moved inode");
+    }
+
+    #[test]
+    fn pins_follow_a_moved_subtree() {
+        let mut db = StateDb::open_in_memory().unwrap();
+        db.reconcile_children(
+            ROOT_INODE,
+            "",
+            &[
+                entry("Photos", true),
+                entry("Photos2", true),
+                entry("Archive", true),
+            ],
+        )
+        .unwrap();
+        let photos = db.node_by_path("Photos").unwrap().unwrap();
+        let archive = db.node_by_path("Archive").unwrap().unwrap();
+        db.reconcile_children(photos.inode, "Photos", &[entry("Photos/2024", true)])
+            .unwrap();
+        let year = db.node_by_path("Photos/2024").unwrap().unwrap();
+        db.reconcile_children(
+            year.inode,
+            "Photos/2024",
+            &[entry("Photos/2024/pic.jpg", false)],
+        )
+        .unwrap();
+
+        db.set_pin("Photos", true).unwrap();
+        db.set_pin("Photos/2024/pic.jpg", false).unwrap(); // a nested pin
+        db.set_pin("Photos2", true).unwrap(); // a sibling that must NOT move
+
+        // Renaming a pinned directory must keep the "keep offline" promise.
+        db.move_subtree(photos.inode, archive.inode, "Bilder")
+            .unwrap();
+
+        assert!(
+            db.is_pinned("Archive/Bilder").unwrap(),
+            "the directory pin followed the rename"
+        );
+        assert!(
+            db.is_pinned("Archive/Bilder/2024/new.jpg").unwrap(),
+            "a file added under the moved pin is still covered"
+        );
+        assert!(
+            !db.is_pinned("Photos/2024/pic.jpg").unwrap(),
+            "the vacated path is no longer pinned"
+        );
+        let pins = db.pins().unwrap();
+        assert!(
+            pins.iter().any(|(p, _)| p == "Archive/Bilder/2024/pic.jpg"),
+            "the nested pin row moved with the subtree: {pins:?}"
+        );
+        // Component-aware: `Photos2` is not below `Photos`.
+        assert!(
+            pins.iter().any(|(p, _)| p == "Photos2"),
+            "the sibling pin is untouched: {pins:?}"
+        );
+        assert!(db.is_pinned("Photos2/holiday.jpg").unwrap());
+    }
+
+    #[test]
+    fn pins_go_away_with_the_subtree_they_covered() {
+        let db = StateDb::open_in_memory().unwrap();
+        db.set_pin("Photos", true).unwrap();
+        db.set_pin("Photos/2024/pic.jpg", false).unwrap();
+        db.set_pin("Photos2", true).unwrap();
+
+        let removed = db.remove_pins_under("Photos").unwrap();
+        assert_eq!(removed, 2, "the directory pin and the one below it");
+        assert!(!db.is_pinned("Photos/2024/pic.jpg").unwrap());
+        // Component-aware again: the `Photos2` pin survives.
+        assert!(db.is_pinned("Photos2").unwrap());
+
+        // The root clears everything (the account itself was dropped).
+        assert_eq!(db.remove_pins_under("").unwrap(), 1);
+        assert!(db.pins().unwrap().is_empty());
+    }
+
+    #[test]
+    fn move_subtree_rejects_a_move_into_its_own_subtree() {
+        let mut db = StateDb::open_in_memory().unwrap();
+        db.reconcile_children(ROOT_INODE, "", &[entry("Docs", true)])
+            .unwrap();
+        let docs = db.node_by_path("Docs").unwrap().unwrap();
+        db.reconcile_children(docs.inode, "Docs", &[entry("Docs/Sub", true)])
+            .unwrap();
+        let sub = db.node_by_path("Docs/Sub").unwrap().unwrap();
+
+        // Moving a directory below itself would make the parent links cyclic —
+        // the path-rewriting walk would then never terminate. Reject it instead.
+        let err = db
+            .move_subtree(docs.inode, sub.inode, "Docs")
+            .expect_err("a move into its own subtree must be refused");
+        assert!(
+            err.to_string().contains("subtree"),
+            "the error says what happened: {err}"
+        );
+        // And a move onto itself is the degenerate case of the same thing.
+        assert!(db.move_subtree(docs.inode, docs.inode, "Docs").is_err());
+
+        // The rejected move left the tree exactly as it was.
+        assert_eq!(db.node_by_path("Docs").unwrap().unwrap().inode, docs.inode);
+        assert_eq!(
+            db.node_by_path("Docs/Sub").unwrap().unwrap().inode,
+            sub.inode
+        );
     }
 
     #[test]

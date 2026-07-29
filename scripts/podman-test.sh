@@ -16,10 +16,14 @@ IMAGE="wusel-dev"
 
 # Locate the repo as the VM sees it (direct share, or an rsync mirror as the
 # fallback) — sets WORK and MIRRORED. Shared logic: scripts/podman-lib.sh.
+# shellcheck source=scripts/podman-lib.sh
 . "$(dirname "$0")/podman-lib.sh"
 resolve_work
 
-podman image exists "$IMAGE" || podman build -t "$IMAGE" -f "$REPO/Containerfile" "$REPO"
+# Build unconditionally (not `podman image exists ||`): podman caches the layers,
+# so a no-op rebuild is ~free, while a stale image after a mise.toml bump would
+# silently test the old toolchain. Same in the other podman-*.sh scripts.
+podman build -t "$IMAGE" -f "$REPO/Containerfile" "$REPO"
 
 echo ">> Running FUSE tests in the container ..."
 podman run --rm \

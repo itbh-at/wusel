@@ -5,9 +5,33 @@
 inlineHeader = """SPDX-License-Identifier: Apache-2.0
 Copyright 2026 IT Beratung Hermann GmbH"""
 
+# Cover whole directories rather than the handful of extensions that happen to
+# exist today, so a newly added workflow, spec, unit file, C source or install
+# script cannot ship without a header. hawkeye honours .gitignore, so build
+# output under these paths is not considered. (It skips file types it has no
+# comment style for — `.spec`, `.service`, `.desktop` — and says so; those are
+# still listed here, since the glob is what catches a future `.sh` or `.py`
+# beside them.)
+#
+# The AsciiDoc pages are covered too, so every page carries a header and none is
+# forgotten. Their `////` comment block is hawkeye's own AsciiDoc style — write a
+# new page without one and `mise run headers` inserts it.
 includes = [
   "crates/**/*.rs",
   "scripts/*.sh",
-  "packaging/rpm/*.sh",
+  "packaging/**",
+  "integration/**",
+  ".github/**/*.yml",
   "documentation/build.sh",
+  "documentation/*.yml",
+  "documentation/diagrams/*.d2",
+  "documentation/modules/**/*.adoc",
+]
+
+excludes = [
+  # Icon assets installed verbatim into the hicolor theme. Licence and copyright
+  # are carried by the package and the repository LICENSE; an XML comment in
+  # every emblem buys nothing and only bloats files a file manager loads often.
+  "integration/nautilus/emblems/*.svg",
+
 ]

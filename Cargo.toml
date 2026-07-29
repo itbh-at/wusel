@@ -8,6 +8,10 @@ members = [
     "crates/wusel-mock",
 ]
 
+# Package metadata every crate inherits with `<field>.workspace = true`. Note
+# that inheritance is opt-in per field: a crate that does not name a field here
+# simply does not get it, so a new field added below is only live once the crate
+# manifests reference it.
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
@@ -15,6 +19,20 @@ rust-version = "1.97"
 license = "Apache-2.0"
 authors = ["Christoph D. Hermann <christoph.hermann@itbh.at>"]
 repository = "https://github.com/itbh-at/wusel"
+homepage = "https://itbh-at.github.io/wusel/"
+readme = "README.md"
+# crates.io *requires* a description; a crate without one cannot be packaged at
+# all. Crates that want a sharper one override it locally.
+description = "Wusel — a VFS-first virtual Nextcloud filesystem for Linux"
+keywords = ["nextcloud", "webdav", "fuse", "filesystem", "vfs"]
+categories = ["filesystem", "network-programming", "command-line-utilities"]
+# Nothing here is published to crates.io. Wusel ships as a Fedora RPM (and later
+# signed store builds) — see the distribution page — and the crates depend on
+# each other by bare `path`, which crates.io rejects anyway. Default-deny is the
+# safe side of that: an accidental `cargo publish` is refused instead of putting
+# an unintended, half-described crate on the registry under a name we would then
+# own forever. Flipping it later is a deliberate one-line change per crate.
+publish = false
 
 # Shared dependency versions for all crates in one place.
 [workspace.dependencies]

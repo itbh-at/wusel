@@ -10,8 +10,11 @@ instead of mirroring everything locally.
 
 The goal is what the official client on Linux still does not offer today:
 a true on-demand filesystem. `wusel` is deliberately **more than just FUSE** —
-FUSE is only *one* frontend; later, `libcloudproviders` (file-manager
-integration) and possibly a native macOS File Provider frontend will join it.
+FUSE only makes the files appear; on top of it sits a full GNOME desktop
+integration (sidebar, emblems, notifications, Shell search). Native macOS
+(File Provider) and Windows (Cloud Filter) frontends remain planned.
+
+**Documentation: <https://itbh-at.github.io/wusel/>**
 
 ## Architecture in one sentence
 
@@ -24,8 +27,25 @@ a FUSE driver.
 Details: [Architecture](documentation/modules/ROOT/pages/architecture.adoc) ·
 Order of work: [Roadmap](documentation/modules/ROOT/pages/roadmap.adoc). The
 docs are an [Antora](https://antora.org) component under
-[`documentation/`](documentation/) (build: `./documentation/build.sh`, live:
-`./documentation/build.sh watch`).
+[`documentation/`](documentation/), published to
+<https://itbh-at.github.io/wusel/> on every push to `main` (build locally:
+`./documentation/build.sh`, live: `./documentation/build.sh watch`).
+
+## Install
+
+On Fedora, take the RPM from the
+[latest release](https://github.com/itbh-at/wusel/releases/latest) — a `v*` tag
+builds and publishes `x86_64` and `aarch64` packages:
+
+```sh
+sudo dnf install ./wusel-*.rpm
+systemctl --user enable --now wusel@default
+```
+
+Full walkthrough:
+[Installation](documentation/modules/ROOT/pages/installation.adoc). To build from
+source instead, see [Trying it
+out](documentation/modules/ROOT/pages/trying-it-out.adoc).
 
 ## Crates
 
@@ -91,18 +111,43 @@ The mount is Linux-only. Native macOS and Windows support (their own File
 Provider / Cloud Filter frontends, not FUSE) is far-future, experimental work; on
 a Mac, test the mount inside the podman container.
 
+### CI
+
+GitHub Actions runs the same `mise run …` tasks on every push and pull request
+(format, licence headers, clippy, check, tests, plus a Linux FUSE build), builds
+the docs, runs a nightly end-to-end test against a real Nextcloud, and publishes
+the RPMs on a `v*` tag. Details:
+[Development & Testing](documentation/modules/ROOT/pages/development.adoc).
+
 ## Status
 
 See the [Roadmap](documentation/modules/ROOT/pages/roadmap.adoc). Working today:
-authentication (Login Flow v2), the live read-only tree (listing + on-demand
-content with real mtimes/permissions), whole-file caching with LRU/age eviction,
-instant invalidation via `notify_push`, configurable TLS trust, multiple
-accounts, pinning ("always keep offline"), a systemd user service, **writing**
-(read-write mount: create/edit/rename/delete, chunked upload for large files,
-lossless conflict handling with opt-in text merge), and a default-on, fail-soft
-OS keyring for the app password (opt-out via `[auth] keyring = false`; if the
-keyring is unusable the password stays in the 0600 file). Next:
-desktop/file-manager integration.
+
+- **Engine** — authentication (Login Flow v2), the live tree (listing +
+  on-demand content with real mtimes/permissions), whole-file caching with
+  LRU/age eviction, instant invalidation via `notify_push`, configurable TLS
+  trust, multiple accounts, pinning ("always keep offline").
+- **Read-write mount** — create/edit/rename/delete, chunked upload for large
+  files, lossless conflict handling with opt-in 3-way text merge.
+- **Credentials** — a default-on, fail-soft OS keyring for the app password
+  (opt-out via `[auth] keyring = false`; if the keyring is unusable the password
+  stays in the 0600 file).
+- **GNOME desktop integration** — a *Wusel (Nextcloud)* sidebar entry with live
+  sync status (`libcloudproviders`), per-file emblems and a pin/unpin
+  context menu via a native Nautilus extension (with live emblem refresh),
+  localized desktop notifications, and a GNOME Shell search provider backed by
+  Nextcloud Unified Search.
+- **Runs like a system component** — a systemd user service, exclusion from
+  desktop indexers by default (so a crawler cannot trigger a download storm),
+  `wusel cache clear` for a clean slate, and a Fedora RPM.
+
+Next up are refinements rather than new pillars — see the roadmap: proactive
+refresh of pinned files, gettext i18n for the file-manager labels, advisory
+locking, and the KDE equivalent of the GNOME integration.
+
+## Security
+
+Found a vulnerability? Please report it privately — see [SECURITY.md](SECURITY.md).
 
 ## License
 

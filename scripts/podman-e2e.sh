@@ -20,13 +20,22 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 IMAGE="wusel-dev"
 NET="wusel-e2e-net"
 NC="wusel-e2e-nc" # also the Host header -> must be a trusted domain (below)
+# Pinned to a major tag, not `latest`: an unpinned upstream image turns "green
+# yesterday, red today" into a mystery with no code change behind it. A major tag
+# still picks up Nextcloud's patch releases — which is what a server E2E should
+# track — while a surprise major upgrade never lands unannounced. Keep in sync
+# with the `nextcloud` service in .github/workflows/e2e.yml.
+NC_IMAGE="nextcloud:34-apache"
 
 # Locate the repo as the VM sees it (direct share, or an rsync mirror as the
 # fallback) — sets WORK and MIRRORED. Shared logic: scripts/podman-lib.sh.
+# shellcheck source=scripts/podman-lib.sh
 . "$(dirname "$0")/podman-lib.sh"
 resolve_work
 
-podman image exists "$IMAGE" || podman build -t "$IMAGE" -f "$REPO/Containerfile" "$REPO"
+# Unconditional rebuild — podman layer-caches, so this is ~free, and it keeps the
+# image from drifting behind a mise.toml toolchain bump (see podman-test.sh).
+podman build -t "$IMAGE" -f "$REPO/Containerfile" "$REPO"
 
 cleanup() {
     echo ">> cleaning up the Nextcloud container and network ..."
@@ -36,14 +45,16 @@ cleanup() {
 trap cleanup EXIT
 cleanup # drop leftovers from an aborted previous run
 
-echo ">> creating network $NET and starting $NC (nextcloud:latest, SQLite) ..."
+echo ">> creating network $NET and starting $NC ($NC_IMAGE, SQLite) ..."
 podman network create "$NET" >/dev/null
+# NEXTCLOUD_ADMIN_PASSWORD is a throw-away credential for a container that is
+# created and destroyed by this very script — it never outlives the run.
 podman run -d --name "$NC" --network "$NET" \
     -e SQLITE_DATABASE=nextcloud \
     -e NEXTCLOUD_ADMIN_USER=admin \
     -e NEXTCLOUD_ADMIN_PASSWORD=adminpass \
     -e "NEXTCLOUD_TRUSTED_DOMAINS=$NC localhost 127.0.0.1" \
-    nextcloud:latest >/dev/null
+    "$NC_IMAGE" >/dev/null
 
 # The dev container reaches Nextcloud by service name on the shared network. The
 # e2e script (and the wusel daemon it starts) all run inside this container, so
@@ -63,6 +74,6 @@ podman run --rm \
     bash -lc '
         set -euo pipefail
         cd /work
-        mise exec -- cargo build -p wusel --features fuse
+        mise run build-fuse
         exec bash scripts/e2e-nextcloud.sh
     '

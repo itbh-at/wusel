@@ -10,17 +10,58 @@
 # glib2-devel, fuse3-devel, and a Rust toolchain — mise is used if present, else
 # the system cargo). To build from a macOS host without a Fedora machine, use
 # scripts/podman-rpm.sh, which runs this inside a Fedora container.
+#
+# Options / env:
+#   --check-version    validate the version only (see EXPECT_VERSION) and exit
+#   EXPECT_VERSION=X   fail unless the packaged version is X. The release
+#                      workflow passes the git tag here: the tag decides what the
+#                      release page is called, the manifest decides what goes
+#                      into the .rpm, and nothing else forces those to agree —
+#                      so tagging v0.2.0 without bumping Cargo.toml would happily
+#                      publish "v0.2.0" carrying wusel-0.1.0-*.rpm.
 set -euo pipefail
+
+CHECK_ONLY=0
+case "${1:-}" in
+    --check-version) CHECK_ONLY=1 ;;
+    "") ;;
+    *) echo "!! unknown argument: $1" >&2; exit 2 ;;
+esac
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$REPO"
 
-VERSION="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
-[ -n "$VERSION" ] || { echo "!! could not read version from Cargo.toml"; exit 1; }
-echo ">> Building Wusel $VERSION RPM ..."
-
 # Pinned toolchain via mise when available, else fall back to the system cargo.
 if command -v mise >/dev/null 2>&1; then RUN=(mise exec --); else RUN=(); fi
+
+# Ask cargo for the version instead of grepping the manifest: `grep -m1
+# '^version = '` picks whatever `version =` comes first in the file, which is the
+# right one only by accident of table ordering — a `[workspace.dependencies.foo]`
+# section moved above `[workspace.package]` would silently package that crate's
+# version. cargo pkgid prints `…#<version>` or `…#<name>@<version>`; stripping
+# through the last `#`/`@` handles both spellings.
+PKGID="$("${RUN[@]}" cargo pkgid -p wusel)"
+VERSION="${PKGID##*[#@]}"
+case "$VERSION" in
+    [0-9]*.[0-9]*) ;;
+    *) echo "!! could not read the wusel version (cargo pkgid: $PKGID)" >&2; exit 1 ;;
+esac
+
+# The tag/manifest guard. Both spellings are accepted so the caller can pass the
+# raw tag ("v0.1.0") or the bare version ("0.1.0").
+if [ -n "${EXPECT_VERSION:-}" ] && [ "${EXPECT_VERSION#v}" != "$VERSION" ]; then
+    echo "!! version mismatch: expected ${EXPECT_VERSION#v} (from ${EXPECT_VERSION})," >&2
+    echo "!! but the workspace manifest says $VERSION." >&2
+    echo "!! Bump the version in Cargo.toml, or re-tag — do not publish these apart." >&2
+    exit 1
+fi
+
+if [ "$CHECK_ONLY" = 1 ]; then
+    echo ">> version OK: $VERSION"
+    exit 0
+fi
+
+echo ">> Building Wusel $VERSION RPM ..."
 
 # --- 1. Compile artefacts ---------------------------------------------------
 echo ">> Compiling wusel (release, --features fuse) ..."

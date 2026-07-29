@@ -23,6 +23,15 @@ pub struct RemoteEntry {
     pub permissions: String,
 }
 
+/// The last path segment of a server-relative path — a child's own name.
+///
+/// One definition for the whole crate: state and provider both need it, and both
+/// used to spell it `rsplit('/').next().unwrap_or(path)` — whose fallback is dead
+/// code, since a split always yields at least one item.
+pub fn basename(path: &str) -> &str {
+    path.rsplit_once('/').map_or(path, |(_, name)| name)
+}
+
 /// Whether Nextcloud's permission letters allow modifying this entry.
 ///
 /// The relevant letters: `W` (update a file's content), `C`/`K` (create files or
@@ -48,7 +57,15 @@ pub fn is_writable(permissions: &str, is_dir: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_writable;
+    use super::{basename, is_writable};
+
+    #[test]
+    fn basename_takes_the_last_segment() {
+        assert_eq!(basename("Docs/Sub/notes.txt"), "notes.txt");
+        assert_eq!(basename("notes.txt"), "notes.txt", "no separator at all");
+        assert_eq!(basename(""), "");
+        assert_eq!(basename("Docs/"), "", "a trailing separator ends the path");
+    }
 
     #[test]
     fn permission_letters_map_to_writability() {

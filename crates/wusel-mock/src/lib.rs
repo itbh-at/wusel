@@ -12,6 +12,13 @@
 //! * `PUT` / `MKCOL` / `DELETE` / `MOVE` → mutate the backing directory, so a
 //!   write round-trip (write then re-list/read) can be tested end-to-end.
 //!
+//! Two **fault-injection markers** in a file's name let a test provoke server
+//! behaviour that is otherwise hard to stage — see [`Config::failed_once`] and
+//! [`etag_headers`]:
+//!
+//! * `*.fail-once` — the first `PUT` to it answers `500`, then it succeeds.
+//! * `*.no-etag*` — its `PUT`/`MOVE` answers carry no `ETag` header.
+//!
 //! Everything is hand-rolled on `tokio` — no HTTP framework, no XML crate, no
 //! percent-coding crate. It is a mock: the correctness bar is "the `wusel-core`
 //! client is happy", not RFC completeness. The binary is a thin wrapper around
@@ -63,8 +70,8 @@ struct Config {
 /// shutting down the runtime. Rust drops an async fn's locals at that point,
 /// which is exactly the hook we need: holding this guard across the accept loop
 /// turns future-drop into cleanup. Best-effort by design — a SIGKILLed mock
-/// binary cannot run destructors, but the directory lives under the OS temp dir,
-/// which reclaims leftovers.
+/// binary cannot run destructors — which is why start-up does not *trust* it;
+/// see [`create_uploads_dir`].
 struct UploadsDirGuard(PathBuf);
 
 impl Drop for UploadsDirGuard {
@@ -85,7 +92,7 @@ pub async fn serve(listener: TcpListener, root: PathBuf, user: &str) -> std::io:
         std::process::id(),
         listener.local_addr()?.port()
     ));
-    std::fs::create_dir_all(&uploads_dir)?;
+    create_uploads_dir(&uploads_dir)?;
     let _uploads_cleanup = UploadsDirGuard(uploads_dir.clone());
     let cfg = Config {
         root: std::fs::canonicalize(&root).unwrap_or(root),
@@ -107,6 +114,49 @@ pub async fn serve(listener: TcpListener, root: PathBuf, user: &str) -> std::io:
     }
 }
 
+/// Create the chunk staging directory such that it is guaranteed to start out
+/// empty — a fresh server must never see a dead predecessor's chunks.
+///
+/// The name is derived from pid and port, and neither is unique over time: a
+/// mock killed with `SIGKILL` runs no destructor, and pids wrap (32768 by
+/// default on Linux), so a later process can legitimately arrive at the very
+/// same path. `create_dir_all` accepts an existing directory silently, and
+/// [`assemble_upload`] then concatenates *everything* it finds — stale chunks
+/// would be spliced into a freshly uploaded file. So: wipe first, then create
+/// **exclusively** (`create_dir`, unlike `create_dir_all`, fails with
+/// `AlreadyExists`), which turns any surviving squatter into a loud start-up
+/// error rather than corrupt uploads.
+///
+/// The directory sits under the OS temp dir, which on Linux is the shared,
+/// world-writable `/tmp`. Two consequences are handled here: the wipe uses
+/// `remove_dir_all`, which does not follow a symlinked top-level entry (std
+/// opens it `O_NOFOLLOW`), so a planted symlink cannot redirect the deletion —
+/// it errors out instead; and the directory is created `0700`, atomically, so
+/// no other local user can drop chunks into it afterwards.
+fn create_uploads_dir(dir: &Path) -> std::io::Result<()> {
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => {}
+        // Nothing to clean up — the normal case.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let mut builder = std::fs::DirBuilder::new();
+    set_owner_only(&mut builder);
+    builder.create(dir)
+}
+
+/// Restrict a directory to its owner at creation time (see
+/// [`create_uploads_dir`]). Atomic, unlike a `set_permissions` afterwards.
+#[cfg(unix)]
+fn set_owner_only(builder: &mut std::fs::DirBuilder) {
+    use std::os::unix::fs::DirBuilderExt;
+    builder.mode(0o700);
+}
+
+/// No POSIX modes off unix; the mock is only ever built for Linux and macOS.
+#[cfg(not(unix))]
+fn set_owner_only(_builder: &mut std::fs::DirBuilder) {}
+
 /// A parsed request — everything downstream needs.
 struct Request {
     method: String,
@@ -120,6 +170,9 @@ struct Request {
     destination: Option<String>,
     /// The `If-Match` header (for conditional `PUT`/`MOVE`), verbatim (quoted).
     if_match: Option<String>,
+    /// The `If-None-Match` header (for conditional `PUT`/`MOVE`), verbatim.
+    /// Almost always `*` from our client ("the target must not exist yet").
+    if_none_match: Option<String>,
     /// Path under the chunked-upload endpoint, if the target is there.
     upload_rel: Option<String>,
     /// The `X-OC-Mtime` header (unix seconds) to stamp the written file with.
@@ -204,6 +257,28 @@ async fn respond_io_error(stream: &mut TcpStream, e: &std::io::Error) -> std::io
     .await
 }
 
+/// Answer a failed *lookup-style* operation (`GET`, `DELETE`, the `MOVE`
+/// rename): `404` only for a genuine "it is not there", `500` for everything
+/// else.
+///
+/// The distinction matters more here than the terse code suggests. `404` is the
+/// one answer a sync client treats as authoritative — it means "the server does
+/// not have this file", and the client acts on it by dropping its own copy or
+/// re-uploading. Collapsing a `PermissionDenied`, an `EIO` or an `ENOTDIR` into
+/// that same answer would let a broken test box masquerade as a legitimate
+/// remote deletion: silent data loss instead of a red test. This is the read
+/// side of what [`respond_io_error`] does for the write side.
+async fn respond_missing_or_io_error(
+    stream: &mut TcpStream,
+    e: &std::io::Error,
+) -> std::io::Result<()> {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        respond(stream, "404 Not Found", "text/plain", &[], b"not found").await
+    } else {
+        respond_io_error(stream, e).await
+    }
+}
+
 /// Chunked upload NG: MKCOL the collection, PUT chunks named by offset, then
 /// MOVE the `.file` marker to assemble them at the destination.
 async fn handle_upload(
@@ -274,23 +349,17 @@ async fn assemble_upload(
     }
     let dest = cfg.root.join(&dest_rel);
 
-    // If-Match precondition on the destination.
-    if let Some(expected) = &req.if_match {
-        if expected != "*" {
-            let current = std::fs::metadata(&dest)
-                .ok()
-                .map(|m| format!("\"{}\"", etag_for(&m)));
-            if current.as_deref() != Some(expected.as_str()) {
-                return respond(
-                    stream,
-                    "412 Precondition Failed",
-                    "text/plain",
-                    &[],
-                    b"conflict",
-                )
-                .await;
-            }
-        }
+    // Conditional headers apply to the *destination* — the resource the MOVE
+    // actually creates or replaces — not to the assembly marker.
+    if !precondition_ok(req, &dest) {
+        return respond(
+            stream,
+            "412 Precondition Failed",
+            "text/plain",
+            &[],
+            b"conflict",
+        )
+        .await;
     }
 
     // Collect chunk names (all but the marker) and sort — offset-padded → in
@@ -329,21 +398,77 @@ async fn assemble_upload(
     let _ = std::fs::remove_dir_all(&chunk_dir);
     set_file_mtime(&dest, req.oc_mtime);
 
-    let etag = std::fs::metadata(&dest)
-        .map(|m| etag_for(&m))
-        .unwrap_or_default();
     respond(
         stream,
         "201 Created",
         "text/plain",
-        &[("ETag".into(), format!("\"{etag}\""))],
+        &etag_headers(&dest, &dest_rel),
         b"",
     )
     .await
 }
 
+/// Evaluate the conditional request headers of a `PUT`/`MOVE` against `target`'s
+/// current state. `false` means the request must be refused with `412
+/// Precondition Failed`. Both upload paths (the plain `PUT` and the chunked
+/// upload's assembling `MOVE`) share this, so their conflict semantics cannot
+/// drift apart — mirroring the single `apply_precondition` on the client side.
+///
+/// Per RFC 9110 §13.1.1–13.1.2, evaluated in the order the RFC prescribes
+/// (`If-Match` before `If-None-Match`; the result is the same either way here,
+/// because our client never sends both):
+///
+/// * `If-Match: *` — the target must exist (any version).
+/// * `If-Match: "<etag>"` — the target must exist with exactly that ETag.
+/// * `If-None-Match: *` — the target must NOT exist. This is what a create
+///   sends, so an existing file is exactly the race it is asking about.
+/// * `If-None-Match: "<etag>"` — the target must not be at that version.
+fn precondition_ok(req: &Request, target: &Path) -> bool {
+    let current = std::fs::metadata(target)
+        .ok()
+        .map(|m| format!("\"{}\"", etag_for(&m)));
+    if let Some(expected) = &req.if_match {
+        let ok = if expected == "*" {
+            current.is_some()
+        } else {
+            current.as_deref() == Some(expected.as_str())
+        };
+        if !ok {
+            return false;
+        }
+    }
+    if let Some(expected) = &req.if_none_match {
+        let ok = if expected == "*" {
+            current.is_none()
+        } else {
+            current.as_deref() != Some(expected.as_str())
+        };
+        if !ok {
+            return false;
+        }
+    }
+    true
+}
+
+/// Response headers for a successful `PUT`/`MOVE`: the target's fresh ETag.
+///
+/// Test-only fault injection, the sibling of the `*.fail-once` marker (see
+/// [`Config::failed_once`]): a target whose name contains `.no-etag` is answered
+/// **without** an `ETag` header. Real servers and reverse proxies do drop it, and
+/// the client must then treat the file's version as *unknown* — not as "the file
+/// does not exist", which would make every later save look like a lost race.
+fn etag_headers(target: &Path, rel: &str) -> Vec<(String, String)> {
+    if rel.contains(".no-etag") {
+        return Vec::new();
+    }
+    let etag = std::fs::metadata(target)
+        .map(|m| etag_for(&m))
+        .unwrap_or_default();
+    vec![("ETag".to_string(), format!("\"{etag}\""))]
+}
+
 /// PUT: write the body to the backing file, replying with the new ETag. Honours
-/// `If-Match` (412 if the current ETag differs), the conflict signal.
+/// the conditional headers (412 on a failed precondition), the conflict signal.
 async fn put(
     stream: &mut TcpStream,
     cfg: &Config,
@@ -370,23 +495,15 @@ async fn put(
             .await;
         }
     }
-    if let Some(expected) = &req.if_match {
-        if expected != "*" {
-            let current = std::fs::metadata(fs_path)
-                .ok()
-                .map(|m| format!("\"{}\"", etag_for(&m)));
-            // Mismatch (or the file no longer exists) → precondition failed.
-            if current.as_deref() != Some(expected.as_str()) {
-                return respond(
-                    stream,
-                    "412 Precondition Failed",
-                    "text/plain",
-                    &[],
-                    b"conflict",
-                )
-                .await;
-            }
-        }
+    if !precondition_ok(req, fs_path) {
+        return respond(
+            stream,
+            "412 Precondition Failed",
+            "text/plain",
+            &[],
+            b"conflict",
+        )
+        .await;
     }
     let written = fs_path
         .parent()
@@ -397,14 +514,11 @@ async fn put(
         return respond_io_error(stream, &e).await;
     }
     set_file_mtime(fs_path, req.oc_mtime);
-    let etag = std::fs::metadata(fs_path)
-        .map(|m| etag_for(&m))
-        .unwrap_or_default();
     respond(
         stream,
         "201 Created",
         "text/plain",
-        &[("ETag".into(), format!("\"{etag}\""))],
+        &etag_headers(fs_path, &req.rel),
         b"",
     )
     .await
@@ -436,7 +550,7 @@ async fn delete(stream: &mut TcpStream, fs_path: &Path) -> std::io::Result<()> {
     };
     match result {
         Ok(()) => respond(stream, "204 No Content", "text/plain", &[], b"").await,
-        Err(_) => respond(stream, "404 Not Found", "text/plain", &[], b"not found").await,
+        Err(e) => respond_missing_or_io_error(stream, &e).await,
     }
 }
 
@@ -463,7 +577,7 @@ async fn move_(
     let dest_path = cfg.root.join(&dest_rel);
     // A failure to create the destination's parent is a server-side problem
     // (500), unlike the rename below, where a missing *source* is the client's
-    // (404).
+    // (404) — but only a missing one: any other rename failure is ours again.
     if let Some(parent) = dest_path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
             return respond_io_error(stream, &e).await;
@@ -471,7 +585,7 @@ async fn move_(
     }
     match std::fs::rename(fs_path, &dest_path) {
         Ok(()) => respond(stream, "201 Created", "text/plain", &[], b"").await,
-        Err(_) => respond(stream, "404 Not Found", "text/plain", &[], b"not found").await,
+        Err(e) => respond_missing_or_io_error(stream, &e).await,
     }
 }
 
@@ -523,6 +637,7 @@ async fn read_request(stream: &mut TcpStream, cfg: &Config) -> std::io::Result<O
     let mut content_length = 0usize;
     let mut destination = None;
     let mut if_match = None;
+    let mut if_none_match = None;
     let mut oc_mtime = None;
     for line in lines {
         let Some((name, value)) = line.split_once(':') else {
@@ -535,6 +650,7 @@ async fn read_request(stream: &mut TcpStream, cfg: &Config) -> std::io::Result<O
             "content-length" => content_length = value.parse().unwrap_or(0),
             "destination" => destination = Some(value.to_string()),
             "if-match" => if_match = Some(value.to_string()),
+            "if-none-match" => if_none_match = Some(value.to_string()),
             "x-oc-mtime" => oc_mtime = value.parse().ok(),
             _ => {}
         }
@@ -571,6 +687,7 @@ async fn read_request(stream: &mut TcpStream, cfg: &Config) -> std::io::Result<O
         body,
         destination,
         if_match,
+        if_none_match,
         upload_rel,
         oc_mtime,
     }))
@@ -621,12 +738,17 @@ async fn propfind(
 }
 
 /// GET/HEAD: serve the whole file, or the requested byte range (206).
+///
+/// The response carries the file's `ETag`, like a real Nextcloud: a client that
+/// derives an upload from what it just read (the 3-way merge) needs to name the
+/// exact version it read.
 async fn get(stream: &mut TcpStream, req: &Request, fs_path: &Path) -> std::io::Result<()> {
     let data = match std::fs::read(fs_path) {
         Ok(d) => d,
-        Err(_) => return respond(stream, "404 Not Found", "text/plain", &[], b"not found").await,
+        Err(e) => return respond_missing_or_io_error(stream, &e).await,
     };
     let total = data.len() as u64;
+    let mut headers = etag_headers(fs_path, &req.rel);
 
     // A HEAD carries no body but the same status/headers as the GET would.
     let want_body = req.method == "GET";
@@ -641,27 +763,34 @@ async fn get(stream: &mut TcpStream, req: &Request, fs_path: &Path) -> std::io::
             .unwrap_or(total.saturating_sub(1))
             .min(total.saturating_sub(1));
         if start >= total || start > end {
-            let hdr = [("Content-Range".to_string(), format!("bytes */{total}"))];
-            return respond(stream, "416 Range Not Satisfiable", "text/plain", &hdr, b"").await;
+            headers.push(("Content-Range".to_string(), format!("bytes */{total}")));
+            return respond(
+                stream,
+                "416 Range Not Satisfiable",
+                "text/plain",
+                &headers,
+                b"",
+            )
+            .await;
         }
         let slice = &data[start as usize..=end as usize];
-        let hdr = [(
+        headers.push((
             "Content-Range".to_string(),
             format!("bytes {start}-{end}/{total}"),
-        )];
+        ));
         let body: &[u8] = if want_body { slice } else { b"" };
         return respond(
             stream,
             "206 Partial Content",
             "application/octet-stream",
-            &hdr,
+            &headers,
             body,
         )
         .await;
     }
 
     let body: &[u8] = if want_body { &data } else { b"" };
-    respond(stream, "200 OK", "application/octet-stream", &[], body).await
+    respond(stream, "200 OK", "application/octet-stream", &headers, body).await
 }
 
 /// Renders one `<d:response>` for a file or directory at `rel`.
@@ -724,14 +853,29 @@ fn href_for(cfg: &Config, rel: &str, is_dir: bool) -> String {
 
 /// Stamp a file's mtime from an `X-OC-Mtime` value (best-effort), so a write
 /// round-trip can verify timestamp propagation.
+///
+/// `X-OC-Mtime` is *signed* unix seconds, and pre-epoch mtimes are ordinary in
+/// real data (scanned archives, restored backups). The obvious `u64::try_from`
+/// would reject exactly those and — since the result was discarded — leave the
+/// file's own mtime in place, which reads as "the header was honoured" to
+/// anything that does not know the expected value. So walk the sign explicitly:
+/// [`Duration`] is unsigned, and the direction lives in the `SystemTime`
+/// arithmetic instead. `checked_*` because a garbage header (`i64::MIN`) must
+/// not panic the connection task — `SystemTime`'s `+`/`-` do exactly that on
+/// overflow.
 fn set_file_mtime(path: &Path, mtime: Option<i64>) {
-    if let Some(secs) = mtime {
-        if let (Ok(file), Ok(secs)) = (
-            std::fs::File::options().write(true).open(path),
-            u64::try_from(secs),
-        ) {
-            let _ = file.set_modified(UNIX_EPOCH + Duration::from_secs(secs));
-        }
+    let (Some(secs), Ok(file)) = (mtime, std::fs::File::options().write(true).open(path)) else {
+        return;
+    };
+    // `unsigned_abs`, not `abs`: `i64::MIN.abs()` would overflow.
+    let magnitude = Duration::from_secs(secs.unsigned_abs());
+    let when = if secs < 0 {
+        UNIX_EPOCH.checked_sub(magnitude)
+    } else {
+        UNIX_EPOCH.checked_add(magnitude)
+    };
+    if let Some(when) = when {
+        let _ = file.set_modified(when);
     }
 }
 
@@ -931,6 +1075,123 @@ mod tests {
         assert_ne!(stable_id("a/b.txt"), stable_id("a/c.txt"));
         assert_eq!(stable_id(""), 1);
         assert!(stable_id("x") >= 2);
+    }
+
+    /// A bare request carrying only the two conditional headers — everything
+    /// `precondition_ok` looks at.
+    fn conditional(if_match: Option<&str>, if_none_match: Option<&str>) -> Request {
+        Request {
+            method: "PUT".into(),
+            rel: String::new(),
+            depth: "1".into(),
+            range: None,
+            body: Vec::new(),
+            destination: None,
+            if_match: if_match.map(str::to_string),
+            if_none_match: if_none_match.map(str::to_string),
+            upload_rel: None,
+            oc_mtime: None,
+        }
+    }
+
+    #[test]
+    fn preconditions_follow_rfc_9110() {
+        let dir = std::env::temp_dir().join(format!("wusel-mock-precond-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let existing = dir.join("there.txt");
+        std::fs::write(&existing, b"x").unwrap();
+        let missing = dir.join("gone.txt");
+        let etag = format!("\"{}\"", etag_for(&std::fs::metadata(&existing).unwrap()));
+
+        // No conditional headers → always fine.
+        assert!(precondition_ok(&conditional(None, None), &existing));
+        assert!(precondition_ok(&conditional(None, None), &missing));
+
+        // If-None-Match: * — "must not exist". The regression this guards: the
+        // mock used to ignore the header and could never answer 412 for it.
+        assert!(!precondition_ok(&conditional(None, Some("*")), &existing));
+        assert!(precondition_ok(&conditional(None, Some("*")), &missing));
+
+        // If-Match: "<etag>" — the version must match exactly.
+        assert!(precondition_ok(&conditional(Some(&etag), None), &existing));
+        assert!(!precondition_ok(
+            &conditional(Some("\"stale\""), None),
+            &existing
+        ));
+        assert!(!precondition_ok(&conditional(Some(&etag), None), &missing));
+
+        // If-Match: * — "must exist, any version" (formerly a dead branch).
+        assert!(precondition_ok(&conditional(Some("*"), None), &existing));
+        assert!(!precondition_ok(&conditional(Some("*"), None), &missing));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_no_etag_marker_suppresses_the_etag_header() {
+        let dir = std::env::temp_dir().join(format!("wusel-mock-noetag-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("note.txt");
+        std::fs::write(&f, b"x").unwrap();
+
+        assert_eq!(etag_headers(&f, "note.txt").len(), 1);
+        assert!(etag_headers(&f, "note.no-etag.txt").is_empty());
+        assert!(etag_headers(&f, "sub/x.no-etag").is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_staging_dir_starts_out_empty_even_after_a_sigkill() {
+        let dir = std::env::temp_dir().join(format!("wusel-mock-staging-u-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // What a SIGKILLed predecessor with the same pid+port leaves behind.
+        std::fs::create_dir_all(dir.join("old-upload")).unwrap();
+        std::fs::write(dir.join("old-upload").join("00000000"), b"stale").unwrap();
+
+        create_uploads_dir(&dir).unwrap();
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            0,
+            "start-up must not inherit a predecessor's chunks"
+        );
+
+        // Owner-only, so nobody else sharing /tmp can plant chunks afterwards.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mtime_header_survives_both_signs() {
+        let dir = std::env::temp_dir().join(format!("wusel-mock-mtime-u-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("note.txt");
+
+        for secs in [1_600_000_000i64, -445_824_000i64, 0] {
+            std::fs::write(&f, b"x").unwrap();
+            set_file_mtime(&f, Some(secs));
+            let modified = std::fs::metadata(&f).unwrap().modified().unwrap();
+            let got = match modified.duration_since(UNIX_EPOCH) {
+                Ok(d) => d.as_secs() as i64,
+                Err(e) => -(e.duration().as_secs() as i64),
+            };
+            assert_eq!(got, secs, "X-OC-Mtime is signed; {secs} must round-trip");
+        }
+
+        // A nonsense header must not panic the connection task.
+        set_file_mtime(&f, Some(i64::MIN));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

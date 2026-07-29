@@ -12,6 +12,7 @@ IMAGE="wusel-dev"
 
 # Locate the repo as the VM sees it (direct share, or an rsync mirror as the
 # fallback) — sets WORK and MIRRORED. Shared logic: scripts/podman-lib.sh.
+# shellcheck source=scripts/podman-lib.sh
 . "$(dirname "$0")/podman-lib.sh"
 resolve_work
 
@@ -23,7 +24,7 @@ podman run --rm \
     -v "$WORK":/work:Z \
     -e MISE_TRUSTED_CONFIG_PATHS=/work \
     "$IMAGE" \
-    bash -lc "cd /work && mise exec -- cargo build -p wusel --features fuse"
+    bash -lc "cd /work && mise run build-fuse"
 
 if [ "$MIRRORED" = 1 ]; then
     # Reclaim the disk: the mirror lives on /private/tmp — the macOS boot disk —

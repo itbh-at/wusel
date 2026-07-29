@@ -1,4 +1,8 @@
-// SPDX-License-Identifier: Apache-2.0
+////
+  // SPDX-License-Identifier: Apache-2.0
+  // Copyright 2026 IT Beratung Hermann GmbH
+////
+
 = File-manager integration
 :description: Sidebar status, per-file emblems and context-menu actions in the graphical file manager — what they need and how to build/install them.
 
@@ -98,10 +102,11 @@ nautilus -q           # restart Nautilus so it loads the extension
 [NOTE]
 ====
 The `.so` is tied to the Nautilus *major* version (`extensions-4/` for Nautilus
-4 / GTK4); it is built against the target's own Nautilus. Distribution packages
-(RPM/DEB) build and install it, so end users install the package and it works —
-no `make`, no scripting runtime, no version/venv surface. This "native, not
-Python" choice is deliberate.
+4 / GTK4); it is built against the target's own Nautilus. The distribution
+package builds and installs it — today that is the
+xref:installation.adoc[Fedora RPM] — so end users install the package and it
+works: no `make`, no scripting runtime, no version/venv surface. This "native,
+not Python" choice is deliberate.
 ====
 
 Emblem refresh (live, no F5): a menu pin/unpin re-reads the file when the command

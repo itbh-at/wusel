@@ -67,8 +67,24 @@ fn write_file(path: &Path, stored: &Stored) -> Result<()> {
     }
     let mut f = opts.open(&tmp)?;
     std::io::Write::write_all(&mut f, &json)?;
+    // …and the rename is only atomic *for readers*, not against a crash: it
+    // orders nothing on disk by itself. Without this fsync, a power loss right
+    // after the rename can leave the directory entry pointing at a file whose
+    // data blocks were never written — a zero-length `credentials.json`
+    // published over a perfectly good one, i.e. the login silently lost. Sync
+    // the bytes first, then rename, then sync the directory so the rename
+    // itself is durable too.
+    f.sync_all()?;
     drop(f);
     std::fs::rename(&tmp, path)?;
+    if let Some(parent) = path.parent() {
+        // Best-effort: not every filesystem allows opening a directory for
+        // fsync, and failing the login over that would be the worse outcome —
+        // the credentials are already written and readable at this point.
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
     Ok(())
 }
 

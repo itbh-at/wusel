@@ -1,8 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 IT Beratung Hermann GmbH
+
 # Build the Fedora RPM for x86_64 and aarch64 and attach both to a GitHub
 # Release. Triggered by a version tag:
 #   git tag v0.1.0 && git push github v0.1.0
-# The RPM version comes from Cargo.toml (build-rpm.sh), so keep the tag in sync.
+# The RPM version comes from the workspace manifest, the release page's name from
+# the tag. Those are two independent sources, so the rpm job asserts they agree
+# (EXPECT_VERSION -> build-rpm.sh) before anything is built or published;
+# otherwise tagging v0.2.0 without bumping Cargo.toml would publish a page titled
+# v0.2.0 carrying wusel-0.1.0-*.rpm, and succeed while doing it.
 # These are the unsigned community RPMs; signed store builds are separate.
 name: Release
 
@@ -10,8 +16,23 @@ on:
   push:
     tags: ["v*"]
 
+# Read-only by default. Only `release` creates the release and uploads the
+# assets. The rpm job runs as root in a container, dnf-installs, compiles the
+# entire dependency graph, builds a C extension and then executes the freshly
+# built binary — it must not be holding a push-capable token while doing so.
+# (actions/upload-artifact uses the runtime token, not GITHUB_TOKEN.)
 permissions:
-  contents: write # create the release and upload the RPM assets
+  contents: read
+
+env:
+  # See ci.yml for both of these; build-rpm.sh calls `mise exec` itself, outside
+  # mise-action's control, which is why the trust path is declared explicitly.
+  MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
+  MISE_AUTO_INSTALL: "false"
+
+defaults:
+  run:
+    shell: bash # -e plus pipefail; see ci.yml
 
 jobs:
   rpm:
@@ -24,8 +45,15 @@ jobs:
           - { runner: ubuntu-24.04-arm, arch: aarch64 }
     runs-on: ${{ matrix.runner }}
     container: fedora:44
+    permissions:
+      contents: read
+    # A full release build of the workspace plus the C extension and rpmbuild,
+    # on the slower arm runner and with a cold cache.
+    timeout-minutes: 60
     env:
-      MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
+      # The tag/manifest guard: build-rpm.sh refuses to build anything if the
+      # packaged version does not match the tag that triggered this run.
+      EXPECT_VERSION: ${{ github.ref_name }}
     steps:
       # Native Fedora build deps (git for checkout; the rest for build-rpm.sh).
       - name: Install build dependencies
@@ -34,16 +62,36 @@ jobs:
           git gcc make pkgconf-pkg-config
           nautilus-devel glib2-devel fuse3-devel
           rpm-build curl ca-certificates
-      - uses: actions/checkout@v5
-      - uses: jdx/mise-action@v2
+      # Pinned to a commit SHA — see the note in ci.yml.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          # Nothing here pushes, and everything here compiles third-party code.
+          persist-credentials: false
+      - name: Cache the cargo registry and build artefacts
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-${{ matrix.arch }}-cargo-rpm-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.arch }}-cargo-rpm-
+      - uses: jdx/mise-action@c37c93293d6b742fc901e1406b8f764f6fb19dac # v2.4.4
         with:
           install: false
       - name: Install the pinned Rust toolchain
         run: mise install rust
+      # Earliest point at which the manifest version can be read the robust way
+      # (cargo has to exist first). Runs before the ~30-minute build so a
+      # mismatch is reported in seconds, not after a full compile.
+      - name: Check the tag matches the packaged version
+        run: ./packaging/rpm/build-rpm.sh --check-version
       - name: Build the RPM
         run: ./packaging/rpm/build-rpm.sh
       - name: Upload the RPM artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: rpm-${{ matrix.arch }}
           path: dist/*.rpm
@@ -53,15 +101,20 @@ jobs:
     name: publish release
     needs: rpm
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # The only job that writes, and it compiles nothing: it just moves the
+    # artifacts the rpm job produced onto the release page.
+    permissions:
+      contents: write # create the release and upload the RPM assets
     steps:
       - name: Download the built RPMs
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
           pattern: rpm-*
           merge-multiple: true
       - name: Create the GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: dist/*.rpm
           fail_on_unmatched_files: true

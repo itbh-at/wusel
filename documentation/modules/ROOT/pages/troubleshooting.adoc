@@ -1,4 +1,8 @@
-// SPDX-License-Identifier: Apache-2.0
+////
+  // SPDX-License-Identifier: Apache-2.0
+  // Copyright 2026 IT Beratung Hermann GmbH
+////
+
 = Troubleshooting
 :description: Symptom-oriented checks for the mount, the desktop integration and the cache.
 

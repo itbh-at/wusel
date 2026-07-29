@@ -410,9 +410,35 @@ fn parse_settings(text: &str) -> crate::Result<Settings> {
     }
     s.tls.ca_cert = raw.tls.ca_cert.filter(|p| !p.is_empty()).map(Into::into);
     s.tls.insecure = raw.tls.insecure.unwrap_or(false);
-    s.mount_point = raw.mount.point.filter(|p| !p.is_empty()).map(Into::into);
+    s.mount_point = raw
+        .mount
+        .point
+        .filter(|p| !p.is_empty())
+        .map(|p| expand_tilde(&p));
     s.exclude_from_indexers = raw.desktop.exclude_from_indexers.unwrap_or(true);
     Ok(s)
+}
+
+/// Expand a leading `~/` (and a bare `~`) against `$HOME`.
+///
+/// A config file is hand-written, and `point = "~/Wusel"` is the spelling every
+/// user reaches for first. A shell expands it before the program ever sees it;
+/// a TOML file does not, so without this the daemon would faithfully create a
+/// directory *named* `~` in whatever the current working directory happens to
+/// be and mount there — technically obedient, never what was meant. Only a
+/// leading tilde is special: `~` elsewhere in a path is a legal filename
+/// character and stays untouched.
+fn expand_tilde(p: &str) -> PathBuf {
+    let Some(rest) = p.strip_prefix('~') else {
+        return PathBuf::from(p);
+    };
+    if !(rest.is_empty() || rest.starts_with('/')) {
+        return PathBuf::from(p); // `~user/…` — not ours to resolve
+    }
+    match std::env::var_os("HOME").filter(|h| !h.is_empty()) {
+        Some(home) => PathBuf::from(home).join(rest.trim_start_matches('/')),
+        None => PathBuf::from(p),
+    }
 }
 
 /// `"5GiB"` → bytes; `"0"`/`"unlimited"`/empty → `Ok(None)` (no limit);
@@ -420,6 +446,12 @@ fn parse_settings(text: &str) -> crate::Result<Settings> {
 /// instead of failing open. The multipliers are **binary** (1 GiB = 2³⁰), so
 /// the IEC spellings (`GiB`, `MiB`, …) are canonical; the plain `GB`/`MB`
 /// spellings are accepted as aliases for the same binary sizes.
+///
+/// A value whose byte count does not fit in a `u64` (`"17000000TiB"`) is treated
+/// as malformed too: the multiplication is **checked**, because an unchecked one
+/// panics in a debug build and — worse — silently wraps to a tiny budget in a
+/// release build, which is exactly the fail-open behaviour this parser exists to
+/// prevent.
 fn parse_size(s: &str) -> Result<Option<u64>, ()> {
     let s = s.trim();
     if s.is_empty() || s == "0" || s.eq_ignore_ascii_case("unlimited") {
@@ -443,12 +475,14 @@ fn parse_size(s: &str) -> Result<Option<u64>, ()> {
     .unwrap_or((up.as_str(), 1));
     num.trim()
         .parse::<u64>()
-        .map(|v| Some(v * mult))
         .map_err(drop)
+        .and_then(|v| v.checked_mul(mult).ok_or(()))
+        .map(Some)
 }
 
 /// `"30d"`/`"12h"`/`"90s"` → seconds; `"0"`/empty → `Ok(None)` (never);
-/// anything unparsable → `Err(())` (see [`parse_size`]).
+/// anything unparsable — including a duration too large for a `u64` of seconds —
+/// → `Err(())` (see [`parse_size`] for why the multiplication is checked).
 fn parse_duration(s: &str) -> Result<Option<u64>, ()> {
     let s = s.trim();
     if s.is_empty() || s == "0" {
@@ -460,8 +494,9 @@ fn parse_duration(s: &str) -> Result<Option<u64>, ()> {
         .unwrap_or((s, 1));
     num.trim()
         .parse::<u64>()
-        .map(|v| Some(v * mult))
         .map_err(drop)
+        .and_then(|v| v.checked_mul(mult).ok_or(()))
+        .map(Some)
 }
 
 #[cfg(test)]
@@ -553,6 +588,50 @@ mod tests {
             Settings::default().cache_max_age_secs,
             "malformed max_age keeps the default"
         );
+    }
+
+    #[test]
+    fn absurd_sizes_and_durations_do_not_overflow() {
+        // `17000000TiB` does not fit in a u64 of bytes. Multiplying unchecked
+        // panics in debug and wraps to a nonsense budget in release — neither is
+        // an acceptable answer to a typo in config.toml. Overflow is just another
+        // malformed value: report it and keep the documented default.
+        assert_eq!(parse_size("17000000TiB"), Err(()));
+        assert_eq!(parse_size("18446744073709551615KiB"), Err(()));
+        assert_eq!(parse_duration("999999999999999999999d"), Err(()));
+        assert_eq!(parse_duration("300000000000000000d"), Err(()));
+
+        let s = parse_settings("[cache]\nmax_size = \"17000000TiB\"\n").unwrap();
+        assert_eq!(
+            s.cache_max_bytes,
+            Settings::default().cache_max_bytes,
+            "an overflowing budget keeps the default, it does not wrap"
+        );
+    }
+
+    #[test]
+    fn a_tilde_mountpoint_resolves_against_home() {
+        // `point = "~/Wusel"` is the spelling everyone writes by hand. Without
+        // expansion the daemon would create a directory literally named `~`.
+        let _env = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = std::env::var_os("HOME").expect("HOME is set on any test host");
+        let home = PathBuf::from(home);
+
+        let s = parse_settings("[mount]\npoint = \"~/Wusel\"\n").unwrap();
+        assert_eq!(s.mount_point.unwrap(), home.join("Wusel"));
+
+        // A bare `~` is the home directory itself.
+        let s = parse_settings("[mount]\npoint = \"~\"\n").unwrap();
+        assert_eq!(s.mount_point.unwrap(), home);
+
+        // An absolute path is untouched, and a tilde that is not the leading
+        // path component is a perfectly ordinary filename character.
+        for literal in ["/srv/cloud", "/srv/~backup", "~someone/else"] {
+            let s = parse_settings(&format!("[mount]\npoint = \"{literal}\"\n")).unwrap();
+            assert_eq!(s.mount_point.unwrap(), PathBuf::from(literal));
+        }
     }
 
     #[test]

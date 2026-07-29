@@ -1,3 +1,8 @@
+////
+  // SPDX-License-Identifier: Apache-2.0
+  // Copyright 2026 IT Beratung Hermann GmbH
+////
+
 = Trying it out
 :experimental:
 
@@ -121,17 +126,19 @@ mise --version
 
 === Step 3 — Get the code and build it
 
-During this test phase you have most likely been handed the repository already —
-if so, just open a terminal in that folder and skip the `git clone`. Otherwise
-clone it, using the URL you were given in place of `<REPOSITORY-URL>`:
+Clone the public repository and let mise fetch the pinned toolchain:
 
 [source,sh]
 ----
-git clone <REPOSITORY-URL>                       # ← replace with the URL you were given
+git clone https://github.com/itbh-at/wusel.git
 cd wusel
 mise trust                                       # allow this project's pinned tools (needed once per checkout)
 mise install                                     # download the pinned Rust (first time: a few minutes)
 ----
+
+TIP: If you only want to *use* Wusel on Fedora rather than build it, skip this
+whole page and install the packaged RPM instead —
+xref:installation.adoc[Installation].
 
 `mise trust` is required because mise refuses to load a project's tool versions
 until you confirm you trust that project — without it you would again see
@@ -355,7 +362,7 @@ wusel mount                                  # mount ~/Wusel
 ----
 
 Notice what disappeared compared with Part A: no `cargo run`, no `--features
-mount`, no `--`. Those were all cargo build-time scaffolding. The installed binary
+fuse`, no `--`. Those were all cargo build-time scaffolding. The installed binary
 already has mounting compiled in and there is no cargo to separate arguments from,
 so the command is simply `wusel mount` — exactly as its own help writes it.
 
@@ -408,8 +415,11 @@ service the moment that directory is cleaned or rebuilt.
 |===
 
 `service enable` writes and enables a systemd *user* unit for you — no editing
-unit files or running `systemctl` by hand. (It needs a systemd user session; a
-packaged unit will ship in the DEB/RPM later.)
+unit files or running `systemctl` by hand. (It needs a systemd user session.) If
+you installed the xref:installation.adoc[Fedora RPM] instead of building from
+source, the unit is already there as
+`/usr/lib/systemd/user/wusel@.service` — use `systemctl --user enable --now
+wusel@default` and skip `service enable` entirely.
 
 == Configuration is optional
 
@@ -426,7 +436,10 @@ key is optional:
 [source,toml]
 ----
 [mount]
-point = "~/Wusel"   # override the mountpoint used by `mount` with no path
+# Override the mountpoint used by `mount` with no path.
+# Give an ABSOLUTE path — "~" is not expanded here, it would be taken literally
+# and create a directory actually named "~".
+point = "/home/you/Wusel"
 
 [cache]
 max_size = "5GB"        # blob budget; "0"/"unlimited" = no limit
@@ -446,6 +459,9 @@ insecure = false                      # true = disable TLS verification (DANGER,
 
 [auth]
 keyring = false   # default true (OS keyring); false = keep the app password in the 0600 file (see below)
+
+[desktop]
+exclude_from_indexers = true  # default; false = let GNOME Tracker index the mount
 ----
 
 Self-hosting with a self-signed certificate? Point `tls.ca_cert` at your CA
@@ -509,17 +525,17 @@ exception is the real mount end-to-end test, which needs a Linux FUSE driver
 
 [source,sh]
 ----
-mise run check      # type-check the whole workspace (no binary produced)
-mise run test       # build + run the native tests (wusel-core, wusel, wusel-mock)
+mise run check      # type-check the workspace except wusel-fuse (no binary produced)
+mise run test       # build + run the native tests (wusel-core, wusel, wusel-desktop, wusel-mock)
 mise run clippy     # lint, failing on any warning (-D warnings)
 mise run fmt-check  # formatting is enforced
 mise run fuse-test  # real FUSE mount e2e against wusel-mock (Linux container)
 ----
 
 The native tests exercise the platform-independent engine (`wusel-core`) and the CLI
-(`wusel` without the `fuse` feature) — no FUSE driver needed. They include an
-in-process WebDAV mock (`wiremock`) and a standalone Rust mock server (`wusel-mock`)
-with end-to-end coverage of the write buffer, conflict handling, deferred create,
+(`wusel` without the `fuse` feature) — no FUSE driver needed. They include our own
+Rust mock server (`wusel-mock`, run in-process) with end-to-end coverage of the
+WebDAV client, the write buffer, conflict handling, deferred create, pinning,
 the ignore list, background revalidation and the ETag sync walk, plus a
 notify_push and a self-signed-TLS end-to-end. See xref:development.adoc[Development]
 for the testing strategy.
@@ -540,8 +556,14 @@ implicit `default` account is used.
 === Pin files/folders offline
 
 Pinning keeps a file or directory available offline: it is downloaded now and
-never evicted (so its reads never touch the network). It needs no mount — it
+never evicted, so it stays readable with the network gone. It needs no mount — it
 writes straight into the cache.
+
+NOTE: A pin is not yet a *live* copy. If the file changes on the server, the
+pinned copy is marked stale and the new content is fetched on the next read —
+which does touch the network. Until that read happens, going offline leaves you
+with the old version. Refreshing pinned files proactively is a
+xref:roadmap.adoc[roadmap] item.
 
 [source,sh]
 ----
@@ -580,6 +602,11 @@ mise exec -- ./documentation/build.sh          # or: … build.sh watch
 == What does NOT work yet
 
 * File-manager integration on non-GNOME desktops (KDE Dolphin, Nemo, Thunar);
-  GNOME/Nautilus emblems + context menus and native notifications work.
+  GNOME/Nautilus emblems + context menus, GNOME Shell search and native
+  notifications work.
+* Proactive refresh of pinned files when the server copy changes (see the note
+  under <<pin,Pin files/folders offline>>).
 * Refinements: fully concurrent content reads (the FUSE loop is single-threaded),
-  a live emblem refresh on pin/unpin, and WebDAV LOCK (advisory locking).
+  and WebDAV LOCK (advisory locking). Emblems do refresh live, but a background
+  hydration only pushes the refresh once the download finishes — see
+  xref:file-manager.adoc[File-manager integration].

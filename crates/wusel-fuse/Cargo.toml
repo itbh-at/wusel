@@ -6,6 +6,15 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description.workspace = true
+keywords.workspace = true
+categories.workspace = true
+# Not published to crates.io: the product ships as an RPM and the crates
+# refer to each other by path, which crates.io would reject anyway. Opting
+# out here makes an accidental `cargo publish` fail instead of claiming a name.
+publish.workspace = true
 
 # wusel-fuse is the FUSE frontend as a LIBRARY (no binary of its own anymore).
 # The daemon `wusel` pulls it in. FUSE needs the Linux kernel driver (libfuse3),

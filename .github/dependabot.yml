@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 IT Beratung Hermann GmbH
+
+# The counterpart to pinning every action to a commit SHA. The pin is what makes
+# the audited code the code that runs — but a pin also never receives a security
+# fix on its own. Dependabot watches the actions referenced under
+# .github/workflows/ and opens a PR when one publishes a new release, rewriting
+# both the SHA and the trailing `# vX.Y.Z` comment. Without this the pins would
+# quietly rot, which is worse than the floating tags they replaced.
+#
+# Only github-actions for now: the Rust dependencies are pinned in Cargo.lock and
+# reviewed with the crate-minimalism rule in mind (see CLAUDE.md), not by bot PR.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    # Conventional Commits 1.0.0 — same rule as for hand-written commits.
+    commit-message:
+      prefix: ci
+    open-pull-requests-limit: 5

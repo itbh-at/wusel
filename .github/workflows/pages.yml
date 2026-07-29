@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 IT Beratung Hermann GmbH
+
 # Build the Antora documentation and publish it to GitHub Pages.
 # One-time repo setup: Settings → Pages → Source = "GitHub Actions".
 # The site is then served at https://itbh-at.github.io/wusel/.
@@ -10,27 +12,54 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Read-only by default; only `deploy` raises pages/id-token for itself. This
+# matters here in particular: the workflow also runs on pull_request, and a PR
+# from a branch in this repository — which is how this project works, per the
+# feature-branch rule — does receive the declared write permissions. The build
+# job runs npm-installed third-party code (antora and its dependency tree), so
+# it must not be able to publish to Pages or mint an OIDC token.
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 # One deployment at a time; don't cancel an in-flight publish.
 concurrency:
   group: pages
   cancel-in-progress: false
 
+env:
+  # See ci.yml for both of these.
+  MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
+  MISE_AUTO_INSTALL: "false"
+
+defaults:
+  run:
+    shell: bash # -e plus pipefail; see ci.yml
+
 jobs:
   build:
     name: build (Antora)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
-      - uses: jdx/mise-action@v2
+      # Pinned to a commit SHA — see the note in ci.yml.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          # This job never pushes; documentation/build.sh only reads the tree.
+          persist-credentials: false
+      - uses: jdx/mise-action@c37c93293d6b742fc901e1406b8f764f6fb19dac # v2.4.4
+        with:
+          install: false
+      # The docs are the one place that legitimately needs the node toolchain —
+      # but only `antora`. watchexec and browser-sync serve `build.sh watch`
+      # locally, d2 renders diagrams whose SVGs are committed, and rust/hawkeye
+      # belong to the Rust workflow. Naming them keeps this job's footprint to
+      # what an `antora antora-playbook.yml` actually uses.
+      - name: Install the pinned docs toolchain (node, antora)
+        run: mise install node "npm:antora"
       - name: Build the documentation
         run: mise exec -- ./documentation/build.sh
       - name: Upload the site artifact
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3.0.1
         with:
           path: documentation/build/site
 
@@ -40,10 +69,17 @@ jobs:
     if: github.event_name != 'pull_request'
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # The only job that publishes — and it runs nothing of its own beyond the
+    # deploy action, so this is the one place the write scopes belong.
+    permissions:
+      contents: read # job-level permissions replace, not merge — restate the base
+      pages: write # publish the artifact to Pages
+      id-token: write # OIDC token deploy-pages exchanges for the deployment
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: Deploy
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4.0.5

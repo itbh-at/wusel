@@ -1,6 +1,8 @@
-// SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 IT Beratung Hermann GmbH
-//
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ * Copyright 2026 IT Beratung Hermann GmbH
+ */
+
 // wusel Nautilus extension — per-file emblems for the virtual Nextcloud mount.
 //
 // A native `libnautilus-extension` module (no scripting runtime): Nautilus loads
@@ -83,10 +85,41 @@ static GHashTable *tracked;     // path (owned) -> GWeakRef* (owned)
 static GDBusConnection *bus;    // session bus, for the signal subscription
 static guint file_changed_sub;  // subscription id, so shutdown can unsubscribe
 
+// Keeping `tracked` bounded.
+//
+// An entry costs a strdup'd path plus a GWeakRef, and update_file_info runs for
+// every file Nautilus draws — browsing a large mount in a session that stays
+// open for days would otherwise grow the table forever. Nothing removes an
+// entry on its own: a weak ref going dead does not notify us, and the
+// FileChanged handler only reaps the one path it was told about.
+//
+// So sweep the dead refs ourselves, but not on every insertion — the sweep is
+// O(n) and update_file_info sits in the draw path. Once per PRUNE_EVERY
+// insertions amortises it to O(1) per file. The sweep alone is not a bound
+// (a window full of *live* files is all live refs), hence the hard cap on top.
+#define TRACKED_PRUNE_EVERY 64
+#define TRACKED_MAX 4096
+
+static guint tracked_since_prune;
+
 static void free_weakref(gpointer p)
 {
     g_weak_ref_clear((GWeakRef *)p);
     g_free(p);
+}
+
+// GHRFunc for the sweep: TRUE drops the entry (and frees key + GWeakRef).
+static gboolean weakref_is_dead(gpointer key, gpointer value, gpointer user_data)
+{
+    (void)key;
+    (void)user_data;
+    NautilusFileInfo *file = g_weak_ref_get((GWeakRef *)value);
+    if (!file)
+    {
+        return TRUE;
+    }
+    g_object_unref(file);
+    return FALSE;
 }
 
 static void track_file(const char *path, NautilusFileInfo *file)
@@ -94,6 +127,20 @@ static void track_file(const char *path, NautilusFileInfo *file)
     if (!tracked)
     {
         return;
+    }
+    if (++tracked_since_prune >= TRACKED_PRUNE_EVERY)
+    {
+        tracked_since_prune = 0;
+        g_hash_table_foreach_remove(tracked, weakref_is_dead, NULL);
+        if (g_hash_table_size(tracked) > TRACKED_MAX)
+        {
+            // Everything in here is live, so there is no "least useful" entry
+            // to pick — and the table is a refresh *optimisation*, not state:
+            // the worst a reset can cost is one missed emblem update, and the
+            // next time Nautilus draws a file it registers it again. Bounded
+            // memory is worth more than that.
+            g_hash_table_remove_all(tracked);
+        }
     }
     GWeakRef *wr = g_new0(GWeakRef, 1);
     g_weak_ref_init(wr, file);
@@ -144,6 +191,7 @@ static void on_file_changed(GDBusConnection *conn, const char *sender,
 static void live_refresh_init(void)
 {
     tracked = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, free_weakref);
+    tracked_since_prune = 0;
     GError *err = NULL;
     bus = g_bus_get_sync(G_BUS_TYPE_SESSION, NULL, &err);
     if (!bus)
@@ -271,15 +319,33 @@ static char *find_wusel(void)
     return NULL;
 }
 
+// Pending `g_child_watch_add_full` source ids (as GUINT_TO_POINTER).
+//
+// Same hazard as the D-Bus subscription: a watch left registered when the
+// module is unloaded would dispatch into unmapped code. A pin/unpin can easily
+// still be running at that moment, so shutdown has to be able to find them —
+// hence the list rather than a fire-and-forget `g_child_watch_add`.
+static GSList *child_watches;
+
 // The command finished — re-read the file's info so its emblem reflects the new
 // state (pinned ⇄ not) without a manual refresh. Runs on the GLib main loop.
 static void on_action_done(GPid pid, gint status, gpointer data)
 {
     (void)status;
+    // A child-watch source destroys itself after this one dispatch, so its id
+    // is about to become free for reuse — it must leave the shutdown list now,
+    // or shutdown would later remove a stranger's source under that number.
+    GSource *self = g_main_current_source();
+    if (self)
+    {
+        child_watches =
+            g_slist_remove(child_watches, GUINT_TO_POINTER(g_source_get_id(self)));
+    }
     NautilusFileInfo *file = NAUTILUS_FILE_INFO(data);
     nautilus_file_info_invalidate_extension_info(file);
-    g_object_unref(file);
     g_spawn_close_pid(pid);
+    // No unref here: the source's GDestroyNotify owns the reference, so it is
+    // released on both paths — this dispatch and a forced removal at shutdown.
 }
 
 // Run `wusel <verb> <path>` for each selected file. wusel resolves the
@@ -312,7 +378,11 @@ static void run_action(NautilusMenuItem *item, const char *verb)
         GError *err = NULL;
         if (g_spawn_async(NULL, argv, NULL, G_SPAWN_DO_NOT_REAP_CHILD, NULL, NULL, &pid, &err))
         {
-            g_child_watch_add(pid, on_action_done, g_object_ref(file));
+            // `_full` for the GDestroyNotify: it releases our reference whether
+            // the watch fires normally or shutdown tears it down unfired.
+            guint watch = g_child_watch_add_full(G_PRIORITY_DEFAULT, pid, on_action_done,
+                                                 g_object_ref(file), g_object_unref);
+            child_watches = g_slist_prepend(child_watches, GUINT_TO_POINTER(watch));
         }
         else
         {
@@ -459,7 +529,18 @@ void nautilus_module_shutdown(void)
         g_dbus_connection_signal_unsubscribe(bus, file_changed_sub);
         file_changed_sub = 0;
     }
+    // Same reasoning for a pin/unpin still running: its child watch points at
+    // on_action_done, which is about to be unmapped. Removing the source drops
+    // the callback and, via its GDestroyNotify, our reference to the file. The
+    // child itself is left unreaped — it is exiting anyway, and there is no
+    // main loop left to notice.
+    for (GSList *l = child_watches; l != NULL; l = l->next)
+    {
+        g_source_remove(GPOINTER_TO_UINT(l->data));
+    }
+    g_clear_pointer(&child_watches, g_slist_free);
     g_clear_pointer(&tracked, g_hash_table_destroy);
+    tracked_since_prune = 0;
     g_clear_object(&bus);
 }
 
