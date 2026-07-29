@@ -51,7 +51,7 @@ jobs:
       # audited code would not be the code that runs. Same rationale as the
       # MISE_VERSION pin in both Containerfiles. .github/dependabot.yml keeps
       # the pins moving.
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # This job compiles untrusted third-party build scripts; leaving the
           # token in .git/config would hand it to any one of them.
