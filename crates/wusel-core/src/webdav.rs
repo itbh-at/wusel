@@ -102,19 +102,19 @@ impl WebDavClient {
   </d:prop>
 </d:propfind>"#;
 
-        let resp = self
-            .http
-            .request(
-                reqwest::Method::from_bytes(b"PROPFIND").unwrap(),
-                self.url_for(path, true)?,
-            )
-            .basic_auth(&self.login_name, Some(&self.app_password))
-            .header("Depth", "1")
-            .header("Content-Type", "application/xml")
-            .body(BODY)
-            .send()
-            .await?
-            .error_for_status()?;
+        let resp = send_retrying(
+            self.http
+                .request(
+                    reqwest::Method::from_bytes(b"PROPFIND").unwrap(),
+                    self.url_for(path, true)?,
+                )
+                .basic_auth(&self.login_name, Some(&self.app_password))
+                .header("Depth", "1")
+                .header("Content-Type", "application/xml")
+                .body(BODY),
+        )
+        .await?
+        .error_for_status()?;
 
         let xml = resp.text().await?;
         let mut entries = parse_multistatus(&xml, &self.base)?;
@@ -145,7 +145,7 @@ impl WebDavClient {
         if let Some((start, len)) = range {
             req = req.header("Range", format!("bytes={}-{}", start, start + len - 1));
         }
-        let resp = req.send().await?;
+        let resp = send_retrying(req).await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             // Deleted on the server since we last listed it — a distinct, benign
             // signal (the caller prunes the stale node), not a transport failure.
@@ -169,6 +169,30 @@ impl WebDavClient {
         }
     }
 
+    /// Full-file `GET` that also reports the version it served.
+    ///
+    /// Separate from [`get`](Self::get) because only one caller needs it: the
+    /// 3-way merge, whose result is valid **only** against exactly the "theirs"
+    /// it read. Carrying that ETag lets it upload the merge with `If-Match`, so
+    /// a server-side change between the read and the write is caught instead of
+    /// being overwritten. `None` if the server sends no `ETag` — then the merge
+    /// falls back to an unconditional upload, as it always did.
+    pub async fn get_with_etag(&self, path: &str) -> Result<(bytes::Bytes, Option<String>)> {
+        tracing::debug!(%path, "GET (with ETag)");
+        let resp = self
+            .http
+            .get(self.url_for(path, false)?)
+            .basic_auth(&self.login_name, Some(&self.app_password))
+            .send()
+            .await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(Error::NotFound);
+        }
+        let resp = resp.error_for_status()?;
+        let etag = etag_from_headers(&resp);
+        Ok((resp.bytes().await?, etag))
+    }
+
     // --- Writing (phase 1) --------------------------------------------------
 
     /// Uploads a whole file with a simple `PUT`. Returns the server's new ETag if
@@ -176,40 +200,38 @@ impl WebDavClient {
     /// later refinement; a plain PUT is correct for any size.
     pub async fn put(&self, path: &str, body: Vec<u8>) -> Result<Option<String>> {
         tracing::debug!(%path, bytes = body.len(), "PUT");
-        let resp = self
-            .http
-            .put(self.url_for(path, false)?)
-            .basic_auth(&self.login_name, Some(&self.app_password))
-            .body(body)
-            .send()
-            .await?
-            .error_for_status()?;
+        let resp = send_retrying(
+            self.http
+                .put(self.url_for(path, false)?)
+                .basic_auth(&self.login_name, Some(&self.app_password))
+                .body(body),
+        )
+        .await?
+        .error_for_status()?;
         Ok(etag_from_headers(&resp))
     }
 
-    /// Conditional upload: `PUT` with `If-Match`, so the server rejects (412) if
-    /// the file changed since `if_match` — our lost-update / conflict signal. An
-    /// **empty** `if_match` means "this file must not exist yet" and sends
-    /// `If-None-Match: *` instead: a deferred create (no base version) must not
-    /// silently clobber a same-named file created concurrently on the server.
-    /// Either precondition failing maps to [`PutResult::Conflict`].
-    pub async fn put_if_match(
+    /// Conditional upload: a `PUT` guarded by `pre` (see [`Precondition`]), so
+    /// the server rejects it with 412 when its state does not match what we
+    /// assumed — our lost-update / conflict signal, mapped to
+    /// [`PutResult::Conflict`].
+    pub async fn put_conditional(
         &self,
         path: &str,
         body: Vec<u8>,
-        if_match: &str,
+        pre: &Precondition,
         mtime: Option<i64>,
     ) -> Result<PutResult> {
-        tracing::debug!(%path, bytes = body.len(), "PUT (conditional)");
+        tracing::debug!(%path, bytes = body.len(), ?pre, "PUT (conditional)");
         let mut req = self
             .http
             .put(self.url_for(path, false)?)
             .basic_auth(&self.login_name, Some(&self.app_password));
-        req = apply_precondition(req, if_match);
+        req = apply_precondition(req, pre);
         if let Some(m) = mtime {
             req = req.header("X-OC-Mtime", m.to_string());
         }
-        let resp = req.body(body).send().await?;
+        let resp = send_retrying(req.body(body)).await?;
         if resp.status() == reqwest::StatusCode::PRECONDITION_FAILED {
             return Ok(PutResult::Conflict);
         }
@@ -263,20 +285,18 @@ impl WebDavClient {
     /// Chunked upload NG: create an upload collection, `PUT` the file in chunks
     /// (named by byte offset so they sort in order), then `MOVE` the `.file`
     /// marker to the target to assemble it. Streams from `source`, so only one
-    /// chunk is ever in memory. The precondition on the final `MOVE` matches
-    /// [`put_if_match`](Self::put_if_match): a non-empty `if_match` sends
-    /// `If-Match` (412 = the file changed under us), an empty one sends
-    /// `If-None-Match: *` (412 = a deferred create raced a server-side create).
-    /// Nextcloud honours both on the assembling MOVE.
+    /// chunk is ever in memory. `pre` guards the final `MOVE` exactly as it
+    /// guards the plain [`put_conditional`](Self::put_conditional) — Nextcloud
+    /// honours the conditional headers on the assembling MOVE.
     pub async fn put_chunked(
         &self,
         target: &str,
         source: &Path,
         total: u64,
-        if_match: &str,
+        pre: &Precondition,
         mtime: Option<i64>,
     ) -> Result<PutResult> {
-        tracing::debug!(path = %target, bytes = total, "PUT (chunked)");
+        tracing::debug!(path = %target, bytes = total, ?pre, "PUT (chunked)");
         let id = format!("wusel-{}-{}", std::process::id(), unique_suffix());
 
         // 1. MKCOL the upload collection. (Nothing to clean up if this fails.)
@@ -291,7 +311,7 @@ impl WebDavClient {
             .error_for_status()?;
 
         let outcome = self
-            .upload_chunks_and_assemble(&id, target, source, total, if_match, mtime)
+            .upload_chunks_and_assemble(&id, target, source, total, pre, mtime)
             .await;
         // A successful MOVE consumes the upload collection server-side. On every
         // other outcome — a failed chunk PUT, a failed MOVE, or a 412 — the
@@ -316,7 +336,7 @@ impl WebDavClient {
         target: &str,
         source: &Path,
         total: u64,
-        if_match: &str,
+        pre: &Precondition,
         mtime: Option<i64>,
     ) -> Result<PutResult> {
         // 2. PUT each chunk (read locally, so RAM stays at one chunk).
@@ -350,7 +370,7 @@ impl WebDavClient {
             .basic_auth(&self.login_name, Some(&self.app_password))
             .header("Destination", dest.as_str())
             .header("OC-Total-Length", total.to_string());
-        req = apply_precondition(req, if_match);
+        req = apply_precondition(req, pre);
         if let Some(m) = mtime {
             req = req.header("X-OC-Mtime", m.to_string());
         }
@@ -395,24 +415,108 @@ impl WebDavClient {
     }
 }
 
-/// Outcome of a conditional [`put_if_match`](WebDavClient::put_if_match).
+/// Outcome of a conditional upload
+/// ([`put_conditional`](WebDavClient::put_conditional) /
+/// [`put_chunked`](WebDavClient::put_chunked)).
 pub enum PutResult {
     /// Uploaded; carries the server's new ETag if it sent one.
     Uploaded(Option<String>),
     /// The server rejected the upload (412) — the file changed under us, or (for
-    /// a deferred create's `If-None-Match: *`) it already exists.
+    /// a create's `If-None-Match: *`) it already exists.
     Conflict,
 }
 
-/// Attach the shared upload precondition: `If-Match: "<etag>"` when a base
-/// version is known, `If-None-Match: *` ("must not exist yet") when it is not.
-/// One helper so the plain PUT and the chunked upload's final MOVE cannot
-/// drift apart in their conflict semantics.
-fn apply_precondition(req: reqwest::RequestBuilder, if_match: &str) -> reqwest::RequestBuilder {
-    if if_match.is_empty() {
-        req.header(reqwest::header::IF_NONE_MATCH, "*")
-    } else {
-        req.header(reqwest::header::IF_MATCH, format!("\"{if_match}\""))
+/// What an upload asserts about the server's current state.
+///
+/// **Why a type and not "the ETag, empty for a create".** These are three
+/// genuinely different situations, and one string cannot express them. The empty
+/// ETag used to mean *both* "nothing exists there yet" *and* "we do not know the
+/// version" — and the latter happens routinely, whenever a `PUT`/`MOVE` answer
+/// carries no `ETag` header (some servers and reverse proxies drop it) or a
+/// PROPFIND has no `getetag`. Every subsequent save of such a file then sent
+/// `If-None-Match: *` against a file that plainly exists, collected a 412, and
+/// filed the user's own document away as a conflicted copy — forever.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Precondition {
+    /// A create: nothing exists server-side yet (the node has no file id). Sends
+    /// `If-None-Match: *`; a 412 means someone created the same name on the
+    /// server first, which we must not silently clobber.
+    MustNotExist,
+    /// A known base version. Sends `If-Match: "<etag>"`; a 412 is the
+    /// lost-update signal — the file changed under us.
+    Match(String),
+    /// The file exists server-side, but we do not know its ETag. Neither
+    /// precondition would be *true*, so we send none.
+    ///
+    /// This deliberately trades lost-update protection for not corrupting every
+    /// save: the alternative — a precondition we know to be wrong — does not
+    /// protect anything, it just guarantees a spurious conflicted copy on every
+    /// single save. The window is small (it closes as soon as any PROPFIND
+    /// re-learns the ETag) and a real concurrent change is still caught by the
+    /// next sync walk; an unusable file is not recoverable at all.
+    Unconditional,
+}
+
+impl Precondition {
+    /// The precondition for uploading a buffer based on `base_etag`, where
+    /// `exists_remotely` says whether the node already has a server identity.
+    /// The one place that maps our two pieces of knowledge onto the three cases.
+    pub fn for_upload(base_etag: &str, exists_remotely: bool) -> Self {
+        match (base_etag.is_empty(), exists_remotely) {
+            (false, _) => Precondition::Match(base_etag.to_string()),
+            (true, false) => Precondition::MustNotExist,
+            (true, true) => Precondition::Unconditional,
+        }
+    }
+}
+
+/// Send a request, retrying a bounded number of times on a *transient transport*
+/// error — one where no response was received, so re-sending is safe. The classic
+/// case is a pooled keep-alive connection the server closed after its
+/// KeepAliveTimeout (bare Apache defaults to just 5 s, far under the 60–75 s
+/// `tls::client` assumes): reqwest hands back the dead connection's "error sending
+/// request …" without the request taking effect, and a fresh attempt gets a new
+/// connection. A 4xx/5xx *response* is a real answer, not a transport failure, and
+/// is never retried here; nor is a streaming body that cannot be cloned to re-send.
+async fn send_retrying(req: reqwest::RequestBuilder) -> reqwest::Result<reqwest::Response> {
+    const MAX_ATTEMPTS: u32 = 3;
+    for attempt in 1..MAX_ATTEMPTS {
+        // Clone before consuming, so the original survives for the next try. A
+        // streaming body cannot be cloned (None) — then we cannot retry safely.
+        let Some(this) = req.try_clone() else {
+            break;
+        };
+        match this.send().await {
+            Ok(resp) => return Ok(resp),
+            Err(e) if is_transient(&e) => {
+                tracing::debug!(attempt, error = %e, "transient send error — retrying");
+                // A brief, growing pause so we do not hammer a server that is
+                // momentarily churning connections.
+                tokio::time::sleep(std::time::Duration::from_millis(100 * u64::from(attempt)))
+                    .await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    // The last attempt (and the only one for a non-cloneable body): surface it.
+    req.send().await
+}
+
+/// A transport-level failure with no response received — safe to re-send. Excludes
+/// response-status errors (a 4xx/5xx is a real answer) and connect *timeouts*
+/// (retrying those only stacks the 15 s handshake wait onto a blocked FUSE op).
+fn is_transient(e: &reqwest::Error) -> bool {
+    (e.is_request() || e.is_connect()) && !e.is_timeout()
+}
+
+/// Attach the shared upload precondition. One helper so the plain PUT and the
+/// chunked upload's final MOVE cannot drift apart in their conflict semantics.
+fn apply_precondition(req: reqwest::RequestBuilder, pre: &Precondition) -> reqwest::RequestBuilder {
+    match pre {
+        Precondition::MustNotExist => req.header(reqwest::header::IF_NONE_MATCH, "*"),
+        Precondition::Match(etag) => req.header(reqwest::header::IF_MATCH, format!("\"{etag}\"")),
+        // No header at all — see the variant's docs for the tradeoff.
+        Precondition::Unconditional => req,
     }
 }
 
@@ -468,7 +572,25 @@ fn etag_from_headers(resp: &reqwest::Response) -> Option<String> {
     resp.headers()
         .get(reqwest::header::ETAG)
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.trim_matches('"').to_string())
+        .map(unquote_etag)
+}
+
+/// The bare entity-tag out of an `ETag` field value: strip an optional weak
+/// validator prefix (`W/`, RFC 9110 §8.8.3), then the quotes.
+///
+/// A plain `trim_matches('"')` is wrong for a weak ETag: the leading `W` blocks
+/// trimming at the front while the trailing quote is still removed, turning
+/// `W/"abc"` into `W/"abc`. That value went back out as
+/// `If-Match: "W/"abc"` — malformed, and a guaranteed 412 on every save.
+fn unquote_etag(value: &str) -> String {
+    let v = value.trim();
+    // Nextcloud sends strong ETags, but a proxy in front of it may weaken them,
+    // and we must not care either way: the tag we compare is the same.
+    let v = v
+        .strip_prefix("W/")
+        .or_else(|| v.strip_prefix("w/"))
+        .unwrap_or(v);
+    v.trim_matches('"').to_string()
 }
 
 /// Parses a `<d:multistatus>` response into [`RemoteEntry`]s.
@@ -570,7 +692,8 @@ impl PartialEntry {
             Field::Href => self.href = val.to_string(),
             Field::Size => self.size = val.parse().unwrap_or(0),
             Field::MTime => self.mtime = parse_http_date(val),
-            Field::ETag => self.etag = val.trim_matches('"').to_string(),
+            // Same unquoting as the response header: a `getetag` may be weak too.
+            Field::ETag => self.etag = unquote_etag(val),
             Field::FileId => self.file_id = val.parse().ok(),
             Field::Permissions => self.permissions = val.to_string(),
         }
@@ -765,6 +888,44 @@ mod tests {
         assert_eq!(
             entries[0].etag, "abc",
             "status text must not leak into the etag"
+        );
+    }
+
+    #[test]
+    fn etags_are_unquoted_including_weak_ones() {
+        // Strong, the common case.
+        assert_eq!(unquote_etag("\"abc\""), "abc");
+        // Weak: `trim_matches('"')` used to leave `W/"abc`, which then went out
+        // as the malformed `If-Match: "W/"abc"` — a guaranteed 412.
+        assert_eq!(unquote_etag("W/\"abc\""), "abc");
+        assert_eq!(unquote_etag("w/\"abc\""), "abc");
+        // Unquoted (sloppy servers) and whitespace-padded values still work.
+        assert_eq!(unquote_etag("abc"), "abc");
+        assert_eq!(unquote_etag("  \"abc\"  "), "abc");
+        assert_eq!(unquote_etag("W/abc"), "abc");
+        // Degenerate input must not panic.
+        assert_eq!(unquote_etag(""), "");
+        assert_eq!(unquote_etag("\"\""), "");
+    }
+
+    #[test]
+    fn precondition_distinguishes_create_from_an_unknown_version() {
+        // A known base version → conditional on exactly that version.
+        assert_eq!(
+            Precondition::for_upload("abc", true),
+            Precondition::Match("abc".into())
+        );
+        // No ETag and no server identity → a real create.
+        assert_eq!(
+            Precondition::for_upload("", false),
+            Precondition::MustNotExist
+        );
+        // No ETag but the file exists server-side → neither precondition is
+        // true. Asserting "must not exist" here is the regression that buried
+        // every save under a conflicted copy.
+        assert_eq!(
+            Precondition::for_upload("", true),
+            Precondition::Unconditional
         );
     }
 
