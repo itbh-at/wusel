@@ -82,6 +82,10 @@ run = "./scripts/podman-shell.sh"
 description = "Run the FUSE tests (real mount e2e) in the Linux container"
 run = "./scripts/podman-test.sh"
 
+[tasks.e2e-local]
+description = "End-to-end test against a real Nextcloud container (mirrors the CI E2E)"
+run = "./scripts/podman-e2e.sh"
+
 # --- Packaging (Fedora RPM) -------------------------------------------------
 # Builds the .rpm in a Fedora container (for a macOS host). On a Fedora machine
 # run packaging/rpm/build-rpm.sh directly instead. Output: ./dist/*.rpm.

@@ -104,9 +104,15 @@ ok "pin/pins works"
 # remote edit: change line1 on the server, out of band (a "second client").
 printf 'line1: REMOTE\nline2: base\nline3: base\n' > /tmp/remote.txt
 curl -fsS "${AUTH[@]}" -T /tmp/remote.txt "$DAV/merge.txt" >/dev/null
-# local edit: change line3 in the mount. On close, wusel uploads with its stale
+# local edit: change line3 in the mount. Write IN PLACE (dd conv=notrunc, no
+# O_TRUNC) to model an editor's read-modify-write: a plain `> file` truncates to
+# zero first, which wusel treats — by design — as a wholesale overwrite with no
+# merge base (and flushes the empty state, spuriously conflicting). In-place, the
+# base cached by the read above survives. On close, wusel uploads with its stale
 # If-Match -> 412 -> 3-way text merge (base vs local vs remote), non-overlapping.
-printf 'line1: base\nline2: base\nline3: LOCAL\n' > "$MNT/merge.txt"
+# (dd conv=notrunc never shrinks the file; the edited line is longer, so fine.)
+printf 'line1: base\nline2: base\nline3: LOCAL\n' \
+  | dd of="$MNT/merge.txt" conv=notrunc status=none
 sync
 sleep 3
 merged="$(curl -fsS "${AUTH[@]}" "$DAV/merge.txt")"
