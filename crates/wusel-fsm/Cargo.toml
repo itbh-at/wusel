@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 IT Beratung Hermann GmbH
+
+[package]
+name = "wusel-fsm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Decision core for wusel: per-object occupancy, collision policy and operation scripts"
+# Not published to crates.io: the product ships as an RPM and the crates depend
+# on each other by bare path, which the registry rejects anyway.
+publish.workspace = true
+
+# Deliberately **no dependencies at all** — not on wusel-core, not on a
+# database, not on an HTTP client, not on a FUSE binding.
+#
+# That is not tidiness, it is the design rule made mechanical. The machine
+# decides and performs no I/O; a crate that cannot reach a socket or a file
+# cannot later be talked into it by a well-meaning patch. The purity gate is
+# `cargo tree -p wusel-fsm`, and it is worth more than a review comment.
+#
+# It is also what keeps a second frontend affordable: a mechanism must not learn
+# what one kernel interface happens to call an identity. See
+# documentation/modules/ROOT/pages/frontends.adoc.
+[dependencies]

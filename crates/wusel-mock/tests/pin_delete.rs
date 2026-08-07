@@ -13,9 +13,7 @@
 mod common;
 
 use wusel_core::config::Account;
-use wusel_core::provider::Provider;
-use wusel_core::state::{StateDb, ROOT_INODE};
-use wusel_core::webdav::WebDavClient;
+use wusel_core::state::ROOT_INODE;
 
 #[test]
 fn deleting_a_pinned_file_drops_its_pin_and_its_eviction_marker() {
@@ -34,21 +32,13 @@ fn deleting_a_pinned_file_drops_its_pin_and_its_eviction_marker() {
     let addr = mock.addr.clone();
 
     let account = Account::new("default");
-    let dav = WebDavClient::new(
-        reqwest::Client::new(),
-        &format!("http://{addr}"),
-        "alice",
-        "pw",
-    );
-    std::fs::create_dir_all(account.state_db_path().parent().unwrap()).unwrap();
-    let state = StateDb::open(&account.state_db_path()).unwrap();
-    let mut provider = Provider::new(dav, state, &account).unwrap();
+    let mut engine = common::Engine::start(&addr);
 
     // Pin the file: it is fetched whole and marked "keep offline" on disk.
-    assert_eq!(provider.pin("Notes.txt").unwrap(), 1);
+    assert_eq!(engine.pin("Notes.txt").unwrap(), 1);
     // The cache is keyed by the server's file id, which the mock derives from
     // the path — so ask the state for it instead of hard-coding one.
-    let file_id = provider
+    let file_id = engine
         .resolve("Notes.txt")
         .unwrap()
         .expect("Notes.txt exists")
@@ -65,12 +55,12 @@ fn deleting_a_pinned_file_drops_its_pin_and_its_eviction_marker() {
     );
 
     // Deleting the file must take both the pin record and the marker with it.
-    provider.remove(ROOT_INODE, "Notes.txt").unwrap();
+    engine.remove(ROOT_INODE, "Notes.txt").unwrap();
     assert!(!backing.exists(), "the DELETE reached the server");
     assert!(
-        provider.pins().unwrap().is_empty(),
+        engine.pins().unwrap().is_empty(),
         "the pin record went with the file: {:?}",
-        provider.pins().unwrap()
+        engine.pins().unwrap()
     );
     assert!(
         !blobs.join(format!("{file_id}.pin")).exists(),

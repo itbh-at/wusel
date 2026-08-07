@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
+  <!-- pinned-stale: kept offline, but the server has moved on. The green check
+       stays, because the promise still holds — the file is there. The amber
+       corner says the copy is not the newest, which is the part the user has to
+       know before opening it. -->
+  <circle cx="8" cy="8" r="7" fill="#2ec27e"/>
+  <path d="M4.6 8.2 6.9 10.5 11.5 5.6" fill="none" stroke="#ffffff"
+        stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="12.4" cy="12.4" r="3.4" fill="#e5a50a" stroke="#ffffff" stroke-width="1"/>
+  <path d="M12.4 10.6 V12.7" fill="none" stroke="#ffffff" stroke-width="1.3"
+        stroke-linecap="round"/>
+  <circle cx="12.4" cy="14.2" r="0.7" fill="#ffffff"/>
+</svg>

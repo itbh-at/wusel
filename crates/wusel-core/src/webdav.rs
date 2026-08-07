@@ -69,6 +69,33 @@ impl WebDavClient {
         }
     }
 
+    /// Build the DAV path from `dav_user` — the canonical **user id** — while
+    /// keeping `login_name` for authentication.
+    ///
+    /// The login flow only tells us the `loginName` (the credential the user
+    /// signed in with, which some providers make an email). That works for Basic
+    /// auth and for `/dav/files/<user>/`, but Nextcloud's chunked-upload endpoint
+    /// `/dav/uploads/<user>/` insists on the exact user id and answers a login
+    /// alias with 403 — sinking every large-file upload. The id is resolved once
+    /// (see [`crate::capabilities::whoami`]) and applied here; auth is left on
+    /// the login name, which is known to work. A no-op when they are equal.
+    #[must_use]
+    pub fn with_dav_user(mut self, dav_user: &str) -> Self {
+        if dav_user.is_empty() || dav_user == self.login_name {
+            return self;
+        }
+        // `base` is `…/remote.php/dav/files/<login_name>` (built in `new`), and
+        // `uploads_url` derives `…/dav/uploads/<same>` from it, so swapping the
+        // one segment here fixes both. Only the first occurrence — the path
+        // segment — is touched, never a look-alike elsewhere in the URL.
+        self.base = self.base.replacen(
+            &format!("/dav/files/{}", self.login_name),
+            &format!("/dav/files/{dav_user}"),
+            1,
+        );
+        self
+    }
+
     /// Builds the request URL for `path`, percent-encoding each segment (so names
     /// with spaces or Unicode work). `as_dir` appends a trailing slash, the
     /// canonical WebDAV address for a collection.
@@ -126,6 +153,55 @@ impl WebDavClient {
         Ok(entries)
     }
 
+    /// The server's current ETag for a single resource, via a Depth-0 PROPFIND.
+    ///
+    /// Needed after a chunked upload: Nextcloud's chunked-assembly MOVE returns
+    /// an ETag in its response that does *not* match the assembled file's real
+    /// ETag (a plain PUT's response ETag does match). Recording the MOVE's ETag
+    /// would make the *next* conditional upload send a stale `If-Match`, which
+    /// the server answers with 412 — read as a conflict, so it parks a
+    /// "conflicted copy". Asking the server for the real ETag closes that gap.
+    pub async fn etag_of(&self, path: &str) -> Result<Option<String>> {
+        Ok(self
+            .remote_meta(path)
+            .await?
+            .map(|(_, etag)| etag)
+            .filter(|t| !t.is_empty()))
+    }
+
+    /// A single resource's `(content-length, ETag)`, via a Depth-0 PROPFIND, or
+    /// `None` if it does not exist (404). Absent is an answer, not an error: the
+    /// caller uses it to tell "not there" from a transient failure it must retry.
+    ///
+    /// The size is what makes a chunked upload's success checkable independently
+    /// of the MOVE's status code — see the completion check in
+    /// [`put_chunked`](Self::put_chunked).
+    pub async fn remote_meta(&self, path: &str) -> Result<Option<(u64, String)>> {
+        const BODY: &str = r#"<?xml version="1.0"?>
+<d:propfind xmlns:d="DAV:"><d:prop><d:getcontentlength/><d:getetag/></d:prop></d:propfind>"#;
+        let resp = send_retrying(
+            self.http
+                .request(
+                    reqwest::Method::from_bytes(b"PROPFIND").unwrap(),
+                    self.url_for(path, false)?,
+                )
+                .basic_auth(&self.login_name, Some(&self.app_password))
+                .header("Depth", "0")
+                .header("Content-Type", "application/xml")
+                .body(BODY),
+        )
+        .await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let resp = resp.error_for_status()?;
+        let xml = resp.text().await?;
+        Ok(parse_multistatus(&xml, &self.base)?
+            .into_iter()
+            .next()
+            .map(|e| (e.size, e.etag)))
+    }
+
     /// Loads (part of) a file. `range` = (start, len) for a range GET.
     pub async fn get(&self, path: &str, range: Option<(u64, u64)>) -> Result<bytes::Bytes> {
         // A zero-length range has an empty answer by definition — and the header
@@ -167,6 +243,26 @@ impl WebDavClient {
             }
             _ => Ok(body),
         }
+    }
+
+    /// Start a full-file `GET` and hand back the response with its body still
+    /// unread, so the caller can stream it chunk by chunk into a file (see
+    /// [`crate::content`]). This is what makes hydrating a whole file cost **one**
+    /// GET instead of one range request per `FETCH_CHUNK`. `NotFound` maps like
+    /// [`get`](Self::get); other non-2xx become an error. The caller must still
+    /// verify it received the full `size` (a 200 can be truncated) — a truncated
+    /// body must never be published as a complete cache blob.
+    pub async fn get_streaming(&self, path: &str) -> Result<reqwest::Response> {
+        tracing::debug!(%path, "GET (streaming, full file)");
+        let req = self
+            .http
+            .get(self.url_for(path, false)?)
+            .basic_auth(&self.login_name, Some(&self.app_password));
+        let resp = send_retrying(req).await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(Error::NotFound);
+        }
+        Ok(resp.error_for_status()?)
     }
 
     /// Full-file `GET` that also reports the version it served.
@@ -285,9 +381,17 @@ impl WebDavClient {
     /// Chunked upload NG: create an upload collection, `PUT` the file in chunks
     /// (named by byte offset so they sort in order), then `MOVE` the `.file`
     /// marker to the target to assemble it. Streams from `source`, so only one
-    /// chunk is ever in memory. `pre` guards the final `MOVE` exactly as it
-    /// guards the plain [`put_conditional`](Self::put_conditional) — Nextcloud
-    /// honours the conditional headers on the assembling MOVE.
+    /// chunk is ever in memory.
+    ///
+    /// Unlike a plain PUT, the precondition is enforced with a pre-flight
+    /// PROPFIND rather than a conditional header on the MOVE: Nextcloud's
+    /// chunked-assembly MOVE does *not* honour `If-Match`/`If-None-Match`
+    /// reliably — it answers even a correct `If-Match` with 412 (it appears to
+    /// test the assembly marker, not the destination) — which the engine then
+    /// reads as a conflict and floods the directory with "conflicted copy"
+    /// files. So check the destination's current ETag ourselves, then assemble
+    /// unconditionally. The window between the check and the MOVE is a race we
+    /// accept: the same last-writer-wins a VFS has anyway.
     pub async fn put_chunked(
         &self,
         target: &str,
@@ -297,6 +401,23 @@ impl WebDavClient {
         mtime: Option<i64>,
     ) -> Result<PutResult> {
         tracing::debug!(path = %target, bytes = total, ?pre, "PUT (chunked)");
+
+        // Pre-flight precondition check (see the note above). A transient
+        // PROPFIND failure propagates as an error so the upload is retried, not
+        // mistaken for a conflict.
+        match pre {
+            Precondition::MustNotExist => {
+                if self.etag_of(target).await?.is_some() {
+                    return Ok(PutResult::Conflict);
+                }
+            }
+            Precondition::Match(expected) => match self.etag_of(target).await? {
+                Some(current) if &current != expected => return Ok(PutResult::Conflict),
+                _ => {}
+            },
+            Precondition::Unconditional => {}
+        }
+
         let id = format!("wusel-{}-{}", std::process::id(), unique_suffix());
 
         // 1. MKCOL the upload collection. (Nothing to clean up if this fails.)
@@ -311,7 +432,7 @@ impl WebDavClient {
             .error_for_status()?;
 
         let outcome = self
-            .upload_chunks_and_assemble(&id, target, source, total, pre, mtime)
+            .upload_chunks_and_assemble(&id, target, source, total, mtime)
             .await;
         // A successful MOVE consumes the upload collection server-side. On every
         // other outcome — a failed chunk PUT, a failed MOVE, or a 412 — the
@@ -336,7 +457,6 @@ impl WebDavClient {
         target: &str,
         source: &Path,
         total: u64,
-        pre: &Precondition,
         mtime: Option<i64>,
     ) -> Result<PutResult> {
         // 2. PUT each chunk (read locally, so RAM stays at one chunk).
@@ -359,7 +479,10 @@ impl WebDavClient {
             offset += n as u64;
         }
 
-        // 3. MOVE the assembly marker to the destination.
+        // 3. MOVE the assembly marker to the destination — unconditionally. The
+        // precondition was already enforced by the pre-flight PROPFIND in
+        // `put_chunked`; a conditional header here is not honoured (it 412s even
+        // when correct), which is the whole reason for this design.
         let dest = self.url_for(target, false)?;
         let mut req = self
             .http
@@ -370,17 +493,43 @@ impl WebDavClient {
             .basic_auth(&self.login_name, Some(&self.app_password))
             .header("Destination", dest.as_str())
             .header("OC-Total-Length", total.to_string());
-        req = apply_precondition(req, pre);
         if let Some(m) = mtime {
             req = req.header("X-OC-Mtime", m.to_string());
         }
-        let resp = req.send().await?;
-        if resp.status() == reqwest::StatusCode::PRECONDITION_FAILED {
-            return Ok(PutResult::Conflict);
+        let moved = req.send().await;
+
+        // Trust the assembled file, not only the MOVE's status code. A reverse
+        // proxy in front of Nextcloud can answer the long server-side assembly
+        // MOVE with an error — a timeout surfaced as 403/5xx, or a WAF — even
+        // though Nextcloud finished assembling the file. Believing that error
+        // would park a file that actually landed (a red "sync error" on a file
+        // the user can see on the server) and, on the next attempt, spawn a
+        // "conflicted copy" because the pre-flight now finds it there. So if the
+        // MOVE did not cleanly succeed, ask the server whether the target now
+        // exists at the full expected size before deciding it failed.
+        let clean = matches!(&moved, Ok(r) if r.status().is_success());
+        if !clean {
+            if let Ok(Some((size, etag))) = self.remote_meta(target).await {
+                if size == total {
+                    tracing::debug!(
+                        %target,
+                        bytes = total,
+                        "chunked MOVE reported an error, but the file assembled in \
+                         full — treating as uploaded (a proxy likely mangled the MOVE)"
+                    );
+                    return Ok(PutResult::Uploaded(Some(etag).filter(|e| !e.is_empty())));
+                }
+            }
+            // Not there, or short: the failure was real. Surface it.
+            moved?.error_for_status()?;
         }
-        Ok(PutResult::Uploaded(etag_from_headers(
-            &resp.error_for_status()?,
-        )))
+        // Clean MOVE. The MOVE's own ETag header is unreliable on Nextcloud, so
+        // read the assembled file's real ETag — it becomes the base for the next
+        // conditional upload's pre-flight check. If that read fails, record none:
+        // the next upload then treats the base as unknown and uploads
+        // unconditionally rather than on a stale, wrong ETag.
+        let etag = self.etag_of(target).await.unwrap_or(None);
+        Ok(PutResult::Uploaded(etag))
     }
 
     /// Best-effort DELETE of an abandoned upload collection (see
@@ -1112,5 +1261,43 @@ mod tests {
             dir.as_str(),
             "https://cloud.example.org/remote.php/dav/files/alice/Sub%20Folder/"
         );
+    }
+
+    #[test]
+    fn with_dav_user_swaps_the_path_segment_but_not_the_login() {
+        // Logged in with an email; the canonical user id is different.
+        let dav = WebDavClient::new(
+            reqwest::Client::new(),
+            "https://collab.example.org",
+            "alex@example.org",
+            "pw",
+        )
+        .with_dav_user("apawle");
+
+        // Both files and uploads address the user id now — the uploads one being
+        // the whole point (it 403s on the login alias).
+        assert_eq!(
+            dav.url_for("big.bin", false).unwrap().as_str(),
+            "https://collab.example.org/remote.php/dav/files/apawle/big.bin"
+        );
+        assert_eq!(
+            dav.uploads_url("id-1/.file").unwrap().as_str(),
+            "https://collab.example.org/remote.php/dav/uploads/apawle/id-1/.file"
+        );
+        // Auth is left on the login name the app password was issued for.
+        assert_eq!(dav.login_name, "alex@example.org");
+    }
+
+    #[test]
+    fn with_dav_user_is_a_noop_when_equal_or_empty() {
+        for user in ["alice", ""] {
+            let dav =
+                WebDavClient::new(reqwest::Client::new(), "https://x.org", "alice", "pw")
+                    .with_dav_user(user);
+            assert_eq!(
+                dav.url_for("f", false).unwrap().as_str(),
+                "https://x.org/remote.php/dav/files/alice/f"
+            );
+        }
     }
 }

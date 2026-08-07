@@ -1,0 +1,102 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 IT Beratung Hermann GmbH
+#
+# Source for the event-driven dispatch architecture (see pages/concurrency.adoc).
+#
+# Render to a committed SVG with:  mise run docs-diagrams
+#
+# The one rule the picture exists to make obvious: the FSM thread decides and
+# nothing else. Every box it points at is somewhere work may block; the FSM
+# itself never waits for disk, database or network.
+#
+# Palette matches arch-overview.d2.
+
+direction: down
+
+kernel: "Linux kernel — FUSE\nrequests carry a unique id, replies may come back out of order" {
+  shape: rectangle
+  style: {fill: "#EAF1FB"; stroke: "#B7BECC"}
+}
+
+daemon: "wusel daemon" {
+  style: {fill: "#FBFBFD"; stroke: "#C6CBD6"}
+
+  dispatch: "Dispatch threads  (fuser, Config::n_threads)\ntranslate callback → Job · hand over the reply object · return at once" {
+    style: {fill: "#EAF1FB"; stroke: "#B7BECC"}
+  }
+
+  fsm: "FSM thread — decides, never waits\n\nper object a clipboard:  Idle  |  Busy { flow, FIFO queue }\n(an opaque identity — the inode under FUSE, a file id or\nan opaque string on the platforms that may follow)\ncollision(running, arriving) → Queue | Join | Abort\nadvance(flow, completion) → next step\n\nno disk · no database · no network" {
+    style: {fill: "#E9F6EE"; stroke: "#B7CBBE"}
+  }
+
+  db: "DB threads  (each owns its own connection)" {
+    style: {fill: "#FBF3E3"; stroke: "#D8CBA9"}
+
+    writer: "1 writer\nserialises every write — ours, and the syncer's" {
+      style: {fill: "#FBF3E3"; stroke: "#D8CBA9"}
+    }
+    readers: "N readers\nWAL: metadata reads never queue behind a write" {
+      style: {fill: "#FBF3E3"; stroke: "#D8CBA9"}
+    }
+  }
+
+  workers: "I/O workers  (here it may block — that is their job)" {
+    style: {fill: "#F0EBFA"; stroke: "#C4B9D8"}
+
+    net: "Network\nWebDAV · OCS" {
+      style: {fill: "#F0EBFA"; stroke: "#C4B9D8"}
+    }
+    file: "File I/O\nscratch · blobs" {
+      style: {fill: "#F0EBFA"; stroke: "#C4B9D8"}
+    }
+    stream: "Streaming hydration\nasync GET → bounded channel → blocking writer\n(backpressure, and drop = real cancellation)" {
+      style: {fill: "#F0EBFA"; stroke: "#C4B9D8"}
+    }
+  }
+
+  syncer: "Syncer thread\nETag walk · notify_push" {
+    style: {fill: "#E9F6EE"; stroke: "#B7CBBE"}
+  }
+
+  dispatch -> fsm: "Job\n(mpsc)"
+  fsm -> db.readers: "DbRead job"
+  fsm -> db.writer: "DbWrite job"
+  fsm -> workers.net: "Net job"
+  fsm -> workers.file: "FileIo job"
+  fsm -> workers.stream: "Hydrate job\n+ AbortHandle"
+  db -> fsm: "Completion"
+  workers -> fsm: "Completion"
+  syncer -> db.writer: "reconcile\n(no second connection —\nno write-lock contention)"
+  syncer -> fsm: "invalidations"
+}
+
+storage: "Local storage — never on the network home" {
+  style: {fill: "#FBEAF0"; stroke: "#D8B6C4"}
+
+  sqlite: "state.sqlite (WAL)\npure cache · relocatable\nSQLite: WAL does not work over NFS/CIFS" {
+    style: {fill: "#FBEAF0"; stroke: "#D8B6C4"}
+  }
+  blobs: "Blob cache + scratch" {
+    style: {fill: "#FBEAF0"; stroke: "#D8B6C4"}
+  }
+}
+
+config: "The user's home  (may be NFS/CIFS)\nconfig.toml · credentials.json · pins.toml\nsmall, rarely read — user intent lives here, not in the DB" {
+  shape: rectangle
+  style: {fill: "#F4F5F9"; stroke: "#C6CBD6"}
+}
+
+server: "Nextcloud" {
+  shape: rectangle
+  style: {fill: "#EAF1FB"; stroke: "#B7BECC"}
+}
+
+kernel -> daemon.dispatch: "read/write/lookup/…"
+daemon.workers -> kernel: "reply — sent by whoever finishes,\nnever by the FSM thread"
+daemon.db -> storage.sqlite
+daemon.workers.file -> storage.blobs
+daemon.workers.stream -> storage.blobs
+daemon.workers.net -> server
+daemon.syncer -> server
+daemon.fsm -> config: "read at start,\nwritten on pin/unpin"
+daemon -> kernel: "notify_inval_entry\n(kernel cache coherence)"

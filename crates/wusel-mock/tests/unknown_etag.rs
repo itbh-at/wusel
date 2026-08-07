@@ -19,11 +19,7 @@ mod common;
 
 use std::sync::{Arc, Mutex};
 
-use wusel_core::config::Account;
 use wusel_core::desktop::{Desktop, Notice, Status};
-use wusel_core::provider::Provider;
-use wusel_core::state::StateDb;
-use wusel_core::webdav::WebDavClient;
 
 /// Records what the engine reports through the OS-integration seam.
 #[derive(Default)]
@@ -63,20 +59,11 @@ fn repeated_saves_survive_a_server_that_sends_no_etag() {
     let mock = common::Mock::serve(&fixture);
     let addr = mock.addr.clone();
 
-    let account = Account::new("default");
-    let dav = WebDavClient::new(
-        reqwest::Client::new(),
-        &format!("http://{addr}"),
-        "alice",
-        "pw",
-    );
-    std::fs::create_dir_all(account.state_db_path().parent().unwrap()).unwrap();
-    let state = StateDb::open(&account.state_db_path()).unwrap();
-    let mut provider = Provider::new(dav, state, &account).unwrap();
     let recorder = Arc::new(Recorder::default());
-    provider.set_desktop(recorder.clone());
+    // Before the substrate starts: its workers take a copy of this seam.
+    let mut engine = common::Engine::start_with(&addr, Some(recorder.clone()));
 
-    let node = provider
+    let node = engine
         .resolve("note.no-etag.txt")
         .unwrap()
         .expect("note.no-etag.txt");
@@ -84,12 +71,13 @@ fn repeated_saves_survive_a_server_that_sends_no_etag() {
 
     // First save: a normal conditional upload against the ETag we listed. It
     // succeeds, but the answer carries no ETag — so we lose track of the version.
-    provider.truncate(node.inode, 0).unwrap();
-    provider.write(node.inode, 0, b"first-edit").unwrap();
-    provider.flush(node.inode).unwrap();
+    engine.truncate(node.inode, 0).unwrap();
+    engine.write(node.inode, 0, b"first-edit").unwrap();
+    engine.flush(node.inode).unwrap();
+    engine.wait_for_uploads();
     assert_eq!(std::fs::read(&backing).unwrap(), b"first-edit");
 
-    let after_first = provider.node(node.inode).unwrap().expect("node survives");
+    let after_first = engine.stat(node.inode).expect("node survives");
     assert!(
         after_first.etag.is_empty(),
         "precondition of this test: with no ETag in the answer the stored ETag \
@@ -104,9 +92,10 @@ fn repeated_saves_survive_a_server_that_sends_no_etag() {
 
     // Second save of the very same file. Nothing changed on the server; this
     // must simply overwrite it.
-    provider.truncate(node.inode, 0).unwrap();
-    provider.write(node.inode, 0, b"second-edit").unwrap();
-    provider.flush(node.inode).unwrap();
+    engine.truncate(node.inode, 0).unwrap();
+    engine.write(node.inode, 0, b"second-edit").unwrap();
+    engine.flush(node.inode).unwrap();
+    engine.wait_for_uploads();
 
     assert_eq!(
         conflict_copies(&fixture),
@@ -128,7 +117,7 @@ fn repeated_saves_survive_a_server_that_sends_no_etag() {
     drop(notices);
 
     // The node is sane afterwards: still the same server file, correct size.
-    let after_second = provider.node(node.inode).unwrap().expect("node survives");
+    let after_second = engine.stat(node.inode).expect("node survives");
     assert_eq!(after_second.file_id, Some(file_id));
     assert_eq!(after_second.size, b"second-edit".len() as u64);
 

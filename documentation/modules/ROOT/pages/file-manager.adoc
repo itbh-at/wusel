@@ -40,8 +40,27 @@ getfattr -n user.wusel.state ~/Wusel/Photos/Birdie.jpg
 |`online-only` |No local copy yet; opening it fetches from the server (and caches).
 |`cached`      |Opened before: a whole copy is in the LRU cache, but evictable.
 |`pinned`      |Kept offline on purpose (pinned, or under a pinned dir/root).
+|`pinned-stale`|Pinned, but the copy we keep is out of date: the server has moved on.
 |`modified`    |A local edit not yet uploaded.
 |===
+
+Staleness is shown for pinned files only. For an ordinary cached file it just
+means the next read goes live, which is what a VFS does all day; a pin promises
+the file is there when the server is not, so an outdated copy is a promise
+half-kept and worth showing *before* someone opens it.
+
+Beside it sits an explicit **Update now** action — in the context menu when a
+`pinned-stale` file is selected, and as `wusel update <path>` on the command
+line. It fetches the current version *in place*: deliberately not "unpin, then
+pin again", which would drop the eviction marker first, so a re-download that
+failed would leave the file outdated **and** unprotected.
+
+Whether the user has to ask at all is `[sync] refresh_pinned` — `manual` (emblem
+only), `ask` (one notification when the backlog grows, naming the first file and
+counting the rest) or `auto` (fetch by itself, but only over an unmetered
+connection).
+See xref:concurrency.adoc#_the_policy_not_a_boolean[the policy] for what happens
+when the connection's cost cannot be established.
 
 The engine guarantees this read is local and network-free, so a file manager
 may query it for every visible file. Directories report a value only when
@@ -71,6 +90,7 @@ Adwaita has pruned its stock emblem set, so the extension ships its own icons
 |`online-only` |A cloud — lives on the server, not downloaded.
 |`cached`      |A cloud with a check — downloaded now, but still evictable.
 |`pinned`      |A green check — kept offline, always available.
+|`pinned-stale`|A green check with a warning — kept offline, but out of date.
 |`modified`    |An up-arrow — a local edit awaiting upload.
 |===
 

@@ -10,6 +10,44 @@ Symptom-oriented checklist, ordered by how often each case has bitten in
 practice. For the architecture behind these parts see
 xref:architecture.adoc[Architecture].
 
+== First stop: `wusel doctor`
+
+Before working through the cases below, run:
+
+[source,console]
+----
+$ wusel doctor
+----
+
+It gathers, in one pass, what a support case needs and what the sections below
+otherwise ask you to collect by hand: the running daemon and its per-thread
+kernel wait-channels, the mount table, the FUSE connection's `waiting` count, a
+timed check that the mountpoint still answers, the effective configuration, and
+— from the running daemon over a per-user socket — the engine's own view of what
+each object is doing. A `PASS`/`WARN`/`FAIL` summary sits on top; the headline
+check is the one that matters most, the `waiting` count held against the
+daemon's parked-reply total, which is the signature of a mount that has stopped
+answering.
+
+To send the result to us, write the bundle to files and attach them:
+
+[source,console]
+----
+$ wusel doctor -o wusel-doctor
+wrote wusel-doctor.txt and wusel-doctor.json
+----
+
+The report is **redacted by default** and safe to attach: the engine's view is
+name-free (it speaks in inode numbers, never file names), no directory of the
+mount is ever listed, no secret is read (only the server and login, never the
+password), and the home path and username are masked in the text. The header
+states exactly what is and is not redacted. `--no-logs` omits the journal tail;
+`--include-listing` turns redaction off for a consenting deep dive.
+
+Every probe is best-effort: one that cannot run says why, and the rest go on —
+so the report is still useful on a half-broken system, which is exactly when it
+is needed.
+
 == Where things have been tested
 
 [cols="1,1,2"]
@@ -147,6 +185,117 @@ server version stays, the local edit is saved as
 With `text_merge` enabled a clean 3-way merge is attempted first; it needs a
 cached base version of the file, otherwise it falls back to the conflicted
 copy.
+
+== A file shows an "uploading" or "sync-error" emblem
+
+Uploads are asynchronous by default: saving a file returns as soon as the change
+is safe on local disk, and the transfer to the server runs behind it. While it
+is on its way the file carries an *uploading* emblem; once it lands the emblem
+goes back to *cached*.
+
+A *sync-error* emblem means the upload was refused for good — most often wrong
+permissions on the target, a name conflict, or a full quota (see the
+`WARN … upload failed permanently` log line and the desktop notification). **The
+change is not lost**: the bytes are kept locally, and saving the file again
+re-tries the upload once the cause is fixed. Transient problems (the server
+briefly down, a dropped connection) are not shown as errors — they retry on
+their own until they land.
+
+To make saving wait for the upload and report its result directly — the
+pre-async behaviour — set `[sync] upload = sync` in `config.toml`.
+
+If it is *large* files in particular that fail (small ones upload fine), the
+cause is usually a reverse proxy mishandling the chunked-upload endpoint — see
+<<uploads-fail>>.
+
+`wusel doctor` (see <<_first_stop_wusel_doctor>>) lists any objects still owed to
+the server and how their uploads stand.
+
+[#uploads-fail]
+== Uploads fail, stall, or spawn conflicted copies
+
+Large files upload with Nextcloud's *chunked-upload* protocol: many small `PUT`s
+to `/remote.php/dav/uploads/`, then one assembling `MOVE`. Almost every upload
+problem seen in the field has been a *reverse proxy* in front of Nextcloud
+mishandling that endpoint — not wusel or Nextcloud themselves. Work through the
+client switches first (no server access needed); then, if you administer the
+server, the proxy checks.
+
+wusel already tolerates the most common proxy misbehaviour on its own: if the
+assembling `MOVE` returns an error (a proxy timeout surfaced as 403/5xx, or a
+WAF) but the file *did* assemble in full, the upload is counted as the success it
+is — no sync-error emblem, no conflicted copy. The switches below are for when
+uploads still fail or crawl.
+
+=== Client side (no server access needed)
+
+Force HTTP/1.1:: Some proxies drop or truncate HTTP/2 request bodies, so a chunk
+reaches Nextcloud as *0 bytes* — its log then reads `Expected file size of N
+bytes, but 0 bytes read`. HTTP/1.1 avoids this entirely. In `config.toml`:
++
+[source,toml]
+----
+[tls]
+http1_only = true
+----
++
+Concurrent reads still parallelise across the connection pool, so the only cost
+is a few more connections. **Try this first** — it fixes the widest class of
+proxy-induced upload failures without touching the server.
+
+Keep the 3-way merge off:: `[sync] text_merge` is off by default and best left
+off: it needs a cached base version of the file and can resolve surprisingly.
+Off, wusel behaves like the reference client — a conflict keeps both versions as
+a conflicted copy. Confirm `config.toml` has no `text_merge = true`.
+
+Make saving wait for the upload:: `[sync] upload = sync` makes write-back
+synchronous, so a save blocks until the upload lands and reports its real result
+at that moment instead of failing quietly in the background. Handy while
+diagnosing.
+
+Clean up stale conflicted copies:: repeated failed attempts can leave
+`name (conflicted copy …)` files; they hold nothing the original does not.
+Deleting them stops them confusing the picture (and, on the server, reclaims the
+space).
+
+=== Server side (if you administer the Nextcloud/proxy)
+
+The tell-tale is in Nextcloud's own log — `…/data/nextcloud.log`, or on Nextcloud
+AIO `docker exec nextcloud-aio-nextcloud tail -f /mnt/ncdata/nextcloud.log`:
+
+----
+Expected file size of N bytes, but 0 bytes read … and written …
+----
+
+That is the *request body being lost in the proxy* — the chunk left the client
+but arrived at Nextcloud empty. It hits *every* upload client (the official
+desktop client too), which is how you tell it apart from a wusel bug. Common
+causes, in the order worth trying — reload the proxy and re-test one large upload
+after each:
+
+. *Disable HTTP/3 (QUIC).* nginx's HTTP/3 has request-body bugs; comment out
+`http3 on;` and any `listen … quic` lines. Clients fall back to HTTP/2.
+. *Disable TLS 0-RTT.* `ssl_early_data on;` can lose or duplicate request bodies;
+comment it out.
+. *Response and request buffering are different directions — do not confuse
+them.* Keep `proxy_buffering off` (the *response* side: downloads, `Range`,
+streaming, WebSocket). Only if the two steps above did not help, turn the
+*request* side on: `proxy_request_buffering on;`. It makes the proxy read each
+chunk fully before forwarding, so Nextcloud never sees a half-body; with chunked
+upload the buffered pieces are small.
+. *No body-size cap, generous timeouts:* `client_max_body_size 0;` and e.g.
+`proxy_read_timeout 3600s;`.
+. *WAF / ModSecurity:* a rule that flags the long `MOVE`, or the `DELETE` of an
+upload folder, returns 403 — and a blocked `DELETE` leaves orphaned chunks in
+`/dav/uploads/` that slowly eat quota. Exempt `/remote.php/dav/uploads/` from
+body inspection.
+
+One 403 you can rule out immediately: the chunked-upload endpoint
+`/remote.php/dav/uploads/<user>/` requires the account's real *user id*, not a
+login alias such as an email — unlike `/dav/files/`, which accepts the alias.
+wusel resolves the user id itself (logged at startup as `resolved the DAV user
+id …`), so this is already handled; only if you reproduce with a hand-built URL,
+take the id from `occ user:list`, not the email.
 
 == Log levels — and turning debug on in production
 

@@ -1,0 +1,107 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 IT Beratung Hermann GmbH
+#
+# The read script (see pages/fsm-scripts.adoc).
+#
+# Render to a committed SVG with:  mise run docs-diagrams
+#
+# Four steps, one decision, three ways to answer. This is the operation the
+# whole design is measured against: it is the one that can run for minutes,
+# and the one a killed reader abandons.
+
+...@_steps
+
+vars: {
+  d2-config: {
+    layout-engine: elk
+  }
+}
+
+direction: down
+
+marker: "synthetic marker inode?" {
+  class: decide
+}
+m_ok: "Answer: empty\nmarkers carry no content" {
+  class: edge
+}
+
+off: "offset >= 0?" {
+  class: decide
+}
+bad: "Fail EINVAL" {
+  class: fail
+}
+
+row: "1 · DbRead  node_by_inode" {
+  class: db
+}
+unknown: "Fail — unknown inode, or a directory" {
+  class: fail
+}
+
+decide_src: "2 · decision only, no I/O\nwhere do these bytes come from?" {
+  class: decide
+}
+
+scratch: "3a · FileIo  read the scratch range\nan open write buffer wins: edits in progress are\nvisible at once, and a deferred create is readable\nbefore it has ever reached the server" {
+  class: io
+}
+
+blob: "3b · FileIo  read the blob range\nonly while the cached ETag still matches" {
+  class: io
+}
+
+net: "3c · Net  range GET\nonline-only: serve just this range, live" {
+  class: io
+}
+
+stream: "the whole file follows in one streamed GET,\nnot a range request per chunk — measured against a\nreal server as 1 GET where it used to be 32" {
+  class: io
+}
+
+gone: "404 — deleted on the server since we listed it" {
+  class: decide
+}
+prune: "DbWrite  remove_subtree\ndrop the node now, or a file manager sitting in\nthe directory keeps reading it and hammering 404s" {
+  class: db
+}
+estale: "Fail ESTALE — a stale handle, so the reader stops" {
+  class: fail
+}
+
+stale_pin: "planned: a pinned blob whose ETag no longer matches\nis served anyway when the server cannot be reached,\nand the user is told it is outdated.\nToday the read falls through to the live path and\nfails offline — the pin promise broken where it counts" {
+  class: planned
+}
+
+ok: "4 · Answer: the bytes\nthe inode is idle again" {
+  class: edge
+}
+
+join: "a second read of the same range joins the running\ntransfer: one fetch, two answers" {
+  class: decide
+}
+
+cancel: "a flush arriving while reads are still outstanding on\nthis handle means the reader is gone — abandon them.\nMeasured: flush arrives immediately, release does not" {
+  class: decide
+}
+
+marker -> m_ok: "yes"
+marker -> off: "no"
+off -> bad: "no"
+off -> row: "yes"
+row -> unknown: "None / is_dir"
+row -> decide_src: "Some(node)"
+decide_src -> scratch: "scratch open"
+decide_src -> blob: "cached and fresh"
+decide_src -> net: "otherwise"
+net -> stream: "" {style.stroke-dash: 3}
+net -> gone
+gone -> prune
+prune -> estale
+blob -> stale_pin: "" {style.stroke-dash: 3}
+scratch -> ok
+blob -> ok
+net -> ok
+net -> join: "" {style.stroke-dash: 3}
+net -> cancel: "" {style.stroke-dash: 3}

@@ -21,10 +21,7 @@
 
 mod common;
 
-use wusel_core::config::Account;
-use wusel_core::provider::{FileState, Provider};
-use wusel_core::state::{StateDb, ROOT_INODE};
-use wusel_core::webdav::WebDavClient;
+use wusel_core::state::ROOT_INODE;
 
 #[test]
 fn a_failed_promotion_upload_does_not_fail_the_rename() {
@@ -35,52 +32,40 @@ fn a_failed_promotion_upload_does_not_fail_the_rename() {
     std::fs::create_dir_all(&fixture).unwrap();
 
     common::xdg_sandbox(&base);
+    std::env::set_var("WUSEL_UPLOAD_RETRY_SECS", "1");
 
     let mock = common::Mock::serve(&fixture);
     let addr = mock.addr.clone();
 
-    let account = Account::new("default");
-    let dav = WebDavClient::new(
-        reqwest::Client::new(),
-        &format!("http://{addr}"),
-        "alice",
-        "pw",
-    );
-    std::fs::create_dir_all(account.state_db_path().parent().unwrap()).unwrap();
-    let state = StateDb::open(&account.state_db_path()).unwrap();
-    let mut provider = Provider::new(dav, state, &account).unwrap();
+    let engine = common::Engine::start(&addr);
 
     // A deferred create (no server identity yet) with some content.
-    let draft = provider.create(ROOT_INODE, "draft.txt").unwrap();
-    provider.write(draft.inode, 0, b"hello").unwrap();
+    let draft = engine.create(ROOT_INODE, "draft.txt").unwrap();
+    engine.write(draft.inode, 0, b"hello").unwrap();
 
     // Renaming it to a non-ignored name promotes it — the buffer is uploaded.
     // The destination carries the `.fail-once` marker, so that upload is
     // answered with a 500; the *rename* must still stand.
-    provider
+    engine
         .rename(ROOT_INODE, "draft.txt", ROOT_INODE, "report.fail-once")
-        .expect("the rename stands locally; the upload retries later");
-
-    assert!(
-        !fixture.join("report.fail-once").exists(),
-        "the rejected upload left nothing on the server"
-    );
-
-    let node = provider.node(draft.inode).unwrap().unwrap();
+        .expect("the rename stands locally — the upload is asynchronous");
+    let node = engine.stat(draft.inode).unwrap();
     assert_eq!(node.name, "report.fail-once", "the local rename committed");
     assert_eq!(node.path, "report.fail-once");
-    assert_eq!(
-        provider.file_state(draft.inode).unwrap(),
-        Some(FileState::Modified),
-        "the write buffer is kept, so the next flush retries the upload"
-    );
 
-    // And the retry does reach the server — the content was never at risk.
-    provider.flush(draft.inode).unwrap();
+    // The promotion upload runs behind the rename and hits the injected 500 — a
+    // transient failure — so it is retried automatically and lands under the new
+    // name. The rename never failed and the content was never at risk.
+    engine.wait_for_uploads();
     assert_eq!(
         std::fs::read(fixture.join("report.fail-once")).unwrap(),
         b"hello",
-        "the deferred flush uploads the buffer under the new name"
+        "the promotion upload reaches the server under the new name"
+    );
+    assert_eq!(
+        engine.upload_state(draft.inode),
+        None,
+        "and the pending record is cleared once it lands"
     );
 
     std::fs::remove_dir_all(&base).ok();

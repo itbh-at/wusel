@@ -1,0 +1,145 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 IT Beratung Hermann GmbH
+#
+# The rename script — two branches that share almost nothing
+# (see pages/fsm-scripts.adoc).
+#
+# Render to a committed SVG with:  mise run docs-diagrams
+#
+# This is the office-suite atomic save: write an ignored temporary file, then
+# rename it onto the real document. Everything unusual in the left branch is
+# there because that sequence has to come out right.
+
+...@_steps
+
+vars: {
+  d2-config: {
+    layout-engine: elk
+  }
+}
+
+direction: down
+
+utf8: "both names valid UTF-8?" {
+  class: decide
+}
+bad: "Fail EINVAL" {
+  class: fail
+}
+
+row: "DbRead  child_by_name(source)" {
+  class: db
+}
+miss: "Fail — no such entry" {
+  class: fail
+}
+
+epoch: "invalidate in-flight listings\nthe membership of one or two directories changes" {
+  class: decide
+}
+
+branch: "does the source exist on the server?" {
+  class: decide
+}
+
+promote: "Local file, not yet on the server — the atomic save" {
+  class: decide
+
+  taken: "is the destination name taken locally?" {
+    class: decide
+  }
+  free: "FileIo  drop the replaced file's buffer\nDbWrite  its eviction markers and rows" {
+    class: db
+  }
+  adopt: "adopt the replaced file's ETag as our base version\nso the upload below asserts If-Match: that version —\na safe replace that only conflicts on a *concurrent*\nserver change. Uploading with If-None-Match: * instead\nwould flag the document being replaced as a conflict\nand bury the save in a conflicted copy" {
+    class: decide
+  }
+  mv: "DbWrite  rename the row" {
+    class: db
+  }
+  ign: "is the new name ephemeral too?" {
+    class: decide
+  }
+  stay: "stays local-only" {
+    class: state
+  }
+  dirty: "mark the buffer dirty — the file must now\nexist on the server under the new name" {
+    class: state
+  }
+  flush: "schedule a publish on the moved object\nIt is scheduled, not run here: the local rename is\nalready committed, so a failed upload must not make\nthe rename report failure" {
+    class: decide
+  }
+  ok: "Answer OK — the upload follows on its own" {
+    class: edge
+  }
+  why: "A failed upload must not fail the rename. The local\nrename is already committed, so reporting failure would\ntell the kernel the rename never happened while our\nstate says it did — and its dentry cache would stay out\nof step for good. It is also the wrong answer for the\nuser: here EIO reads as your document could not be\nsaved, although the content is safe in the buffer and\nonly the upload is outstanding. It is retried by the\nnext flush, and the failure was already reported" {
+    class: decide
+  }
+
+  taken -> free: "yes"
+  taken -> mv: "no"
+  free -> adopt
+  adopt -> mv
+  mv -> ign
+  ign -> stay: "yes"
+  ign -> dirty: "no"
+  stay -> ok
+  dirty -> flush
+  flush -> ok
+  flush -> why: "" {style.stroke-dash: 3}
+}
+
+server: "A real server file" {
+  class: decide
+
+  dst: "DbRead  the destination parent's path" {
+    class: db
+  }
+  mv: "Net  MOVE, overwrite allowed" {
+    class: io
+  }
+  replaced: "did it replace a destination we knew?" {
+    class: decide
+  }
+  mirror: "FileIo  drop that file's buffer\nDbWrite  remove its rows — mirroring\nwhat the MOVE just did on the server" {
+    class: db
+  }
+  move_rows: "DbWrite  move the row and its subtree's paths" {
+    class: db
+  }
+  why: "Moved, not deleted and re-inserted by the reconcile\nbelow: that keeps the inode alive, so open file handles\nand a pending write buffer keyed by it survive the\nrename. A dropped buffer would silently lose the edit" {
+    class: decide
+  }
+  reload: "Net  PROPFIND the old parent —\nand the new one, when it differs" {
+    class: io
+  }
+  reconcile: "DbWrite  reconcile_children" {
+    class: db
+  }
+  ok: "Answer OK" {
+    class: edge
+  }
+
+  dst -> mv
+  mv -> replaced
+  replaced -> mirror: "yes"
+  replaced -> move_rows: "no"
+  mirror -> move_rows
+  move_rows -> reload
+  move_rows -> why: "" {style.stroke-dash: 3}
+  reload -> reconcile
+  reconcile -> ok
+}
+
+queue: "A running upload of this file does not get aborted —\nthe rename queues behind it. Aborting mid-upload can\nleave half an object on the server, and for the atomic\nsave the ordering is the whole point" {
+  class: decide
+}
+
+utf8 -> bad: "no"
+utf8 -> row: "yes"
+row -> miss: "None"
+row -> epoch: "Some"
+epoch -> branch
+branch -> promote: "no — deferred create"
+branch -> server: "yes"
+epoch -> queue: "" {style.stroke-dash: 3}

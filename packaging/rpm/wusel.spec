@@ -92,6 +92,36 @@ fi
 # with no system-wide preset to apply; each user enables their own instance.
 
 %changelog
+* Sat Aug 01 2026 Christoph D. Hermann <christoph.hermann@itbh.at> - 0.2.0-1
+- See the Changelog page in the documentation for the full notes; in brief:
+- Concurrency: every FUSE callback is now an intent handed to a state machine
+  that decides and performs no I/O, with database readers, a single writer, and
+  network and file pools underneath. 0.1.0 served one request at a time.
+- Whole-file hydration is a single streamed GET instead of one range GET per
+  chunk.
+- Atomic saves (GNOME Text Editor and anything on g_file_replace) work: a rename
+  replaces its destination and inherits its server identity, instead of failing
+  with EIO and then producing a conflicted copy.
+- A background listing refresh no longer makes the next caller wait for it.
+- The file-manager emblem changes on every route: a file arriving in the cache
+  (read, hydration or write) and a file leaving it (eviction, unpin) are both
+  announced.
+- The kernel is told when a file's content changed on the server, so reopening
+  shows the current version rather than a cached one.
+- A failed operation says what failed in the log, not only an errno.
+- Pins live in <config>/pins.json instead of the state database: they survive
+  `cache clear`, a rebuilt database, and a roaming home directory.
+- The state database is moved off NFS/CIFS to local storage, loudly, because
+  SQLite cannot lock reliably there; override with [state] db_path.
+- Stale pinned files: a fifth state, an "Update now" action, and
+  [sync] refresh_pinned = manual | ask | auto, where auto fetches only on an
+  unmetered connection.
+- [sync] open_pinned = newest | newest-unmetered | offline chooses what opening
+  an outdated pinned file serves; an outdated offline copy is read-only.
+- A pinned file stays readable when the server is unreachable, even if its copy
+  is out of date.
+- Nautilus context-menu entries are prefixed "Wusel - ".
+
 * Tue Jul 28 2026 Christoph D. Hermann <christoph.hermann@itbh.at> - 0.1.0-1
 - First public release: VFS-first Nextcloud mount (online-only, on-demand
   hydration, caching, pinning, write-back) with the GNOME desktop integration

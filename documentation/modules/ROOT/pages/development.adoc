@@ -102,6 +102,28 @@ checkout — there is no separate CI script to keep in sync.
 Before pushing, `mise run fmt-check`, `mise run clippy`, `mise run check` and
 `mise run test` reproduce the CI job locally.
 
+== Documentation diagrams
+
+The diagrams under `documentation/diagrams/*.d2` are rendered to **committed**
+SVGs, and the docs build embeds those — it never runs `d2`, which is why the
+Pages workflow installs nothing but antora. The workflow after editing one:
+
+[source,bash]
+----
+mise run docs-diagrams        # re-render, then commit the changed SVGs
+----
+
+Forgetting that step used to be invisible: the site would build green and ship a
+picture that no longer matched the page around it. It is now caught, and without
+adding a `d2` dependency to the build — `mise run docs-diagrams` records the
+hash of every source in `diagrams/rendered.sha256`, and
+`documentation/check-diagrams.sh` compares them. The docs build calls it
+(refusing an official build, warning in `watch` mode), so CI does too.
+
+Sources beginning with an underscore are shared partials imported with
+`...@name`, not diagrams — they are not rendered, but they *are* hashed, since a
+change to `_steps.d2` invalidates every diagram that imports it.
+
 == Mounting on Linux (podman container)
 
 FUSE needs a kernel driver → Linux container with `/dev/fuse`:
@@ -150,6 +172,13 @@ podman machine ssh "sudo mkdir -p /var/mnt/<disk> && \
   echo '<tag> /var/mnt/<disk> virtiofs rw,nofail,context=system_u:object_r:nfs_t:s0 0 0' \
   | sudo tee -a /etc/fstab && sudo systemctl daemon-reload && sudo mount /var/mnt/<disk>"
 ----
+
+TIP: The VM's disk is a *sparse* file: it grows as data is written and does not
+shrink when files inside are deleted, so `podman system prune` alone leaves the
+host file at its high-water mark. To hand the space back, trim inside the guest:
+`podman machine ssh "sudo fstrim -av"`. If a container build ever fails, check
+`/var/tmp` in the guest too — podman leaves the unpacked build context behind
+and nothing collects it.
 
 `podman machine init` recreates the VM from scratch — redo both steps then (the
 scripts fall back to mirroring automatically until you do).

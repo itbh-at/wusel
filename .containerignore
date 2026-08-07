@@ -1,0 +1,45 @@
+# Build context for `podman build` (Containerfile and packaging/rpm/Containerfile).
+#
+# Why this file matters more than it looks. Both Containerfiles copy exactly one
+# file — `mise.toml` — but podman transfers the *whole* context into the VM and
+# unpacks it there before the first instruction runs. Without the exclusions
+# below that is every build artefact in the working tree: `target/`,
+# `target-linux/`, `target-rpm/` and `dist/` are gigabytes each.
+#
+# This went unnoticed for a long time because the podman scripts usually work on
+# an rsync mirror (see scripts/podman-lib.sh), and rsync excludes the same
+# directories. On the *direct* disk share — the faster path, and the one the
+# development docs recommend — the full context is sent instead. A failed build
+# then leaves its half-unpacked copy behind in the VM's /var/tmp, where nothing
+# ever collects it: one such leftover filled 31 GB.
+#
+# Keep this list in step with .gitignore's build-output entries.
+
+# Rust build output
+/target
+/target-linux
+/target-rpm
+
+# RPM build output
+/dist
+
+# Version control — never needed by a build that copies one file
+/.git
+
+# Antora build output
+/documentation/build
+
+# Claude Code working dirs (agent worktrees, machine-local settings)
+/.claude
+
+# Editor/OS leftovers
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
+*.orig
+*.rej
+
+# Native Nautilus extension build output
+/integration/nautilus/*.so

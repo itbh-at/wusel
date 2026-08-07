@@ -15,11 +15,6 @@ mod common;
 
 use std::time::UNIX_EPOCH;
 
-use wusel_core::config::Account;
-use wusel_core::provider::Provider;
-use wusel_core::state::StateDb;
-use wusel_core::webdav::WebDavClient;
-
 /// A file's mtime as signed unix seconds. `SystemTime` has no signed accessor:
 /// `duration_since(UNIX_EPOCH)` errors for pre-epoch times and hands the
 /// magnitude back inside the error, so the sign has to be reconstructed.
@@ -47,24 +42,20 @@ fn setattr_mtime_is_propagated_on_upload() {
     let mock = common::Mock::serve(&fixture);
     let addr = mock.addr.clone();
 
-    let account = Account::new("default");
-    let dav = WebDavClient::new(
-        reqwest::Client::new(),
-        &format!("http://{addr}"),
-        "alice",
-        "pw",
-    );
-    std::fs::create_dir_all(account.state_db_path().parent().unwrap()).unwrap();
-    let state = StateDb::open(&account.state_db_path()).unwrap();
-    let mut provider = Provider::new(dav, state, &account).unwrap();
+    let mut engine = common::Engine::start(&addr);
 
-    let node = provider.resolve("note.txt").unwrap().expect("note.txt");
+    let node = engine
+        .provider()
+        .resolve("note.txt")
+        .unwrap()
+        .expect("note.txt");
 
     // A specific past timestamp (2020-09-13T12:26:40Z).
     let target = 1_600_000_000i64;
-    provider.write(node.inode, 0, b"edited").unwrap();
-    provider.set_mtime(node.inode, target).unwrap();
-    provider.flush(node.inode).unwrap();
+    engine.write(node.inode, 0, b"edited").unwrap();
+    engine.set_mtime(node.inode, target).unwrap();
+    engine.flush(node.inode).unwrap();
+    engine.wait_for_uploads();
 
     assert_eq!(
         mtime_secs(&backing),
@@ -76,13 +67,11 @@ fn setattr_mtime_is_propagated_on_upload() {
     // The mock used to convert `X-OC-Mtime` through `u64::try_from` and discard
     // the error, so a negative value left the file's own mtime untouched.
     let pre_epoch = -445_824_000i64;
-    let old = provider
-        .resolve("scanned.txt")
-        .unwrap()
-        .expect("scanned.txt");
-    provider.write(old.inode, 0, b"edited").unwrap();
-    provider.set_mtime(old.inode, pre_epoch).unwrap();
-    provider.flush(old.inode).unwrap();
+    let old = engine.resolve("scanned.txt").unwrap().expect("scanned.txt");
+    engine.write(old.inode, 0, b"edited").unwrap();
+    engine.set_mtime(old.inode, pre_epoch).unwrap();
+    engine.flush(old.inode).unwrap();
+    engine.wait_for_uploads();
 
     assert_eq!(
         mtime_secs(&old_backing),

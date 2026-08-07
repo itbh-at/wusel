@@ -14,6 +14,7 @@
 //! The FUSE layer holds no state itself — everything lives here, transactionally.
 
 use rusqlite::{Connection, OptionalExtension};
+use wusel_fsm::ObjectId;
 
 use crate::model::{basename, RemoteEntry};
 use crate::Result;
@@ -39,6 +40,27 @@ impl StateDb {
         let db = Self { conn };
         db.init_schema()?;
         Ok(db)
+    }
+
+    /// Attach another connection to a database that already exists.
+    ///
+    /// [`Self::open`] ends in `init_schema`, which is DDL and therefore needs
+    /// the write lock. That is right for the one connection that establishes
+    /// the database and wrong for every later one: a worker opened that way
+    /// cannot start while anybody holds a write transaction, and would sit out
+    /// the busy timeout to run statements whose only effect is `IF NOT EXISTS`.
+    ///
+    /// `journal_mode` is left alone for the same reason — it is a property of
+    /// the file, set by whoever created it, and setting it again is at best a
+    /// no-op and at worst a write.
+    ///
+    /// # Errors
+    /// If the database cannot be opened.
+    pub fn open_existing(path: &std::path::Path) -> Result<Self> {
+        let conn = Connection::open(path)?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        Ok(Self { conn })
     }
 
     /// In-memory DB for tests.
@@ -72,13 +94,19 @@ impl StateDb {
             );
             CREATE INDEX IF NOT EXISTS idx_nodes_parent ON nodes(parent);
 
-            -- Pins ("always keep offline"): a path plus whether it is a directory.
-            -- Path-based (not per-inode) so a pin survives reconciliation and a
-            -- directory pin covers its whole subtree, including entries not yet
-            -- listed. The empty path is the account root — pinning it means "all".
-            CREATE TABLE IF NOT EXISTS pins (
-                path   TEXT PRIMARY KEY,
-                is_dir INTEGER NOT NULL DEFAULT 0
+            -- Local changes committed on close but not yet on the server, so an
+            -- asynchronous upload survives a crash or restart. Keyed by the
+            -- object (its value is the node inode), with the upload target stored
+            -- *explicitly* rather than re-derived — a later rename moves this
+            -- path, and re-walking the tree at upload time could disagree.
+            CREATE TABLE IF NOT EXISTS pending_uploads (
+                object_id   INTEGER PRIMARY KEY,
+                remote_path TEXT    NOT NULL,
+                base_etag   TEXT    NOT NULL DEFAULT '',  -- precondition; '' = must-not-exist
+                mtime       INTEGER,                      -- X-OC-Mtime to send, if set
+                state       TEXT    NOT NULL DEFAULT 'pending',  -- pending | uploading | error
+                attempts    INTEGER NOT NULL DEFAULT 0,
+                last_error  TEXT
             );
 
             -- Create the root node idempotently.
@@ -364,10 +392,16 @@ impl StateDb {
     /// Descendant paths are rewritten iteratively via the parent links (no
     /// `LIKE` on the old prefix, so names containing `%`/`_` are safe).
     ///
-    /// Pins move with the subtree (see `move_pins`) — a rename must not quietly
-    /// end a "keep offline" promise. A move **into the node's own subtree** is
-    /// refused (see `descends_from`).
-    pub fn move_subtree(&mut self, inode: u64, new_parent: u64, new_name: &str) -> Result<()> {
+    /// Returns `(old_path, new_path)`: pins are keyed by path and live outside
+    /// this database ([`crate::pins`]), so the caller is the one that can carry
+    /// them over — a rename must not quietly end a "keep offline" promise. A
+    /// move **into the node's own subtree** is refused (see `descends_from`).
+    pub fn move_subtree(
+        &mut self,
+        inode: u64,
+        new_parent: u64,
+        new_name: &str,
+    ) -> Result<(String, String)> {
         let tx = self.conn.transaction()?;
         // A cyclic parent link would make the rewrite walk below push children
         // forever (it would never pop its way out), so this is not a nicety: it
@@ -393,7 +427,25 @@ impl StateDb {
         } else {
             format!("{parent_path}/{new_name}")
         };
-        move_pins(&tx, &old_path, &path)?;
+        // Kept for the answer: the subtree rewrite below consumes `path`.
+        let new_path = path.clone();
+        // `rename(2)` replaces its destination, and `nodes` has UNIQUE(parent,
+        // name) — so an occupant has to go first or the UPDATE below fails the
+        // constraint. That is not an exotic case: every atomic save (GNOME's
+        // .goutputstream-*, LibreOffice's temporaries) renames onto the file
+        // being saved, and the failure surfaced as EIO on Ctrl+S.
+        let occupant: Option<(u64, Option<u64>, String, String)> = tx
+            .query_row(
+                "SELECT inode, file_id, etag, permissions FROM nodes
+                 WHERE parent = ?1 AND name = ?2 AND inode != ?3",
+                rusqlite::params![new_parent, new_name, inode],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        if let Some((old_inode, file_id, etag, permissions)) = &occupant {
+            delete_subtree(&tx, *old_inode)?;
+            let _ = (file_id, etag, permissions);
+        }
         tx.execute(
             "UPDATE nodes SET parent = ?2, name = ?3, path = ?4 WHERE inode = ?1",
             rusqlite::params![inode, new_parent, new_name, path],
@@ -428,8 +480,26 @@ impl StateDb {
                 }
             }
         }
+        // Whoever replaces a file takes over its identity on the server: same
+        // remote resource, new contents. Only when the mover has none of its
+        // own — a server-side MOVE has already settled that case, and the
+        // resource that survives there is the one that moved.
+        //
+        // Without this, an atomic save uploads as a *creation*: the machine
+        // asserts "must not exist", the server answers 412 because the file it
+        // is replacing is still there, and the user's save lands in a
+        // "(conflicted copy)" instead of in their document. Inheriting the ETag
+        // turns it into the ordinary overwrite it is — while still asserting
+        // something, so a genuine server-side change in between is still caught.
+        if let Some((_, file_id, etag, permissions)) = occupant {
+            tx.execute(
+                "UPDATE nodes SET file_id = ?2, etag = ?3, permissions = ?4
+                 WHERE inode = ?1 AND file_id IS NULL",
+                rusqlite::params![inode, file_id, etag, permissions],
+            )?;
+        }
         tx.commit()?;
-        Ok(())
+        Ok((old_path, new_path))
     }
 
     /// Delete every file node that was never materialised on the server (no file
@@ -439,8 +509,13 @@ impl StateDb {
     /// file-id-less nodes). Directories are untouched (they always have a file id
     /// once listed; the root has none but is excluded).
     pub fn remove_unmaterialized_files(&self) -> Result<()> {
+        // A never-materialised file with a pending upload is a deferred create
+        // committed on close but not yet sent — the async write-back must keep
+        // it, or the change is lost at the next start.
         self.conn.execute(
-            "DELETE FROM nodes WHERE file_id IS NULL AND is_dir = 0 AND inode != ?1",
+            "DELETE FROM nodes
+             WHERE file_id IS NULL AND is_dir = 0 AND inode != ?1
+               AND inode NOT IN (SELECT object_id FROM pending_uploads)",
             [ROOT_INODE],
         )?;
         Ok(())
@@ -509,81 +584,120 @@ impl StateDb {
         Ok(())
     }
 
-    // --- Pins ("always keep offline") ---------------------------------------
+    // --- Pending uploads (asynchronous write-back) --------------------------
 
-    /// Record a pin on `path` (empty string = the account root).
-    pub fn set_pin(&self, path: &str, is_dir: bool) -> Result<()> {
+    /// Record that an object has local content to upload, replacing any earlier
+    /// record for it. Resets the state to `pending` and the attempt count: this
+    /// is a fresh commit (a new close), so whatever the last attempt was, the
+    /// bytes have changed and the uploader should start over.
+    pub fn mark_pending_upload(
+        &self,
+        object: ObjectId,
+        remote_path: &str,
+        base_etag: &str,
+        mtime: Option<i64>,
+    ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO pins(path, is_dir) VALUES(?1, ?2)
-             ON CONFLICT(path) DO UPDATE SET is_dir = excluded.is_dir",
-            rusqlite::params![path.trim_matches('/'), is_dir as i64],
+            "INSERT INTO pending_uploads(object_id, remote_path, base_etag, mtime, state, attempts, last_error)
+             VALUES (?1, ?2, ?3, ?4, 'pending', 0, NULL)
+             ON CONFLICT(object_id) DO UPDATE SET
+                 remote_path = excluded.remote_path,
+                 base_etag   = excluded.base_etag,
+                 mtime       = excluded.mtime,
+                 state       = 'pending',
+                 attempts    = 0,
+                 last_error  = NULL",
+            rusqlite::params![object.0 as i64, remote_path, base_etag, mtime],
         )?;
         Ok(())
     }
 
-    /// Remove a pin on exactly `path` (does not touch pins on its subtree).
-    pub fn remove_pin(&self, path: &str) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM pins WHERE path = ?1", [path.trim_matches('/')])?;
+    /// Every pending upload, for the uploader to work through and for resume at
+    /// start-up. Ordered by object so the walk is deterministic.
+    pub fn pending_uploads(&self) -> Result<Vec<PendingUpload>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT object_id, remote_path, base_etag, mtime, state, attempts, last_error
+             FROM pending_uploads ORDER BY object_id",
+        )?;
+        let rows = stmt.query_map([], PendingUpload::from_row)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// One object's pending upload, if it has one.
+    pub fn pending_upload(&self, object: ObjectId) -> Result<Option<PendingUpload>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT object_id, remote_path, base_etag, mtime, state, attempts, last_error
+                 FROM pending_uploads WHERE object_id = ?1",
+                rusqlite::params![object.0 as i64],
+                PendingUpload::from_row,
+            )
+            .optional()?)
+    }
+
+    /// Move an object's state, recording (or clearing) the last error with it.
+    pub fn set_upload_state(
+        &self,
+        object: ObjectId,
+        state: UploadState,
+        last_error: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE pending_uploads SET state = ?2, last_error = ?3 WHERE object_id = ?1",
+            rusqlite::params![object.0 as i64, state.as_str(), last_error],
+        )?;
         Ok(())
     }
 
-    /// Drop the pin on `path` **and every pin below it**, returning how many were
-    /// removed. For a subtree that no longer exists (a delete): its "keep
-    /// offline" promises are void, and a pin left behind would keep protecting
-    /// the dead files' cache blobs from eviction forever. Component-aware, so
-    /// removing `Photos` leaves `Photos2` alone. The empty path is the account
-    /// root and clears everything.
-    pub fn remove_pins_under(&self, path: &str) -> Result<usize> {
-        let path = path.trim_matches('/');
-        if path.is_empty() {
-            return Ok(self.conn.execute("DELETE FROM pins", [])?);
-        }
-        let doomed = pins_under(&self.conn, path)?;
-        for (pin, _) in &doomed {
-            self.conn
-                .execute("DELETE FROM pins WHERE path = ?1", [pin])?;
-        }
-        Ok(doomed.len())
+    /// Count a failed attempt, so a backoff has something to grow on.
+    pub fn bump_upload_attempt(&self, object: ObjectId) -> Result<()> {
+        self.conn.execute(
+            "UPDATE pending_uploads SET attempts = attempts + 1 WHERE object_id = ?1",
+            rusqlite::params![object.0 as i64],
+        )?;
+        Ok(())
     }
 
-    /// Whether `path` is kept offline: pinned itself, under a pinned directory,
-    /// or covered by a root pin.
+    /// Follow a rename: the same bytes now belong at a new path. This is what
+    /// keeps the office-suite atomic save correct — the buffer committed under
+    /// the temporary name uploads to the document it was renamed onto.
+    pub fn move_pending_upload(&self, object: ObjectId, new_remote_path: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE pending_uploads SET remote_path = ?2 WHERE object_id = ?1",
+            rusqlite::params![object.0 as i64, new_remote_path],
+        )?;
+        Ok(())
+    }
+
+    /// The upload landed (or the object was removed): forget the record.
+    pub fn clear_pending_upload(&self, object: ObjectId) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM pending_uploads WHERE object_id = ?1",
+            rusqlite::params![object.0 as i64],
+        )?;
+        Ok(())
+    }
+
+    // --- Pins ("always keep offline") ---------------------------------------
+
+    /// The pins of a database written before they moved into their own file.
     ///
-    /// This runs once per **visible entry** whenever a file manager draws a
-    /// directory (via `Provider::file_state`), so it must not scan the pins table
-    /// or allocate per row. Instead it asks the primary key directly — once for
-    /// the path itself, then once per ancestor prefix (a borrowed slice, no
-    /// `format!`), then for the root pin. That is a handful of indexed lookups
-    /// bounded by the path's depth, whatever the number of pins.
-    pub fn is_pinned(&self, path: &str) -> Result<bool> {
-        let path = path.trim_matches('/');
-        let mut stmt = self
-            .conn
-            .prepare_cached("SELECT is_dir FROM pins WHERE path = ?1")?;
-        /// The pin on exactly `p`, if any: `Some(is_dir)`.
-        fn pin_at(stmt: &mut rusqlite::CachedStatement, p: &str) -> Result<Option<bool>> {
-            Ok(stmt
-                .query_row([p], |r| r.get::<_, i64>(0))
-                .optional()?
-                .map(|v| v != 0))
+    /// Only the migration calls this. A database created by this version has no
+    /// such table at all, which is not an error but the ordinary answer: there
+    /// is nothing to take over.
+    ///
+    /// # Errors
+    /// If the table exists but cannot be read.
+    pub fn legacy_pins(&self) -> Result<Vec<(String, bool)>> {
+        let exists: bool = self.conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'pins'",
+            [],
+            |r| Ok(r.get::<_, i64>(0)? > 0),
+        )?;
+        if !exists {
+            return Ok(Vec::new());
         }
-        // A pin on the entry itself counts whatever kind it is …
-        if pin_at(&mut stmt, path)?.is_some() {
-            return Ok(true);
-        }
-        // … an ancestor only if it is a *directory* pin (its subtree).
-        for (i, _) in path.match_indices('/') {
-            if pin_at(&mut stmt, &path[..i])? == Some(true) {
-                return Ok(true);
-            }
-        }
-        // The root pin ("") is the legacy "keep everything offline".
-        Ok(pin_at(&mut stmt, "")? == Some(true))
-    }
-
-    /// All pins as `(path, is_dir)`.
-    pub fn pins(&self) -> Result<Vec<(String, bool)>> {
         let mut stmt = self
             .conn
             .prepare("SELECT path, is_dir FROM pins ORDER BY path")?;
@@ -593,6 +707,22 @@ impl StateDb {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// The node a cache blob belongs to, by its server file id.
+    ///
+    /// Used to turn an eviction — which knows only the blob's name — back into
+    /// something a person can be shown. Rare enough that a scan would do; the
+    /// column is indexed anyway because reconcile matches on it.
+    ///
+    /// # Errors
+    /// If the state cannot be read.
+    pub fn node_by_file_id(&self, file_id: u64) -> Result<Option<NodeRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT inode, parent, name, path, is_dir, size, etag, mtime, file_id, permissions
+             FROM nodes WHERE file_id = ?1",
+        )?;
+        Ok(stmt.query_row([file_id], NodeRow::from_row).optional()?)
     }
 
     /// `(path, file_id)` for known nodes at/under `path` that have a file id.
@@ -651,52 +781,6 @@ fn descends_from(tx: &rusqlite::Transaction, inode: u64, ancestor: u64) -> Resul
 /// Pins at or below `path` as `(path, is_dir)`. Filtered by **path component**
 /// in Rust (`Photos` must not catch `Photos2`) and without `LIKE`, so names
 /// containing `%`/`_` are safe. `path` must be non-empty and already trimmed.
-fn pins_under(conn: &Connection, path: &str) -> Result<Vec<(String, bool)>> {
-    let prefix = format!("{path}/");
-    let mut stmt = conn.prepare("SELECT path, is_dir FROM pins")?;
-    let rows = stmt.query_map([], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? != 0))
-    })?;
-    let mut out = Vec::new();
-    for row in rows {
-        let (pin, is_dir) = row?;
-        if pin == path || pin.starts_with(&prefix) {
-            out.push((pin, is_dir));
-        }
-    }
-    Ok(out)
-}
-
-/// Rewrite every pin at or below `old_path` onto `new_path`, so a rename carries
-/// the "keep offline" promise with it. Without this, renaming a pinned directory
-/// silently unpins it: [`StateDb::is_pinned`] is path-keyed, so it answers `false`
-/// for the new path — newly added files are never hydrated, the file manager
-/// shows the wrong emblem, and the stale `.pin` markers keep their blobs out of
-/// the cache budget forever.
-fn move_pins(tx: &rusqlite::Transaction, old_path: &str, new_path: &str) -> Result<()> {
-    if old_path.is_empty() || old_path == new_path {
-        return Ok(()); // the root never moves, and a no-op move changes nothing
-    }
-    let moved = pins_under(tx, old_path)?;
-    // Delete first, then insert: the destination may itself carry a pin (a
-    // rename that overwrites), and doing it in two passes keeps that from
-    // depending on the order rows come back in.
-    for (pin, _) in &moved {
-        tx.execute("DELETE FROM pins WHERE path = ?1", [pin])?;
-    }
-    for (pin, is_dir) in &moved {
-        // The remainder is either empty (the moved node itself) or starts with
-        // the separator, so simple concatenation rebuilds the path.
-        let rest = &pin[old_path.len()..];
-        tx.execute(
-            "INSERT INTO pins(path, is_dir) VALUES(?1, ?2)
-             ON CONFLICT(path) DO UPDATE SET is_dir = excluded.is_dir",
-            rusqlite::params![format!("{new_path}{rest}"), *is_dir as i64],
-        )?;
-    }
-    Ok(())
-}
-
 /// Delete `inode` and its entire subtree, iteratively and by inode (no `LIKE`,
 /// so file names containing `%` or `_` are safe). Returns the rows deleted.
 fn delete_subtree(tx: &rusqlite::Transaction, inode: u64) -> Result<usize> {
@@ -723,6 +807,70 @@ fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Where an asynchronous upload stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UploadState {
+    /// Committed locally, waiting for the uploader.
+    Pending,
+    /// The uploader has it in flight.
+    Uploading,
+    /// Given up after a *permanent* failure (wrong permissions, a conflict, no
+    /// quota); the bytes are still in the buffer, and the user has been told.
+    Error,
+}
+
+impl UploadState {
+    fn as_str(self) -> &'static str {
+        match self {
+            UploadState::Pending => "pending",
+            UploadState::Uploading => "uploading",
+            UploadState::Error => "error",
+        }
+    }
+
+    /// An unknown value from a newer version is read as `pending` — the safe
+    /// reading, since it only means the uploader will look at it again.
+    fn from_str(s: &str) -> Self {
+        match s {
+            "uploading" => UploadState::Uploading,
+            "error" => UploadState::Error,
+            _ => UploadState::Pending,
+        }
+    }
+}
+
+/// A local change committed on close but not yet on the server — the durable
+/// record that makes an asynchronous upload survive a crash. Its precondition
+/// (`base_etag`) lives here, not only in memory, so a resumed upload is still a
+/// *conditional* one and cannot silently overwrite a newer server version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingUpload {
+    pub object: ObjectId,
+    /// The upload target, account-relative — stored, not re-derived.
+    pub remote_path: String,
+    /// The version the edit is based on; empty means "must not exist yet".
+    pub base_etag: String,
+    /// A modification time to send as `X-OC-Mtime`, if one was set.
+    pub mtime: Option<i64>,
+    pub state: UploadState,
+    pub attempts: u32,
+    pub last_error: Option<String>,
+}
+
+impl PendingUpload {
+    fn from_row(row: &rusqlite::Row) -> rusqlite::Result<Self> {
+        Ok(PendingUpload {
+            object: ObjectId(row.get::<_, i64>(0)? as u64),
+            remote_path: row.get(1)?,
+            base_etag: row.get(2)?,
+            mtime: row.get(3)?,
+            state: UploadState::from_str(&row.get::<_, String>(4)?),
+            attempts: row.get::<_, i64>(5)? as u32,
+            last_error: row.get(6)?,
+        })
+    }
 }
 
 /// A row from `nodes`, as the FUSE layer needs it.
@@ -901,82 +1049,116 @@ mod tests {
         assert_eq!(after.inode, docs.inode, "reconcile keeps the moved inode");
     }
 
+    /// The pins themselves live in [`crate::pins`] now; what this database still
+    /// owes them is the pair of paths a rename went between. Without it the
+    /// caller cannot carry the promise, and a renamed pinned directory is
+    /// silently unpinned.
     #[test]
-    fn pins_follow_a_moved_subtree() {
+    fn a_move_reports_the_paths_a_pin_has_to_follow() {
         let mut db = StateDb::open_in_memory().unwrap();
         db.reconcile_children(
             ROOT_INODE,
             "",
-            &[
-                entry("Photos", true),
-                entry("Photos2", true),
-                entry("Archive", true),
-            ],
+            &[entry("Photos", true), entry("Archive", true)],
         )
         .unwrap();
         let photos = db.node_by_path("Photos").unwrap().unwrap();
         let archive = db.node_by_path("Archive").unwrap().unwrap();
-        db.reconcile_children(photos.inode, "Photos", &[entry("Photos/2024", true)])
+
+        let (from, to) = db
+            .move_subtree(photos.inode, archive.inode, "Bilder")
             .unwrap();
-        let year = db.node_by_path("Photos/2024").unwrap().unwrap();
+        assert_eq!((from.as_str(), to.as_str()), ("Photos", "Archive/Bilder"));
+    }
+
+    /// `rename(2)` replaces its destination, and an atomic save always does:
+    /// the editor renames its temporary over the document. Two things have to
+    /// happen for that, and both were missing.
+    #[test]
+    fn a_rename_replaces_its_destination_and_takes_over_its_identity() {
+        let mut db = StateDb::open_in_memory().unwrap();
         db.reconcile_children(
-            year.inode,
-            "Photos/2024",
-            &[entry("Photos/2024/pic.jpg", false)],
+            ROOT_INODE,
+            "",
+            &[entry("Notes.txt", false), entry("Sub", true)],
         )
         .unwrap();
+        let target = db.node_by_path("Notes.txt").unwrap().unwrap();
+        assert!(target.file_id.is_some(), "the document is on the server");
 
-        db.set_pin("Photos", true).unwrap();
-        db.set_pin("Photos/2024/pic.jpg", false).unwrap(); // a nested pin
-        db.set_pin("Photos2", true).unwrap(); // a sibling that must NOT move
+        // The editor's temporary: local only, no server identity.
+        let tmp = db
+            .insert_local_file(ROOT_INODE, ".goutputstream-ABC")
+            .unwrap()
+            .inode;
+        assert!(db.node_by_inode(tmp).unwrap().unwrap().file_id.is_none());
 
-        // Renaming a pinned directory must keep the "keep offline" promise.
-        db.move_subtree(photos.inode, archive.inode, "Bilder")
-            .unwrap();
+        // UNIQUE(parent, name) would reject this outright without the occupant
+        // being cleared first — which is what surfaced as EIO on Ctrl+S.
+        let (from, to) = db.move_subtree(tmp, ROOT_INODE, "Notes.txt").unwrap();
+        assert_eq!(
+            (from.as_str(), to.as_str()),
+            (".goutputstream-ABC", "Notes.txt")
+        );
 
-        assert!(
-            db.is_pinned("Archive/Bilder").unwrap(),
-            "the directory pin followed the rename"
+        let now = db.node_by_path("Notes.txt").unwrap().unwrap();
+        assert_eq!(now.inode, tmp, "the mover holds the name");
+        assert_eq!(
+            now.file_id, target.file_id,
+            "and inherits the server resource it replaced, so the upload \
+             overwrites instead of asserting the file does not exist"
         );
-        assert!(
-            db.is_pinned("Archive/Bilder/2024/new.jpg").unwrap(),
-            "a file added under the moved pin is still covered"
-        );
-        assert!(
-            !db.is_pinned("Photos/2024/pic.jpg").unwrap(),
-            "the vacated path is no longer pinned"
-        );
-        let pins = db.pins().unwrap();
-        assert!(
-            pins.iter().any(|(p, _)| p == "Archive/Bilder/2024/pic.jpg"),
-            "the nested pin row moved with the subtree: {pins:?}"
-        );
-        // Component-aware: `Photos2` is not below `Photos`.
-        assert!(
-            pins.iter().any(|(p, _)| p == "Photos2"),
-            "the sibling pin is untouched: {pins:?}"
-        );
-        assert!(db.is_pinned("Photos2/holiday.jpg").unwrap());
+        assert_eq!(now.etag, target.etag, "…including the version to assert");
+    }
+
+    /// A node that already has a server identity keeps its own: a server-side
+    /// MOVE has settled that case, and the resource that survives there is the
+    /// one that moved, not the one it landed on.
+    #[test]
+    fn a_materialised_mover_keeps_its_own_identity() {
+        let mut db = StateDb::open_in_memory().unwrap();
+        let with_id = |path: &str, id: u64| RemoteEntry {
+            file_id: Some(id),
+            ..entry(path, false)
+        };
+        db.reconcile_children(
+            ROOT_INODE,
+            "",
+            &[with_id("a.txt", 11), with_id("b.txt", 22)],
+        )
+        .unwrap();
+        let a = db.node_by_path("a.txt").unwrap().unwrap();
+        let b = db.node_by_path("b.txt").unwrap().unwrap();
+        assert_ne!(a.file_id, b.file_id, "two distinct server resources");
+
+        db.move_subtree(a.inode, ROOT_INODE, "b.txt").unwrap();
+        let now = db.node_by_path("b.txt").unwrap().unwrap();
+        assert_eq!(now.file_id, a.file_id, "the mover's own identity survives");
+    }
+
+    /// A database from before pins moved out still has the table; a fresh one
+    /// does not. Both must answer, because the migration asks every database it
+    /// opens exactly once.
+    #[test]
+    fn a_database_without_a_pins_table_reports_no_legacy_pins() {
+        let db = StateDb::open_in_memory().unwrap();
+        assert!(db.legacy_pins().unwrap().is_empty());
     }
 
     #[test]
-    fn pins_go_away_with_the_subtree_they_covered() {
+    fn the_pins_of_an_older_database_are_still_readable() {
         let db = StateDb::open_in_memory().unwrap();
-        db.set_pin("Photos", true).unwrap();
-        db.set_pin("Photos/2024/pic.jpg", false).unwrap();
-        db.set_pin("Photos2", true).unwrap();
-
-        let removed = db.remove_pins_under("Photos").unwrap();
-        assert_eq!(removed, 2, "the directory pin and the one below it");
-        assert!(!db.is_pinned("Photos/2024/pic.jpg").unwrap());
-        // Component-aware again: the `Photos2` pin survives.
-        assert!(db.is_pinned("Photos2").unwrap());
-
-        // The root clears everything (the account itself was dropped).
-        assert_eq!(db.remove_pins_under("").unwrap(), 1);
-        assert!(db.pins().unwrap().is_empty());
+        db.conn
+            .execute_batch(
+                "CREATE TABLE pins (path TEXT PRIMARY KEY, is_dir INTEGER NOT NULL DEFAULT 0);
+                 INSERT INTO pins VALUES ('Photos', 1), ('a.txt', 0);",
+            )
+            .unwrap();
+        assert_eq!(
+            db.legacy_pins().unwrap(),
+            vec![("Photos".to_string(), true), ("a.txt".to_string(), false)]
+        );
     }
-
     #[test]
     fn move_subtree_rejects_a_move_into_its_own_subtree() {
         let mut db = StateDb::open_in_memory().unwrap();
@@ -1100,35 +1282,6 @@ mod tests {
     }
 
     #[test]
-    fn pins_cover_files_dirs_subtrees_and_root() {
-        let db = StateDb::open_in_memory().unwrap();
-
-        // A single file pin matches only that file.
-        db.set_pin("Docs/Report.pdf", false).unwrap();
-        assert!(db.is_pinned("Docs/Report.pdf").unwrap());
-        assert!(!db.is_pinned("Docs/Other.pdf").unwrap());
-
-        // A directory pin covers the whole subtree, but not siblings.
-        db.set_pin("Photos", true).unwrap();
-        assert!(db.is_pinned("Photos").unwrap());
-        assert!(db.is_pinned("Photos/2024/pic.jpg").unwrap());
-        assert!(
-            !db.is_pinned("PhotosOld/pic.jpg").unwrap(),
-            "prefix must be a path component"
-        );
-
-        // Removing a pin takes effect.
-        db.remove_pin("Photos").unwrap();
-        assert!(!db.is_pinned("Photos/2024/pic.jpg").unwrap());
-
-        // The root pin ("") is the legacy "download everything".
-        db.set_pin("", true).unwrap();
-        assert!(db.is_pinned("anything/at/all.txt").unwrap());
-
-        assert_eq!(db.pins().unwrap().len(), 2, "Docs/Report.pdf and root");
-    }
-
-    #[test]
     fn dir_needs_reload_respects_ttl() {
         let mut db = StateDb::open_in_memory().unwrap();
         assert!(
@@ -1176,5 +1329,82 @@ mod tests {
         );
         // With no floor, the same push does force a re-list.
         assert!(db.dir_needs_reload(ROOT_INODE, 3600, future, 0).unwrap());
+    }
+
+    #[test]
+    fn a_pending_upload_round_trips_and_a_recommit_resets_it() {
+        let db = StateDb::open_in_memory().unwrap();
+        let obj = wusel_fsm::ObjectId(42);
+        assert!(db.pending_upload(obj).unwrap().is_none());
+
+        db.mark_pending_upload(obj, "Docs/report.odt", "etag-1", Some(1000))
+            .unwrap();
+        let p = db.pending_upload(obj).unwrap().expect("recorded");
+        assert_eq!(p.object, obj);
+        assert_eq!(p.remote_path, "Docs/report.odt");
+        assert_eq!(p.base_etag, "etag-1");
+        assert_eq!(p.mtime, Some(1000));
+        assert_eq!(p.state, UploadState::Pending);
+        assert_eq!(p.attempts, 0);
+
+        // A failed attempt, then a permanent error parks it.
+        db.bump_upload_attempt(obj).unwrap();
+        db.set_upload_state(obj, UploadState::Error, Some("403 Forbidden"))
+            .unwrap();
+        let p = db.pending_upload(obj).unwrap().unwrap();
+        assert_eq!(p.attempts, 1);
+        assert_eq!(p.state, UploadState::Error);
+        assert_eq!(p.last_error.as_deref(), Some("403 Forbidden"));
+
+        // A fresh close of the same file supersedes it: new bytes, clean slate.
+        db.mark_pending_upload(obj, "Docs/report.odt", "etag-2", None)
+            .unwrap();
+        let p = db.pending_upload(obj).unwrap().unwrap();
+        assert_eq!(p.state, UploadState::Pending, "re-commit clears the error");
+        assert_eq!(p.attempts, 0, "and resets the attempt count");
+        assert_eq!(p.base_etag, "etag-2");
+        assert_eq!(p.last_error, None);
+    }
+
+    #[test]
+    fn a_move_follows_the_bytes_and_clear_forgets_them() {
+        let db = StateDb::open_in_memory().unwrap();
+        let obj = wusel_fsm::ObjectId(7);
+        db.mark_pending_upload(obj, ".goutputstream-XYZ", "", None)
+            .unwrap();
+        // The office-suite atomic save: the temp file is renamed onto the
+        // document, so its pending upload must follow to the document's path.
+        db.move_pending_upload(obj, "report.odt").unwrap();
+        assert_eq!(
+            db.pending_upload(obj).unwrap().unwrap().remote_path,
+            "report.odt"
+        );
+
+        db.clear_pending_upload(obj).unwrap();
+        assert!(db.pending_upload(obj).unwrap().is_none());
+    }
+
+    #[test]
+    fn pending_uploads_survive_a_reopen() {
+        // The whole point of persisting them: a crash between close and upload
+        // must not lose the record, or the file is silently never uploaded.
+        let dir = std::env::temp_dir().join(format!("wusel-pending-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.sqlite");
+        {
+            let db = StateDb::open(&path).unwrap();
+            db.mark_pending_upload(wusel_fsm::ObjectId(1), "a.txt", "e1", None)
+                .unwrap();
+            db.mark_pending_upload(wusel_fsm::ObjectId(2), "b.txt", "e2", Some(5))
+                .unwrap();
+        }
+        let db = StateDb::open(&path).unwrap();
+        let all = db.pending_uploads().unwrap();
+        assert_eq!(all.len(), 2, "both records survived the reopen");
+        assert_eq!(all[0].object, wusel_fsm::ObjectId(1));
+        assert_eq!(all[1].remote_path, "b.txt");
+        assert_eq!(all[1].mtime, Some(5));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -12,23 +12,24 @@ use std::ffi::OsStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
-    FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
-    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow,
+    BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
+    Generation, INodeNo, LockOwner, MountOption, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate,
+    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite,
+    ReplyXattr, Request as Request_, TimeOrNow, WriteFlags,
 };
 
-use wusel_core::provider::{Invalidation, Provider};
-use wusel_core::state::NodeRow;
+use std::sync::Arc;
 
-/// Map an engine error to an errno for the kernel.
-fn errno(e: &wusel_core::Error) -> i32 {
-    match e {
-        wusel_core::Error::Denied => libc::EACCES,
-        // The object vanished on the server — the network-filesystem idiom for
-        // "this handle no longer refers to anything".
-        wusel_core::Error::NotFound => libc::ESTALE,
-        _ => libc::EIO,
-    }
-}
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+
+use wusel_core::provider::{Invalidation, Provider};
+use wusel_core::runtime::{Pools, Substrate};
+use wusel_core::state::NodeRow;
+use wusel_fsm::{Intent, ObjectId, Request, RequestId};
+
+use crate::dispatch::{spawn_pump, Pending, PumpContext, Replies};
 
 /// Unix seconds → `SystemTime`, both signs. `SystemTime` has no signed
 /// constructor, but it does represent pre-1970 instants as `UNIX_EPOCH -
@@ -66,22 +67,22 @@ fn unix_from_system_time(t: SystemTime) -> i64 {
 
 /// How long the kernel may cache our attribute/entry answers. Short for now;
 /// active invalidation on remote changes comes later (see architecture docs).
-const TTL: Duration = Duration::from_secs(1);
-const GENERATION: u64 = 0;
+pub(crate) const TTL: Duration = Duration::from_secs(1);
+pub(crate) const GENERATION: Generation = Generation(0);
 
 /// The single xattr we expose: a file's availability state (`online-only` /
 /// `cached` / `pinned` / `modified`), read by file-manager extensions to draw
 /// per-file emblems. See [`wusel_core::provider::FileState`].
-const STATE_XATTR: &str = "user.wusel.state";
+pub(crate) const STATE_XATTR: &str = "user.wusel.state";
 
 /// Reply to an xattr get/list following the kernel's two-call protocol: a
 /// `size == 0` probe asks only for the length; a sized call copies the bytes if
 /// they fit, else `ERANGE`.
-fn reply_xattr(reply: ReplyXattr, value: &[u8], size: u32) {
+pub(crate) fn reply_xattr(reply: ReplyXattr, value: &[u8], size: u32) {
     if size == 0 {
         reply.size(value.len() as u32);
     } else if (size as usize) < value.len() {
-        reply.error(libc::ERANGE);
+        reply.error(Errno::ERANGE);
     } else {
         reply.data(value);
     }
@@ -94,7 +95,8 @@ fn reply_xattr(reply: ReplyXattr, value: &[u8], size: u32) {
 /// state, never uploaded to Nextcloud. The reserved inodes sit far above any
 /// real SQLite rowid, so they never collide. (KDE Baloo ignores markers; it
 /// needs a config exclude instead — a later addition.)
-const MARKERS: [(u64, &str); 2] = [(u64::MAX, ".trackerignore"), (u64::MAX - 1, ".nomedia")];
+pub(crate) const MARKERS: [(u64, &str); 2] =
+    [(u64::MAX, ".trackerignore"), (u64::MAX - 1, ".nomedia")];
 
 fn marker_name(ino: u64) -> Option<&'static str> {
     MARKERS.iter().find(|(i, _)| *i == ino).map(|&(_, n)| n)
@@ -106,7 +108,7 @@ fn marker_inode(name: &str) -> Option<u64> {
 /// Attributes of a synthetic marker: a 0-byte, read-only regular file.
 fn marker_attr(ino: u64) -> FileAttr {
     FileAttr {
-        ino,
+        ino: INodeNo(ino),
         size: 0,
         blocks: 0,
         atime: UNIX_EPOCH,
@@ -124,20 +126,6 @@ fn marker_attr(ino: u64) -> FileAttr {
     }
 }
 
-/// Where a `readdir` chunk starts in the listing.
-///
-/// FUSE carries the offset as `i64`, and as in `read`/`write` a negative one is
-/// never valid. It has to be rejected explicitly: `offset as usize` would wrap
-/// it into a huge number, `skip` would swallow the whole listing, and the reply
-/// would be an empty — i.e. "end of directory" — answer to a bogus request.
-fn dir_offset(offset: i64) -> Result<usize, i32> {
-    if offset < 0 {
-        Err(libc::EINVAL)
-    } else {
-        Ok(offset as usize)
-    }
-}
-
 /// How many directory streams may keep a snapshot at the same time.
 ///
 /// A snapshot is a full copy of one directory's entries, so N open handles on
@@ -150,304 +138,349 @@ fn dir_offset(offset: i64) -> Result<usize, i32> {
 /// and a shell together hold a handful of directories open, not sixty.
 const MAX_DIR_STREAMS: usize = 64;
 
-/// The listing served when a handle has no snapshot and none could be built —
-/// unreachable by construction, and an empty listing (i.e. "end of directory")
-/// is the harmless answer if it ever were reached.
-const NO_ENTRIES: &[(u64, FileType, String)] = &[];
-
-pub struct NcFs {
-    provider: Provider,
-    /// Expose the synthetic indexer-exclusion markers at the root (opt-in).
-    markers: bool,
-    /// Per-open-directory listing snapshots, keyed by the file handle we hand
-    /// out in `opendir`. A directory stream arrives as several `readdir`
-    /// chunks indexed by offset; recomputing the listing per chunk would let a
-    /// background revalidation between two chunks shift the offsets and skip
-    /// or duplicate entries. One snapshot per *traversal* keeps a stream
-    /// internally consistent — it is taken when the stream starts (`readdir`
-    /// at offset 0, see there) and reused for every continuation chunk.
-    /// FUSE requests are served on a single thread (like everything else in
-    /// this adapter), so a plain map needs no lock. Capped at
-    /// [`MAX_DIR_STREAMS`] entries, so the copies cannot pile up unbounded.
-    dir_streams: std::collections::HashMap<u64, Vec<(u64, FileType, String)>>,
-    /// Last file handle handed out by `opendir`. Starts at 0 so the first
-    /// handle is 1 — `fh == 0` stays free to mean "no registered stream"
-    /// (readdir then falls back to a throwaway listing).
-    next_dir_fh: u64,
+/// Per-open-directory listing snapshots — pure *frontend* state, so it stays in
+/// the adapter rather than behind the owner thread.
+///
+/// A directory stream arrives as several `readdir` chunks indexed by offset;
+/// recomputing the listing per chunk would let a background revalidation between
+/// two chunks shift the offsets and skip or duplicate entries. One snapshot per
+/// *traversal* keeps a stream internally consistent — it is taken when the stream
+/// starts (`readdir` at offset 0, see there) and reused for every continuation
+/// chunk. Capped at [`MAX_DIR_STREAMS`] entries, so the copies cannot pile up.
+///
+/// `readdir`/`opendir`/`releasedir` mutate this through `&self`, so it needs
+/// interior mutability: a small `Mutex`, held only for map lookups — never across
+/// an owner round-trip or any I/O — so it stays uncontended even once Etappe 6
+/// turns the dispatch threads up.
+pub(crate) struct DirStreams {
+    streams: std::collections::HashMap<u64, Vec<(u64, FileType, String)>>,
+    /// Last file handle handed out by `opendir`. Starts at 0 so the first handle
+    /// is 1 — `fh == 0` stays free to mean "no registered stream" (readdir then
+    /// falls back to a throwaway listing).
+    next_fh: u64,
 }
 
-impl Filesystem for NcFs {
-    fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
-        if self.markers && marker_name(ino).is_some() {
-            return reply.attr(&TTL, &marker_attr(ino));
-        }
-        match self.provider.node(ino) {
-            Ok(Some(node)) => reply.attr(&TTL, &to_attr(&node)),
-            Ok(None) => reply.error(libc::ENOENT),
-            Err(e) => {
-                tracing::error!(%e, ino, "getattr failed");
-                reply.error(libc::EIO);
-            }
+impl DirStreams {
+    /// Keep a listing for a stream's continuation chunks.
+    pub(crate) fn remember(&mut self, fh: u64, entries: Vec<(u64, FileType, String)>) {
+        // Only for handles we actually registered: past the cap, and for the
+        // `fh == 0` case where no `releasedir` will ever arrive, storing would
+        // leak exactly what the cap exists to prevent.
+        if self.streams.contains_key(&fh) {
+            self.streams.insert(fh, entries);
         }
     }
 
-    fn lookup(
-        &mut self,
-        _req: &Request<'_>,
-        parent: u64,
-        name: &std::ffi::OsStr,
-        reply: ReplyEntry,
-    ) {
-        let Some(name) = name.to_str() else {
-            return reply.error(libc::EINVAL);
+    /// The listing a continuation chunk should be served from.
+    pub(crate) fn snapshot(&self, fh: u64) -> Option<&[(u64, FileType, String)]> {
+        self.streams.get(&fh).map(Vec::as_slice)
+    }
+}
+
+/// The FUSE adapter.
+///
+/// It carries no engine logic and no engine state. A callback is translated
+/// into an [`Intent`], its reply is parked, and the dispatch thread returns —
+/// everything after that happens on the substrate's threads. What remains here
+/// is genuinely frontend-only: the directory-stream snapshots and the synthetic
+/// marker files, neither of which the engine has ever heard of.
+pub struct NcFs {
+    substrate: Substrate,
+    replies: Arc<Replies>,
+    dirs: Arc<Mutex<DirStreams>>,
+    /// Reads still outstanding, by the file handle that issued them.
+    ///
+    /// This is what makes cancellation possible at all. `fuser` exposes no
+    /// interrupt callback, so a reader that dies can only be noticed through the
+    /// descriptor teardown — and the kernel delivers `flush` for it immediately
+    /// while holding `release` back until every outstanding read is answered. A
+    /// `flush` on a handle that still has reads open therefore means nobody
+    /// wants them any more.
+    reads: Arc<Mutex<HashMap<u64, Vec<RequestId>>>>,
+    /// Last handle handed out by `open`. Real handles, not a constant: without
+    /// them there is no telling one reader's outstanding work from another's.
+    next_fh: AtomicU64,
+    /// Expose the synthetic indexer-exclusion markers at the root (opt-in).
+    markers: bool,
+}
+
+impl NcFs {
+    /// Lock the frontend directory-stream state, tolerating a poisoned mutex (a
+    /// panicking callback must not wedge every later one).
+    fn dirs(&self) -> std::sync::MutexGuard<'_, DirStreams> {
+        self.dirs.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Park a reply and hand the work to the machine.
+    ///
+    /// A submission that cannot be delivered answers straight away: a request
+    /// nobody will ever complete is worse than an error, because the caller
+    /// waits for ever with nothing to point at.
+    fn go(&self, pending: Pending, object: u64, intent: Intent) -> Option<RequestId> {
+        let id = self.replies.park(pending);
+        let request = Request {
+            id,
+            object: ObjectId(object),
+            intent,
         };
-        if self.markers && parent == wusel_core::state::ROOT_INODE {
+        if self.substrate.submit(request).is_err() {
+            if let Some(p) = self.replies.take(id) {
+                p.fail(Errno::EIO);
+            }
+            return None;
+        }
+        Some(id)
+    }
+
+    /// Give up whatever this handle still has in flight.
+    ///
+    /// Requests already answered are simply not found — the machine says so,
+    /// rather than us keeping a second account of what is still live.
+    fn abandon_reads(&self, fh: u64) {
+        let ids = {
+            let mut reads = self.reads.lock().unwrap_or_else(|e| e.into_inner());
+            reads.get_mut(&fh).map(std::mem::take).unwrap_or_default()
+        };
+        for id in ids {
+            let _ = self.substrate.abandon(id);
+        }
+    }
+
+    /// The same, for a write — whose bytes travel beside the request.
+    fn go_write(&self, pending: Pending, object: u64, intent: Intent, data: Vec<u8>) {
+        let id = self.replies.park(pending);
+        let request = Request {
+            id,
+            object: ObjectId(object),
+            intent,
+        };
+        if self.substrate.submit_write(request, data).is_err() {
+            if let Some(p) = self.replies.take(id) {
+                p.fail(Errno::EIO);
+            }
+        }
+    }
+}
+
+/// A freedesktop "top directory" trash name — `.Trash` or `.Trash-<uid>`. Such a
+/// directory at the mount root is where a file manager would move files "to the
+/// wastebasket". We refuse to host one so that deletion goes straight to the
+/// server (and Nextcloud's own trash), instead of a `.Trash-<uid>` folder
+/// appearing in the user's cloud and syncing to every device. See the desktop
+/// integration docs.
+pub(crate) fn is_trash_name(name: &str) -> bool {
+    name == ".Trash" || name.starts_with(".Trash-")
+}
+
+/// Append one chunk of a directory listing to the reply, starting at `start`.
+pub(crate) fn serve_chunk(
+    entries: &[(u64, FileType, String)],
+    start: usize,
+    reply: &mut ReplyDirectory,
+) {
+    for (i, (inode, kind, name)) in entries.iter().enumerate().skip(start) {
+        // `offset` is the *next* entry to read; hence i + 1.
+        if reply.add(INodeNo(*inode), (i + 1) as u64, *kind, name) {
+            break; // reply buffer full
+        }
+    }
+}
+
+impl Filesystem for NcFs {
+    fn getattr(&self, _req: &Request_, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+        let ino = ino.0;
+        if self.markers && marker_name(ino).is_some() {
+            return reply.attr(&TTL, &marker_attr(ino));
+        }
+        self.go(Pending::Attr(reply), ino, Intent::Stat);
+    }
+
+    fn lookup(&self, _req: &Request_, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        let Some(name) = name.to_str() else {
+            return reply.error(Errno::EINVAL);
+        };
+        if self.markers && parent.0 == wusel_core::state::ROOT_INODE {
             if let Some(ino) = marker_inode(name) {
                 return reply.entry(&TTL, &marker_attr(ino), GENERATION);
             }
         }
-        match self.provider.lookup(parent, name) {
-            Ok(Some(child)) => reply.entry(&TTL, &to_attr(&child), GENERATION),
-            Ok(None) => reply.error(libc::ENOENT),
-            Err(e) => {
-                tracing::error!(%e, parent, name, "lookup failed");
-                reply.error(errno(&e));
-            }
+        // A trash directory at the root is hidden from listings; make a direct
+        // lookup agree, so a file manager cannot stat or traverse into a
+        // pre-existing `.Trash-<uid>` either. Together they make it absent.
+        if parent.0 == wusel_core::state::ROOT_INODE && is_trash_name(name) {
+            return reply.error(Errno::ENOENT);
         }
+        self.go(
+            Pending::Entry(reply),
+            parent.0,
+            Intent::Lookup {
+                name: name.to_string(),
+            },
+        );
     }
 
-    /// Open a directory stream: hand out a fresh file handle and register the
-    /// stream. The listing itself is *not* taken here — `readdir` takes it when
-    /// the stream starts (offset 0), which is also where a `rewinddir` lands
-    /// (see `readdir`). Snapshotting here as well would only build every
-    /// listing twice per `ls`.
-    ///
-    /// Beyond [`MAX_DIR_STREAMS`] open streams the handle is still valid but
-    /// stays unregistered: the open must not fail, it just loses the snapshot
-    /// and is served like any unknown handle.
-    fn opendir(&mut self, _req: &Request<'_>, _ino: u64, _flags: i32, reply: ReplyOpen) {
-        self.next_dir_fh += 1;
-        let fh = self.next_dir_fh;
-        if self.dir_streams.len() < MAX_DIR_STREAMS {
-            self.dir_streams.insert(fh, Vec::new());
+    /// Open a directory stream: hand out a fresh handle and register it. The
+    /// listing itself is taken by `readdir` when the stream starts, which is
+    /// also where a `rewinddir` lands — snapshotting here as well would build
+    /// every listing twice per `ls`.
+    fn opendir(&self, _req: &Request_, _ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        let mut dirs = self.dirs();
+        dirs.next_fh += 1;
+        let fh = dirs.next_fh;
+        if dirs.streams.len() < MAX_DIR_STREAMS {
+            dirs.streams.insert(fh, Vec::new());
         } else {
             tracing::debug!(
-                open_streams = self.dir_streams.len(),
+                open_streams = dirs.streams.len(),
                 "directory-stream cap reached — serving this handle without a snapshot"
             );
         }
-        reply.opened(fh, 0);
+        reply.opened(FileHandle(fh), FopenFlags::empty());
     }
 
     fn readdir(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        fh: u64,
-        offset: i64,
+        &self,
+        _req: &Request_,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        let start = match dir_offset(offset) {
-            Ok(start) => start,
-            Err(errno) => return reply.error(errno),
-        };
-
-        // A stream starting at offset 0 gets a fresh listing; its continuation
-        // chunks (offset > 0) are served from that snapshot.
-        //
-        // Both halves matter. The snapshot keeps *one* traversal consistent: a
-        // background revalidation landing between two chunks must not shift the
-        // offsets and thereby skip or duplicate entries. Refreshing at offset 0
-        // is what POSIX demands of `rewinddir` — the stream must then "refer to
-        // the current state of the directory". glibc implements `rewinddir` as
-        // `lseek(fd, 0, SEEK_SET)` on the *same* descriptor, so the kernel
-        // re-issues READDIR at offset 0 with the same `fh` and never a second
-        // OPENDIR. Without the refresh, a long-lived dirfd (a watcher, an
-        // indexer, a file manager sitting in the directory) would keep serving
-        // its opendir-time listing for the lifetime of that handle — blind to
-        // every later addition, even after push invalidation fired.
-        //
-        // An unknown fh — 0 when no opendir preceded, or a handle past
-        // [`MAX_DIR_STREAMS`] — gets a throwaway listing rather than an entry
-        // in the map: for fh 0 no `releasedir` will ever arrive, so storing one
-        // would leak, and past the cap storing is exactly what we are avoiding.
-        let mut throwaway = None;
-        if self.dir_streams.contains_key(&fh) {
-            if start == 0 {
-                match self.dir_entries(ino) {
-                    Ok(entries) => {
-                        self.dir_streams.insert(fh, entries);
-                    }
-                    Err(errno) => return reply.error(errno),
-                }
-            }
-        } else {
-            match self.dir_entries(ino) {
-                Ok(entries) => throwaway = Some(entries),
-                Err(errno) => return reply.error(errno),
+        let start = usize::try_from(offset).unwrap_or(usize::MAX);
+        // A continuation chunk is served from the snapshot this stream started
+        // with. That is the whole point of taking one: a background refresh
+        // between two chunks must not shift the offsets and thereby skip or
+        // duplicate entries.
+        if start > 0 {
+            let dirs = self.dirs();
+            if let Some(entries) = dirs.snapshot(fh.0) {
+                let entries = entries.to_vec();
+                drop(dirs);
+                serve_chunk(&entries, start, &mut reply);
+                return reply.ok();
             }
         }
-        // `get`, never `self.dir_streams[&fh]`: indexing panics on a missing
-        // key, and a panic in a FUSE callback takes the whole mount down. The
-        // key is present by construction here — that is precisely why it must
-        // not be enforced by a panic.
-        let entries: &[(u64, FileType, String)] = match &throwaway {
-            Some(entries) => entries,
-            None => self.dir_streams.get(&fh).map_or(NO_ENTRIES, Vec::as_slice),
-        };
-
-        for (i, (inode, kind, name)) in entries.iter().enumerate().skip(start) {
-            // `offset` is the *next* entry to read; hence i + 1.
-            if reply.add(*inode, (i + 1) as i64, *kind, name) {
-                break; // reply buffer full
-            }
-        }
-        reply.ok();
+        // Offset 0 is where a stream begins *and* where `rewinddir` lands, so
+        // it takes a fresh listing — without which a long-lived directory
+        // handle would go blind to everything that arrives later.
+        self.go(
+            Pending::Dir {
+                reply,
+                ino: ino.0,
+                fh: fh.0,
+                start,
+            },
+            ino.0,
+            Intent::Enumerate,
+        );
     }
 
-    /// Close a directory stream: drop its `opendir` snapshot.
+    /// Close a directory stream: drop its snapshot.
     fn releasedir(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        fh: u64,
-        _flags: i32,
+        &self,
+        _req: &Request_,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _flags: OpenFlags,
         reply: ReplyEmpty,
     ) {
-        self.dir_streams.remove(&fh);
+        self.dirs().streams.remove(&fh.0);
         reply.ok();
     }
 
-    fn open(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
-        // Nothing to set up per open — but this is the one low-frequency spot
-        // that narrates *which* files applications touch: cache-served reads
-        // never hit the network and would otherwise be invisible in the log.
-        if let Ok(Some(node)) = self.provider.node(ino) {
-            tracing::debug!(path = %node.path, "open");
-        }
-        reply.opened(0, 0);
+    /// Nothing to set up per open, and nothing to ask anybody: answering here
+    /// keeps the machine out of the one callback that has no work to do.
+    fn open(&self, _req: &Request_, _ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        let fh = self.next_fh.fetch_add(1, Ordering::Relaxed) + 1;
+        reply.opened(FileHandle(fh), FopenFlags::empty());
     }
 
     fn read(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
+        &self,
+        _req: &Request_,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
         size: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
+        let ino = ino.0;
         if self.markers && marker_name(ino).is_some() {
             return reply.data(&[]); // synthetic markers are always empty
         }
-        // FUSE carries the offset as i64, but a negative offset is never valid
-        // for a regular file — reject it instead of silently acting on 0.
-        if offset < 0 {
-            return reply.error(libc::EINVAL);
-        }
-        match self.provider.read(ino, offset as u64, size) {
-            Ok(bytes) => reply.data(&bytes),
-            // A file deleted on the server is expected, not an error: log quietly
-            // and return a stale-handle errno so the reader stops.
-            Err(e @ wusel_core::Error::NotFound) => {
-                tracing::debug!(ino, offset, size, "read: file gone on the server");
-                reply.error(errno(&e));
-            }
-            Err(e) => {
-                tracing::error!(%e, ino, offset, size, "read failed");
-                reply.error(errno(&e));
-            }
+        // Remembered against the handle that issued it: a `flush` on that handle
+        // is how a dead reader announces itself, and this is the list it kills.
+        if let Some(id) = self.go(
+            Pending::Data(reply),
+            ino,
+            Intent::Fetch { offset, len: size },
+        ) {
+            self.reads
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(fh.0)
+                .or_default()
+                .push(id);
         }
     }
 
-    /// Filesystem statistics (`statfs`/`df`). We are a virtual, server-backed FS,
-    /// so we advertise a large capacity with plenty free — otherwise apps that
-    /// check available space before opening/saving would see zero and refuse.
-    /// (Reporting the real Nextcloud quota is a later refinement.)
-    fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {
+    /// Filesystem statistics. We are a virtual, server-backed filesystem, so we
+    /// advertise a large capacity with plenty free — otherwise applications that
+    /// check available space before saving would see zero and refuse.
+    fn statfs(&self, _req: &Request_, _ino: INodeNo, reply: ReplyStatfs) {
         const BSIZE: u32 = 512;
         const TOTAL_BLOCKS: u64 = 1 << 41; // ~1 PiB at 512-byte blocks
         const TOTAL_INODES: u64 = 1 << 32;
         reply.statfs(
-            TOTAL_BLOCKS, // blocks
-            TOTAL_BLOCKS, // bfree
-            TOTAL_BLOCKS, // bavail
-            TOTAL_INODES, // files
-            TOTAL_INODES, // ffree
-            BSIZE,        // bsize
-            255,          // namelen
-            BSIZE,        // frsize
+            TOTAL_BLOCKS,
+            TOTAL_BLOCKS,
+            TOTAL_BLOCKS,
+            TOTAL_INODES,
+            TOTAL_INODES,
+            BSIZE,
+            255,
+            BSIZE,
         );
     }
 
-    /// Serve our one xattr, `user.wusel.state`, so file-manager extensions can
-    /// draw per-file emblems. `ENODATA` for any other name, or when the inode has
-    /// no state (an unpinned directory). Network-free — safe for the storms of
-    /// getxattr a file manager issues while drawing a folder.
-    fn getxattr(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        name: &OsStr,
-        size: u32,
-        reply: ReplyXattr,
-    ) {
+    fn getxattr(&self, _req: &Request_, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
         if name != OsStr::new(STATE_XATTR) {
-            return reply.error(libc::ENODATA);
+            return reply.error(Errno::ENODATA);
         }
-        match self.provider.file_state(ino) {
-            Ok(Some(state)) => reply_xattr(reply, state.as_xattr().as_bytes(), size),
-            Ok(None) => reply.error(libc::ENODATA),
-            Err(e) => {
-                tracing::error!(%e, ino, "getxattr: file_state failed");
-                reply.error(libc::EIO);
-            }
-        }
+        self.go(Pending::Xattr { reply, size }, ino.0, Intent::State);
     }
 
-    /// List the xattrs of `ino`: just `user.wusel.state`, and only when the
-    /// inode actually has a state (so `getfattr -d` on an unpinned directory
-    /// shows nothing rather than an empty-valued attribute).
-    fn listxattr(&mut self, _req: &Request<'_>, ino: u64, size: u32, reply: ReplyXattr) {
-        let mut list = Vec::new();
-        if matches!(self.provider.file_state(ino), Ok(Some(_))) {
-            list.extend_from_slice(STATE_XATTR.as_bytes());
-            list.push(0); // the kernel expects a NUL-separated, NUL-terminated list
-        }
-        reply_xattr(reply, &list, size);
+    fn listxattr(&self, _req: &Request_, ino: INodeNo, size: u32, reply: ReplyXattr) {
+        self.go(Pending::XattrList { reply, size }, ino.0, Intent::State);
     }
 
     fn write(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
+        &self,
+        _req: &Request_,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
         data: &[u8],
-        _write_flags: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        _write_flags: WriteFlags,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
-        // As in `read`: a negative offset is invalid, not "offset 0".
-        if offset < 0 {
-            return reply.error(libc::EINVAL);
-        }
-        match self.provider.write(ino, offset as u64, data) {
-            Ok(written) => reply.written(written),
-            Err(e) => {
-                tracing::error!(%e, ino, "write failed");
-                reply.error(errno(&e));
-            }
-        }
+        let len = data.len() as u32;
+        self.go_write(
+            Pending::Written(reply),
+            ino.0,
+            Intent::Write { offset, len },
+            data.to_vec(),
+        );
     }
 
     fn create(
-        &mut self,
-        _req: &Request<'_>,
-        parent: u64,
+        &self,
+        _req: &Request_,
+        parent: INodeNo,
         name: &OsStr,
         _mode: u32,
         _umask: u32,
@@ -455,72 +488,89 @@ impl Filesystem for NcFs {
         reply: ReplyCreate,
     ) {
         let Some(name) = name.to_str() else {
-            return reply.error(libc::EINVAL);
+            return reply.error(Errno::EINVAL);
         };
-        match self.provider.create(parent, name) {
-            Ok(node) => reply.created(&TTL, &to_attr(&node), GENERATION, 0, 0),
-            Err(e) => {
-                tracing::error!(%e, parent, name, "create failed");
-                reply.error(errno(&e));
-            }
+        if parent.0 == wusel_core::state::ROOT_INODE && is_trash_name(name) {
+            return reply.error(Errno::EACCES);
         }
+        self.go(
+            Pending::Created(reply),
+            parent.0,
+            Intent::Materialise {
+                name: name.to_string(),
+                dir: false,
+            },
+        );
     }
 
     fn mkdir(
-        &mut self,
-        _req: &Request<'_>,
-        parent: u64,
+        &self,
+        _req: &Request_,
+        parent: INodeNo,
         name: &OsStr,
         _mode: u32,
         _umask: u32,
         reply: ReplyEntry,
     ) {
         let Some(name) = name.to_str() else {
-            return reply.error(libc::EINVAL);
+            return reply.error(Errno::EINVAL);
         };
-        match self.provider.mkdir(parent, name) {
-            Ok(node) => reply.entry(&TTL, &to_attr(&node), GENERATION),
-            Err(e) => {
-                tracing::error!(%e, parent, name, "mkdir failed");
-                reply.error(errno(&e));
-            }
+        // Refuse the file manager's attempt to create a `.Trash-<uid>` at the
+        // mount root: no top-directory trash here means "move to trash" falls
+        // back to a real delete (which lands in Nextcloud's own trash).
+        if parent.0 == wusel_core::state::ROOT_INODE && is_trash_name(name) {
+            return reply.error(Errno::EACCES);
         }
+        self.go(
+            Pending::Entry(reply),
+            parent.0,
+            Intent::Materialise {
+                name: name.to_string(),
+                dir: true,
+            },
+        );
     }
 
-    fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+    fn unlink(&self, _req: &Request_, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         self.remove(parent, name, reply);
     }
 
-    fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+    fn rmdir(&self, _req: &Request_, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         self.remove(parent, name, reply);
     }
 
     fn rename(
-        &mut self,
-        _req: &Request<'_>,
-        parent: u64,
+        &self,
+        _req: &Request_,
+        parent: INodeNo,
         name: &OsStr,
-        newparent: u64,
+        newparent: INodeNo,
         newname: &OsStr,
-        _flags: u32,
+        _flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
         let (Some(name), Some(newname)) = (name.to_str(), newname.to_str()) else {
-            return reply.error(libc::EINVAL);
+            return reply.error(Errno::EINVAL);
         };
-        match self.provider.rename(parent, name, newparent, newname) {
-            Ok(()) => reply.ok(),
-            Err(e) => {
-                tracing::error!(%e, parent, name, "rename failed");
-                reply.error(errno(&e));
-            }
+        // Do not let a rename create a top-directory trash at the root either.
+        if newparent.0 == wusel_core::state::ROOT_INODE && is_trash_name(newname) {
+            return reply.error(Errno::EACCES);
         }
+        self.go(
+            Pending::Empty(reply),
+            parent.0,
+            Intent::Move {
+                from_name: name.to_string(),
+                to_parent: ObjectId(newparent.0),
+                to_name: newname.to_string(),
+            },
+        );
     }
 
     fn setattr(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
+        &self,
+        _req: &Request_,
+        ino: INodeNo,
         _mode: Option<u32>,
         _uid: Option<u32>,
         _gid: Option<u32>,
@@ -528,154 +578,88 @@ impl Filesystem for NcFs {
         _atime: Option<TimeOrNow>,
         mtime: Option<TimeOrNow>,
         _ctime: Option<SystemTime>,
-        _fh: Option<u64>,
+        _fh: Option<FileHandle>,
         _crtime: Option<SystemTime>,
         _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>,
-        _flags: Option<u32>,
+        _flags: Option<BsdFileFlags>,
         reply: ReplyAttr,
     ) {
-        // We honour truncation (`size`) and mtime (propagated on the next
-        // upload as X-OC-Mtime); other attrs are accepted as no-ops.
-        if let Some(size) = size {
-            if let Err(e) = self.provider.truncate(ino, size) {
-                tracing::error!(%e, ino, size, "truncate failed");
-                return reply.error(errno(&e));
-            }
-        }
-        if let Some(mtime) = mtime {
-            // Signed conversion: a pre-epoch timestamp (`touch -t 196912...`,
-            // archive tools restoring old mtimes) must stay negative rather
-            // than collapse to 0 = 1970-01-01.
-            let secs = match mtime {
-                TimeOrNow::SpecificTime(t) => unix_from_system_time(t),
-                TimeOrNow::Now => unix_from_system_time(SystemTime::now()),
-            };
-            if let Err(e) = self.provider.set_mtime(ino, secs) {
-                tracing::error!(%e, ino, "set mtime failed");
-                return reply.error(errno(&e));
-            }
-        }
-        match self.provider.node(ino) {
-            Ok(Some(node)) => reply.attr(&TTL, &to_attr(&node)),
-            Ok(None) => reply.error(libc::ENOENT),
-            Err(e) => reply.error(errno(&e)),
-        }
+        // Signed conversion: a pre-epoch timestamp (`touch -t 196912…`, archive
+        // tools restoring old mtimes) must stay negative rather than collapse
+        // to 1970-01-01.
+        let mtime = mtime.map(|t| match t {
+            TimeOrNow::SpecificTime(t) => unix_from_system_time(t),
+            TimeOrNow::Now => unix_from_system_time(SystemTime::now()),
+        });
+        self.go(Pending::Attr(reply), ino.0, Intent::SetAttr { size, mtime });
     }
 
     fn flush(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
-        _lock_owner: u64,
+        &self,
+        _req: &Request_,
+        ino: INodeNo,
+        fh: FileHandle,
+        _lock_owner: LockOwner,
         reply: ReplyEmpty,
     ) {
-        self.upload(ino, reply);
+        // Measured, not assumed: the kernel delivers this for a killed reader
+        // while its reads are still open. Whatever this handle still has running
+        // has nobody waiting for it — and over a metered link that is the user's
+        // bandwidth, not merely tidiness.
+        self.abandon_reads(fh.0);
+        self.go(Pending::Empty(reply), ino.0, Intent::Publish);
     }
 
     fn fsync(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
+        &self,
+        _req: &Request_,
+        ino: INodeNo,
+        _fh: FileHandle,
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
-        self.upload(ino, reply);
+        self.go(Pending::Empty(reply), ino.0, Intent::Publish);
     }
 
     fn release(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        &self,
+        _req: &Request_,
+        ino: INodeNo,
+        fh: FileHandle,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        self.upload(ino, reply);
+        // The handle is finished with, so nothing it started can still be wanted.
+        self.abandon_reads(fh.0);
+        self.reads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&fh.0);
+        self.go(Pending::Empty(reply), ino.0, Intent::Publish);
     }
 }
 
 impl NcFs {
-    /// Build the full listing for one directory stream: `.` and `..`, the
-    /// provider's children, plus the synthetic root markers. Called once per
-    /// `opendir` (and as the `readdir` fallback for an unknown fh); errors map
-    /// straight to the errno the caller replies with.
-    fn dir_entries(&mut self, ino: u64) -> Result<Vec<(u64, FileType, String)>, i32> {
-        // The directory's own inode + parent, for `.` and `..`.
-        let node = match self.provider.node(ino) {
-            Ok(Some(n)) if n.is_dir => n,
-            Ok(Some(_)) => return Err(libc::ENOTDIR),
-            Ok(None) => return Err(libc::ENOENT),
-            Err(e) => {
-                tracing::error!(%e, ino, "readdir: node lookup failed");
-                return Err(errno(&e));
-            }
-        };
-        let children = match self.provider.list_dir(ino) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!(%e, path = %node.path, "readdir failed");
-                return Err(errno(&e));
-            }
-        };
-        // One log line per listing (built once per stream, not per readdir
-        // chunk). Cached listings produce no PROPFIND line, so this is their
-        // only trace.
-        tracing::debug!(path = %node.path, entries = children.len(), "readdir");
-
-        let mut entries: Vec<(u64, FileType, String)> = Vec::with_capacity(children.len() + 2);
-        entries.push((ino, FileType::Directory, ".".to_string()));
-        entries.push((node.parent, FileType::Directory, "..".to_string()));
-        for c in children {
-            let kind = if c.is_dir {
-                FileType::Directory
-            } else {
-                FileType::RegularFile
-            };
-            entries.push((c.inode, kind, c.name));
-        }
-        // Synthetic indexer-exclusion markers, root only (a root marker excludes
-        // the whole subtree). Never in the listing from the server.
-        if self.markers && ino == wusel_core::state::ROOT_INODE {
-            for (mino, mname) in MARKERS {
-                entries.push((mino, FileType::RegularFile, mname.to_string()));
-            }
-        }
-        Ok(entries)
-    }
-
-    /// Shared body for `unlink`/`rmdir`.
-    fn remove(&mut self, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+    /// Shared body for `unlink` and `rmdir` — one operation, so one script.
+    fn remove(&self, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let Some(name) = name.to_str() else {
-            return reply.error(libc::EINVAL);
+            return reply.error(Errno::EINVAL);
         };
-        match self.provider.remove(parent, name) {
-            Ok(()) => reply.ok(),
-            Err(e) => {
-                tracing::error!(%e, parent, name, "remove failed");
-                reply.error(errno(&e));
-            }
-        }
-    }
-
-    /// Shared body for `flush`/`fsync`/`release`: upload if dirty.
-    fn upload(&mut self, ino: u64, reply: ReplyEmpty) {
-        match self.provider.flush(ino) {
-            Ok(()) => reply.ok(),
-            Err(e) => {
-                tracing::error!(%e, ino, "flush failed");
-                reply.error(errno(&e));
-            }
-        }
+        self.go(
+            Pending::Empty(reply),
+            parent.0,
+            Intent::Remove {
+                name: name.to_string(),
+            },
+        );
     }
 }
 
 /// Build FUSE attributes from a state row.
-fn to_attr(node: &NodeRow) -> FileAttr {
+pub(crate) fn to_attr(node: &NodeRow) -> FileAttr {
     let t = system_time_from_unix(node.mtime);
     // Reflect the server's permissions: drop the write bits when the entry is not
     // writable (a read-only share or group folder), so the mode matches what the
@@ -688,7 +672,7 @@ fn to_attr(node: &NodeRow) -> FileAttr {
         (false, false) => (FileType::RegularFile, 0o444, 1),
     };
     FileAttr {
-        ino: node.inode,
+        ino: INodeNo(node.inode),
         size: node.size,
         blocks: node.size.div_ceil(512),
         atime: t,
@@ -797,12 +781,35 @@ impl Drop for Teardown {
 pub fn mount(mountpoint: &std::path::Path, mut provider: Provider) -> anyhow::Result<()> {
     tracing::info!(mountpoint = %mountpoint.display(), "mounting wusel");
 
-    let options = vec![MountOption::FSName("wusel".into())];
+    // fuser 0.18 takes a structured `Config` instead of a `&[MountOption]`. It is
+    // `#[non_exhaustive]`, so it must be built from `default()` and mutated, not a
+    // struct literal.
+    let mut config = Config::default();
+    config.mount_options = vec![MountOption::FSName("wusel".into())];
+    // NOTE: `x-gvfs-notrash` is deliberately NOT passed here. fuser puts a
+    // `CUSTOM` option into the kernel mount-data string, and the FUSE kernel
+    // rejects the unknown option — the mount then never comes up (proved by the
+    // atomic-save mount-e2e). `x-gvfs-notrash` is a userspace mount option and
+    // must reach GIO via fstab / utab, not the kernel; that is an install-time
+    // integration, tracked separately. The filesystem-side refusal of trash
+    // directories (see `is_trash_name` / `is_trash_path`) is the desktop-agnostic
+    // mechanism and needs no mount option.
+    // Concurrency (Etappe 6): run this many FUSE dispatch threads, so independent
+    // operations are served in parallel. Left at 1 by default (single-threaded,
+    // the pre-concurrency behaviour); a value > 1 is a deliberate config choice.
+    // The engine runtime is already sized to match (see `Provider::new`), and all
+    // shared frontend state is behind locks / the owner thread, so this is safe to
+    // turn up. `n_threads` is only set above 1 — leaving it unset keeps fuser's
+    // own single-threaded default.
+    let dispatch_threads = provider.dispatch_threads();
+    if dispatch_threads > 1 {
+        config.n_threads = Some(dispatch_threads);
+    }
 
     // Take the syncer's kernel-invalidation stream before moving the provider in;
     // a background thread turns each event into a FUSE notification so a file
     // manager sitting in a directory sees server-side add/removes without a manual
-    // refresh. We use `Session` (not `mount2`) so we can get its `Notifier`.
+    // refresh. We use `Session` (not `mount`) so we can get its `Notifier`.
     let invalidations = provider.take_invalidations();
     let markers = provider.exclude_from_indexers();
     // Capture what the drain thread needs before the provider moves into the
@@ -810,13 +817,60 @@ pub fn mount(mountpoint: &std::path::Path, mut provider: Provider) -> anyhow::Re
     // mountpoint (to turn a remote path into the on-disk path the desktop knows).
     let desktop = provider.desktop();
     let mount_root = mountpoint.to_path_buf();
-    let fs = NcFs {
-        provider,
-        markers,
-        dir_streams: std::collections::HashMap::new(),
-        next_dir_fh: 0,
+    // The substrate: the deciding thread, the database readers and writer, and
+    // the network and file pools. The Provider hands over its own parts rather
+    // than having us assemble them from pieces we would have to be told about.
+    let ctx = provider.substrate_context();
+    let pools = Pools {
+        db_readers: dispatch_threads.max(2),
+        net: dispatch_threads.max(4),
+        file: dispatch_threads.max(2),
     };
-    let mut session = fuser::Session::new(fs, mountpoint, &options)?;
+    let (substrate, answers) = Substrate::start(&ctx, pools)?;
+
+    let replies = Arc::new(Replies::new());
+
+    // Serve the engine's internal state on a per-user socket, so `wusel doctor`
+    // can read what the mount is doing — the stuck flow, the parked replies —
+    // without a debugger. Best-effort and name-free; a socket that will not bind
+    // never stops the mount. Take the handle now, before the substrate moves
+    // into the session below. `_diag_socket` lives to the end of `mount`, which
+    // removes the socket file when the mount ends.
+    let _diag_socket = crate::diag::DiagSocket::bind(
+        wusel_core::config::diag_socket_for_mount(mountpoint),
+        substrate.diag_handle(),
+        Arc::clone(&replies),
+    );
+    let dirs = Arc::new(Mutex::new(DirStreams {
+        streams: std::collections::HashMap::new(),
+        next_fh: 0,
+    }));
+    // The reply pump runs on its own thread and not on the deciding one:
+    // `reply.data()` writes to /dev/fuse, which is I/O, and the decider does
+    // none by construction.
+    let _pump = spawn_pump(
+        answers,
+        Arc::clone(&replies),
+        PumpContext {
+            dirs: Arc::clone(&dirs),
+            markers,
+        },
+    );
+
+    // The Provider is no longer on the request path — the substrate is — but it
+    // still owns the background syncer and the revalidator, so it has to
+    // outlive the session rather than be dropped here.
+    let _engine = provider;
+
+    let fs = NcFs {
+        substrate,
+        replies,
+        dirs,
+        reads: Arc::new(Mutex::new(HashMap::new())),
+        next_fh: AtomicU64::new(0),
+        markers,
+    };
+    let mut session = fuser::Session::new(fs, mountpoint, &config)?;
 
     // Without AutoUnmount we own the teardown, twice over: `Teardown` drops the
     // kernel mount however `mount()` returns, and the signal thread turns a
@@ -835,18 +889,35 @@ pub fn mount(mountpoint: &std::path::Path, mut provider: Provider) -> anyhow::Re
     };
     unmount_on_signal(session.unmount_callable(), finished);
     if let Some(rx) = invalidations {
-        let notifier = session.notifier();
+        // The kernel notifier is deliberately not taken here: its two calls are
+        // disabled below (see the note). Re-add `session.notifier()` when they
+        // come back.
         std::thread::Builder::new()
             .name("wusel-fuse-inval".into())
             .spawn(move || {
                 while let Ok(inv) = rx.recv() {
+                    // NOTE (under investigation): the kernel-cache invalidations
+                    // below — `notify_inval_entry` / `notify_inval_inode` — are
+                    // the one thing this mount does that an ordinary filesystem
+                    // never does, and they are the remaining suspect for a
+                    // reported freeze: navigating out of a directory and back
+                    // leaves Nautilus showing a blank view, with the daemon never
+                    // asked to re-read. A busy shared server fires these
+                    // constantly (every push → sync walk), so they land while the
+                    // user is navigating.
+                    //
+                    // They are disabled here to confirm that and to give a usable
+                    // build. What is lost is only *live* appearance of add/removes
+                    // in an already-open window — the kernel picks them up on its
+                    // own one-second attribute/entry TTL, and on the next reload.
+                    // The desktop emblem refresh (`file_changed`) is kept: it goes
+                    // through the file manager's own extension, not the kernel, so
+                    // it cannot cause this.
                     match inv {
-                        Invalidation::Entry { parent, name, path } => {
-                            // Drop the kernel's cached dentry so add/removes show;
-                            // ENOENT just means nothing was cached, which is fine.
-                            let _ = notifier.inval_entry(parent, OsStr::new(&name));
-                            // Push the on-disk path to the desktop so a file
-                            // manager re-reads this file's emblem live.
+                        Invalidation::Entry { path, .. } => {
+                            desktop.file_changed(&mount_root.join(&path).to_string_lossy());
+                        }
+                        Invalidation::Content { path, .. } => {
                             desktop.file_changed(&mount_root.join(&path).to_string_lossy());
                         }
                     }
@@ -856,6 +927,9 @@ pub fn mount(mountpoint: &std::path::Path, mut provider: Provider) -> anyhow::Re
     }
     // `_teardown` drops after this returns — including on the `?` — so the
     // mountpoint is released whether the session ended by unmount or by error.
+    // `run` consumes the session, so `NcFs` drops when it returns, which stops
+    // the substrate: its threads are joined by that drop, and the reply pump
+    // ends when the answer channel closes with them.
     session.run()?;
     Ok(())
 }
@@ -864,22 +938,10 @@ pub fn mount(mountpoint: &std::path::Path, mut provider: Provider) -> anyhow::Re
 mod tests {
     use super::*;
 
-    /// A negative offset must become EINVAL, not a silent "end of directory".
-    /// The kernel never sends one, but the FUSE wire format allows it, and this
-    /// is the same contract `read`/`write` already enforce. (The `readdir`
-    /// callback itself needs a live mount to drive — the end-to-end coverage
-    /// lives in `tests/rewinddir_e2e.rs`.)
-    #[test]
-    fn negative_readdir_offsets_are_rejected() {
-        assert_eq!(dir_offset(-1), Err(libc::EINVAL));
-        assert_eq!(dir_offset(i64::MIN), Err(libc::EINVAL));
-    }
-
-    #[test]
-    fn non_negative_readdir_offsets_pass_through() {
-        assert_eq!(dir_offset(0), Ok(0));
-        assert_eq!(dir_offset(42), Ok(42));
-    }
+    // (The old `dir_offset` negative-rejection tests are gone with the helper:
+    // fuser 0.18 types the readdir offset as `u64`, so a negative value is now
+    // impossible at the type level rather than rejected at runtime. The readdir
+    // end-to-end coverage lives in `tests/rewinddir_e2e.rs`.)
 
     /// The timestamp conversion must survive both ends of the `i64` range.
     /// `utimensat(…, tv_sec = i64::MIN)` reaches `setattr` as exactly this

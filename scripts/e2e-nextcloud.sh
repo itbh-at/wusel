@@ -42,7 +42,51 @@ WUSEL_PID=""
 fail() { echo "!! E2E FAIL: $*" >&2; exit 1; }
 ok()   { echo ">> ok: $*"; }
 
+# 3G link emulation for the responsiveness checks (steps 9 and 10). We shape
+# BOTH directions: downloads (a read stalls on these — step 9) and uploads (a
+# write/flush stalls on these — step 10). Egress is the root qdisc; ingress
+# cannot be rate-limited directly, so it is redirected to an intermediate `ifb`
+# device and shaped there. Profile: a few Mbit/s at mobile latency, so one large
+# transfer takes many seconds — long enough that an operation stuck on it visibly
+# freezes an unrelated `stat`. Needs NET_ADMIN + iproute2 (both from the dev
+# container).
+NET_IF="${NET_IF:-eth0}"
+NET_3G_RATE="${NET_3G_RATE:-3mbit}"
+NET_3G_DELAY="${NET_3G_DELAY:-150ms}"
+net_3g_on() {
+    # Egress (upload) shaping: the interface's root qdisc.
+    tc qdisc add dev "$NET_IF" root netem delay "$NET_3G_DELAY" rate "$NET_3G_RATE"
+    # Ingress (download) shaping: redirect to an ifb device and shape that.
+    ip link add ifb0 type ifb 2>/dev/null || true
+    ip link set ifb0 up
+    tc qdisc add dev "$NET_IF" handle ffff: ingress
+    tc filter add dev "$NET_IF" parent ffff: protocol ip u32 match u32 0 0 \
+        action mirred egress redirect dev ifb0
+    tc qdisc add dev ifb0 root netem delay "$NET_3G_DELAY" rate "$NET_3G_RATE"
+}
+net_3g_off() {
+    tc qdisc del dev "$NET_IF" root 2>/dev/null || true
+    tc qdisc del dev "$NET_IF" ingress 2>/dev/null || true
+    tc qdisc del dev ifb0 root 2>/dev/null || true
+    ip link del ifb0 2>/dev/null || true
+}
+
+# Latency-only shaping for the concurrency check (step 12). Deliberately NOT
+# bandwidth-limited: two downloads sharing one throttled pipe finish in the same
+# wall time whether or not they overlap, which would hide parallelism. High
+# latency with ample bandwidth instead lets concurrent transfers overlap their
+# round-trips, so parallel is measurably faster than sequential — but only if the
+# engine really runs them at once (multi-threaded runtime + dispatch threads).
+NET_LATENCY="${NET_LATENCY:-300ms}"
+net_latency_on() {
+    tc qdisc add dev "$NET_IF" root netem delay "$NET_LATENCY"
+}
+net_latency_off() {
+    tc qdisc del dev "$NET_IF" root 2>/dev/null || true
+}
+
 cleanup() {
+    net_3g_off  # never leave the link shaped, even if step 9 aborts mid-way
     fusermount3 -u "$MNT" 2>/dev/null || true
     if [ -n "$WUSEL_PID" ]; then
         kill "$WUSEL_PID" 2>/dev/null || true
@@ -124,13 +168,50 @@ cat > "$XDG_CONFIG_HOME/wusel/config.toml" <<EOF
 [sync]
 text_merge = true
 revalidate_secs = 3600
+[mount]
+dispatch_threads = 4
 EOF
 ok "credentials + config written"
 
-# --- 3. Seed a base file on the server -------------------------------------
+# --- 3. Seed files on the server (BEFORE mounting) -------------------------
 printf 'line1: base\nline2: base\nline3: base\n' > "$WORK/base.txt"
 curl -fsS "${AUTH[@]}" -T "$WORK/base.txt" "$DAV/merge.txt" >/dev/null
 ok "seeded merge.txt on the server"
+
+# The responsiveness check (step 9) needs a large online-only file and a small
+# cached one. They MUST be seeded before the mount: this image has no notify_push
+# ("relying on TTL revalidation" in the log) and the config pins the directory
+# TTL at 3600s for the merge test, so a file uploaded out of band AFTER the mount
+# never enters the cached listing and stays invisible. Seeded here, both are in
+# the mount's initial PROPFIND. big.bin is never read before step 9, so it stays
+# online-only (uncached) — exactly the transfer the check puts under load.
+echo ">> seeding big.bin (256 MiB) + small.txt for the responsiveness check ..."
+dd if=/dev/urandom of="$WORK/big.bin" bs=1M count=256 status=none
+curl -fsS "${AUTH[@]}" -T "$WORK/big.bin" "$DAV/big.bin" >/dev/null
+printf 'small\n' > "$WORK/small.txt"
+curl -fsS "${AUTH[@]}" -T "$WORK/small.txt" "$DAV/small.txt" >/dev/null
+ok "seeded big.bin + small.txt on the server"
+
+# hydra.bin: a large file used only to measure hydration cost (step 12). It is
+# pinned — which forces a whole-file download — and never range-read, so the
+# GET count against it (checked on the host in podman-e2e.sh) is exactly the
+# hydration's: one streamed GET now, versus one per 8 MiB chunk before Etappe 5.
+# 64 MiB = 8 chunk-GETs the old way. Seeded before the mount, like the others.
+echo ">> seeding hydra.bin (64 MiB) for the hydration-cost measurement ..."
+dd if=/dev/urandom of="$WORK/hydra.bin" bs=1M count=64 status=none
+curl -fsS "${AUTH[@]}" -T "$WORK/hydra.bin" "$DAV/hydra.bin" >/dev/null
+ok "seeded hydra.bin on the server"
+
+# Four equal, online-only files for the concurrency check (step 12): par1/par2
+# are read in parallel, seq1/seq2 back to back. Each is read exactly once (never
+# before step 12), so no cache-clear is needed. Seeded before the mount so they
+# are in the initial listing.
+echo ">> seeding par1/par2/seq1/seq2 (32 MiB each) for the concurrency check ..."
+for f in par1 par2 seq1 seq2; do
+    dd if=/dev/urandom of="$WORK/$f.bin" bs=1M count=32 status=none
+    curl -fsS "${AUTH[@]}" -T "$WORK/$f.bin" "$DAV/$f.bin" >/dev/null
+done
+ok "seeded the concurrency-check files on the server"
 
 # --- 4. Mount ---------------------------------------------------------------
 echo ">> mounting at $MNT ..."
@@ -161,6 +242,56 @@ for _ in $(seq 1 "$UPLOAD_TIMEOUT_S"); do
 done
 [ "$srv" = "hello from the mount" ] || fail "new file did not upload: '$srv'"
 ok "write-back upload works"
+
+# --- 6b. Large file through the mount (chunked upload NG) -------------------
+# A file larger than one 4 MiB chunk, copied INTO the mount, must chunk-upload
+# (MKCOL + PUT parts + MOVE assemble) and reassemble byte-for-byte on a *real*
+# Nextcloud. This is the path a real "cp big file" takes, and the one the mock
+# cannot vouch for: the mock concatenates the parts, whereas Nextcloud assembles
+# them and enforces OC-Total-Length. Not covered before, and exactly what a
+# tester reported failing.
+echo ">> copying a 12 MiB file through the mount (chunked upload NG) ..."
+dd if=/dev/urandom of="$WORK/big-up.bin" bs=1M count=12 status=none
+want="$(sha256sum "$WORK/big-up.bin" | cut -d' ' -f1)"
+cp "$WORK/big-up.bin" "$MNT/big-up.bin"
+sync
+got=""
+for _ in $(seq 1 "$UPLOAD_TIMEOUT_S"); do
+    if curl -fsS "${AUTH[@]}" "$DAV/big-up.bin" -o "$WORK/big-up.down" 2>/dev/null; then
+        got="$(sha256sum "$WORK/big-up.down" | cut -d' ' -f1)"
+        [ "$got" = "$want" ] && break
+    fi
+    sleep 1
+done
+[ "$got" = "$want" ] || fail "large file did not chunk-upload intact: want $want got ${got:-<none>}"
+ok "chunked upload through the mount works"
+
+# --- 6c. Overwrite a large file in place (the "compress to ZIP" pattern) ----
+# A file manager building a ZIP creates the target and then rewrites it; each
+# rewrite of a >4 MiB file is a chunked upload with `If-Match: <etag>`. If that
+# conditional MOVE misbehaves the engine reads it as a conflict and parks a
+# "conflicted copy" — which is exactly the flood of `(conflicted copy …).zip`
+# files a tester saw. Overwrite big-up.bin in place, and assert both that the
+# new content lands AND that no conflicted copy was created.
+echo ">> overwriting the 12 MiB file in place (no conflict copies expected) ..."
+dd if=/dev/urandom of="$WORK/big-up2.bin" bs=1M count=12 status=none
+want2="$(sha256sum "$WORK/big-up2.bin" | cut -d' ' -f1)"
+cp "$WORK/big-up2.bin" "$MNT/big-up.bin"
+sync
+got2=""
+for _ in $(seq 1 "$UPLOAD_TIMEOUT_S"); do
+    if curl -fsS "${AUTH[@]}" "$DAV/big-up.bin" -o "$WORK/big-up2.down" 2>/dev/null; then
+        got2="$(sha256sum "$WORK/big-up2.down" | cut -d' ' -f1)"
+        [ "$got2" = "$want2" ] && break
+    fi
+    sleep 1
+done
+[ "$got2" = "$want2" ] || fail "overwrite of a large file did not land: want $want2 got ${got2:-<none>}"
+# No conflicted copy may have appeared in the directory listing.
+copies="$(curl -fsS "${AUTH[@]}" -X PROPFIND -H 'Depth: 1' "$DAV/" 2>/dev/null \
+    | grep -c 'conflicted copy' || true)"
+[ "$copies" = 0 ] || fail "overwriting a large file spawned $copies conflicted copies"
+ok "in-place overwrite of a large file works (no conflict copies)"
 
 # --- 7. Pin keeps a file offline -------------------------------------------
 "$WUSEL" pin merge.txt
@@ -202,5 +333,116 @@ if curl -fsS "${AUTH[@]}" -X PROPFIND -H 'Depth: 1' "$DAV/" \
   fail "expected a clean merge but a conflicted copy was created"
 fi
 ok "3-way text merge combined both non-overlapping edits, no conflict copy"
+
+# --- 9. Responsiveness under a running transfer (throttled 3G link) --------
+# The property under test: an unrelated, purely local operation must be served
+# while a large read is in flight. With a single dispatch thread it is not —
+# `stat` queues behind the transfer, which is what makes a file manager freeze.
+# On a fast localhost link each 8 MiB range GET returns in ~50 ms, so the freeze
+# is invisible; we throttle the download to a 3G link so one range GET blocks the
+# dispatch thread for several seconds and the freeze becomes measurable. big.bin
+# and small.txt were seeded before the mount (step 3), so both are already in the
+# cached listing here — no out-of-band upload to wait on.
+ls "$MNT" >/dev/null                       # both nodes are known from the listing
+cat "$MNT/small.txt" >/dev/null            # cache the small one (local content)
+net_3g_on
+cat "$MNT/big.bin" > /dev/null &           # the (now slow) transfer under test
+READER_PID=$!
+sleep 2                                     # let it enter a chunked range GET
+# Probe every 1.1 s — longer than the 1 s attribute TTL — so each stat forces a
+# fresh getattr onto the dispatch thread rather than being served from the
+# kernel's attribute cache. The reader stays blocked on the throttled link for
+# the whole window (256 MiB at 3 Mbit/s far outlasts the probes), so on a single
+# dispatch thread every probe queues behind it and times out.
+STALLS=0
+for _ in $(seq 1 8); do
+    kill -0 "$READER_PID" 2>/dev/null || break   # transfer finished; stop probing
+    timeout 2 stat "$MNT/small.txt" >/dev/null 2>&1 || STALLS=$((STALLS + 1))
+    sleep 1.1
+done
+kill "$READER_PID" 2>/dev/null || true     # we bounded the read; no need to finish
+wait "$READER_PID" 2>/dev/null || true
+net_3g_off
+[ "$STALLS" -eq 0 ] || fail "$STALLS of the probes stalled >2s while a read was in flight"
+ok "the mount stays responsive during a large transfer (3G link)"
+
+# --- 10. Ordering and responsiveness under a running upload ----------------
+# Two writes to the same file in quick succession must reach the server in
+# order: an event-driven write path must queue per inode, not race. On the
+# sequential write path this holds trivially; it is the guard that keeps the
+# event-driven rewrite (Etappe 4) honest.
+printf 'first\n' > "$MNT/order.txt"
+printf 'second\n' > "$MNT/order.txt"
+sync
+final=""
+for _ in $(seq 1 "$UPLOAD_TIMEOUT_S"); do
+    final="$(curl -fsS "${AUTH[@]}" "$DAV/order.txt" 2>/dev/null || true)"
+    [ "$final" = "second" ] && break
+    sleep 1
+done
+[ "$final" = "second" ] || fail "write ordering violated, server has '$final'"
+ok "writes to one file keep their order"
+
+# A large upload must not stall unrelated operations either. Throttled to 3G so
+# the upload's flush holds the write path for many seconds; a stat on an
+# unrelated, already-cached file (small.txt, cached in step 9) must still return
+# promptly. Probe every 1.1 s (> the 1 s attribute TTL) so each stat forces a
+# fresh, dispatch-bound getattr.
+dd if=/dev/urandom of="$WORK/up.bin" bs=1M count=64 status=none
+net_3g_on
+cp "$WORK/up.bin" "$MNT/up.bin" &          # blocks in close() on the throttled flush
+UPLOADER_PID=$!
+sleep 3                                     # let the writes finish and the flush begin
+STALLS=0
+for _ in $(seq 1 8); do
+    kill -0 "$UPLOADER_PID" 2>/dev/null || break   # upload finished; stop probing
+    timeout 2 stat "$MNT/small.txt" >/dev/null 2>&1 || STALLS=$((STALLS + 1))
+    sleep 1.1
+done
+net_3g_off                                  # unthrottle so the upload can finish
+wait "$UPLOADER_PID" 2>/dev/null || true
+[ "$STALLS" -eq 0 ] || fail "$STALLS probes stalled >2s while an upload was in flight"
+ok "the mount stays responsive during a large upload (3G link)"
+
+# --- 11. Hydration cost: pinning a whole file is ONE GET -------------------
+# Pin hydra.bin (never range-read), which forces a whole-file download. Since
+# Etappe 5 that is a single streamed GET instead of one per 8 MiB chunk. The GET
+# count against hydra.bin is asserted on the host (podman-e2e.sh reads the
+# Nextcloud access log); here we just trigger the hydration and confirm the file
+# is now served locally.
+"$WUSEL" pin hydra.bin
+"$WUSEL" pins | grep -q 'hydra.bin' || fail "hydra.bin not listed as pinned"
+[ "$(stat -c %s "$MNT/hydra.bin")" = "$((64 * 1024 * 1024))" ] || fail "pinned hydra.bin has the wrong size"
+ok "pinned hydra.bin (hydration cost checked on the host)"
+
+# --- 12. Two transfers actually overlap (informational) --------------------
+# The hard, deterministic proof that reads run concurrently lives in the mock
+# test `two_reads_run_in_parallel` (fixed per-GET delay, no throughput effects).
+# This real-server timing is kept for visibility but is NOT a pass/fail gate: a
+# `netem delay` link throttles per-connection throughput (delayed ACKs shrink the
+# window), so two parallel transfers largely *share* the pipe and the wall-clock
+# speedup is small and noisy — and a from-0 sequential `cat` also kicks off a
+# background whole-file hydration that competes. We log the numbers (ms) and warn
+# if parallel was not faster, without failing the run.
+ls "$MNT" >/dev/null
+net_latency_on
+t0=$(date +%s%3N)
+cat "$MNT/par1.bin" >/dev/null &
+P1=$!
+cat "$MNT/par2.bin" >/dev/null &
+P2=$!
+wait "$P1" "$P2"
+t_par=$(($(date +%s%3N) - t0))
+t0=$(date +%s%3N)
+cat "$MNT/seq1.bin" >/dev/null
+cat "$MNT/seq2.bin" >/dev/null
+t_seq=$(($(date +%s%3N) - t0))
+net_latency_off
+echo ">> parallel ${t_par}ms vs sequential ${t_seq}ms (informational; see the mock test for the gate)"
+if [ "$t_par" -lt "$t_seq" ]; then
+    ok "concurrent transfers overlapped (${t_par}ms < ${t_seq}ms)"
+else
+    echo ">> note: parallel was not faster this run (${t_par}ms vs ${t_seq}ms) — expected on a throughput-throttled link; the deterministic proof is the mock test"
+fi
 
 echo ">> E2E PASSED"

@@ -21,7 +21,15 @@ Legend: ✅ done · ◐ works, refinement pending · ⬜ planned
   real-mount tests run in a podman container. `wusel-core` tests run natively on
   Linux and macOS.
 * ✅ `wusel` CLI: `login`, `mount`, `service`, `pin` / `unpin` / `pins`,
-  `accounts` / `account`, `desktop`, `cache`, `search-provider`.
+  `accounts` / `account`, `desktop`, `cache`, `search-provider`, `doctor`.
+* ✅ `wusel doctor` — a support-diagnostics command that collects system, daemon
+  (per-thread kernel wait-channels), mount (`/sys/fs/fuse` `waiting` count),
+  configuration and connectivity, and asks the running daemon for its internal
+  state over a per-user socket. Redacted by default (name-free engine view, no
+  secrets, home/username masked); writes a `.txt` and `.json` bundle with `-o`.
+  Built because talking a non-technical user through `cat /sys/fs/fuse/…` is not
+  viable, and commercial support needs a one-command bundle. See
+  xref:troubleshooting.adoc[Troubleshooting].
 * ✅ Per-account configuration (`config.toml`) and multiple named accounts, each
   with its own credentials, state, cache and mountpoint. Scoped logging via
   `RUST_LOG`.
@@ -33,6 +41,22 @@ Legend: ✅ done · ◐ works, refinement pending · ⬜ planned
 * ✅ Credentials in the OS keyring by default (freedesktop Secret Service — works
   with gnome-keyring, KWallet, KeePassXC), fail-soft to a `0600` file; opt out
   with `[auth] keyring = false`. See xref:architecture.adoc[_Credential storage_].
+
+=== Concurrency (released in 0.2.0)
+
+* ✅ *The mount runs on a state machine*: every callback becomes an engine
+  intent; a deciding thread that performs no I/O hands steps to database
+  readers, one writer, and network and file pools. One collision policy replaces
+  the coordination that used to be written per operation. See
+  xref:concurrency.adoc[Concurrency].
+* ✅ *Proven against a real Nextcloud* (`mise run e2e-local`): responsive during
+  both a large download and a large upload over a throttled 3 Mbit link, write
+  ordering preserved, one GET per hydration, and concurrent transfers
+  overlapping.
+* ✅ *Cancellation*: a reader that dies mid-transfer is noticed through the
+  `flush` the kernel delivers for it, and the transfer is given up rather than
+  run out. Measured behaviour, not an assumption — `interrupt_probe.rs` stays in
+  the tree as the regression guard.
 
 === The virtual filesystem (VFS-first)
 
@@ -51,6 +75,12 @@ Legend: ✅ done · ◐ works, refinement pending · ⬜ planned
   rename / mkdir / truncate — with chunked upload for large files, conflict
   detection via `If-Match` (a conflicted copy by default, opt-in 3-way text
   merge), read-only entries rejected, and mtime propagated.
+* ✅ *Asynchronous* write-back (the default): `close` returns once the change is
+  durable locally and the upload runs in the background, so a slow server never
+  blocks a save and a file manager copying many files does not stall. Durable
+  and resumable across a crash; transient failures retry with backoff, permanent
+  ones are parked and reported; an *uploading* / *sync-error* emblem shows where
+  each change is. `[sync] upload = sync` keeps the synchronous behaviour.
 * ✅ Change detection: `notify_push` (WebSocket) for instant invalidation, with
   TTL + ETag revalidation as the fallback.
 
@@ -70,34 +100,82 @@ Legend: ✅ done · ◐ works, refinement pending · ⬜ planned
 
 == Refinements (near-term)
 
+* ⬜ **Handle an authentication failure (401) as a first-class state — high
+  priority.** Today wusel has none: `error_for_status` folds a 401 into a generic
+  HTTP error, indistinguishable from a 500 or a dropped connection. The session
+  is never marked invalid, the user is never told, and every later operation
+  runs into the same 401 on its own. Our low, push-driven request cadence keeps
+  that a trickle rather than the storm a busier client would make — but the
+  architecture is the same gap.
++
+The aim is to be better than *both* official clients, which fail at opposite
+extremes. The iOS app has no central handler and retries blindly. The desktop
+client does treat 401 centrally, but as a *terminal* failure — several official
+and third-party clients "remove the local account entirely" on a 401, deleting
+cached state and forcing re-onboarding, which is destructive because a 401 does
+not distinguish a deleted user from one temporarily disabled (a known
+server-side ambiguity, nextcloud/server#57877).
++
+So the target sits between them: detect a 401 centrally, mark the session
+invalid, *pause* the background loops instead of re-hitting it, and tell the user
+with an actionable notice ("your login is no longer valid — sign in again"). Never
+delete anything — a disabled account may be re-enabled, and the pins, cache and
+config must survive it. A `Notice` variant for it (there is none today; the
+closest is `ConnectionLost`), and a re-auth path that resumes the loops once a
+fresh app password is in place.
+
 * ◐ The 3-way text merge is implemented and covered by mock end-to-end tests, but
   not yet verified against a live Nextcloud — treat it as experimental until it is.
-* ◐ Emblem refresh is best-effort (it fires when hydration completes, so a
-  large/queued download delays it); a transient "syncing" emblem at the moment an
-  open starts would make it immediate. The emblem is always correct on the next
-  view reload.
+* ◐ Emblem refresh announces a file *arriving* in the cache on every route
+  since 0.2.0, but not a file leaving it — see _Telling the desktop the truth_
+  below. A transient "syncing" emblem at the moment an open starts would also
+  make the arrival immediate rather than merely prompt.
 * ⬜ Proper gettext i18n (`.po`/`.mo`) for the file-manager labels — currently a
   small built-in de/en table.
+* ✅ **Versioned documentation with a version selector.** The published site now
+  builds every version: `main` as "latest" plus each release tag as its number,
+  with the bottom-left menu to switch. The version is supplied by the *site*
+  playbook (`antora-playbook-site.yml`, run by `build.sh site`), not by
+  `antora.yml` — a value there would override the mapping, which is precisely how
+  the pre-versioning tags collided when first tried (they carry `version: ~`).
+  `v0.1.0` stays excluded; `v0.2.0` was re-tagged onto a commit whose `antora.yml`
+  omits the key, so it joins the menu as `0.2.0`, and each `vX.Y.Z` from then on
+  appears automatically. Local editing is unaffected — `antora-playbook.yml`
+  still previews the working tree via `build.sh` / `build.sh watch`.
 * ⬜ Re-crawl a pinned directory to pick up files added after the pin; prefetch
   policy and exclusion patterns.
-* ⬜ Refresh pinned files proactively when the server copy changes. Today the
-  sync walk only updates the state ETag, which marks the pinned blob stale; the
-  fresh content arrives on the *next read* — until then, a user going offline
-  keeps the old version. The walk already sees exactly which entries changed,
-  so it could trigger re-hydration for pinned paths directly (full-file
-  downloads by design: WebDAV offers no delta transfer, only per-file change
-  detection via ETag).
-* ⬜ **Concurrent FUSE dispatch (a worker pool)** — the largest performance win
-  available to the frontend. Today `fuser`'s session loop handles one request at
-  a time, so every blocking call serialises the whole mount: a running hydration
-  delays the file manager's per-file emblem lookups behind it, and a `cp` from
-  the mount and an `ls` elsewhere take turns for no reason. Dispatching to a pool
-  costs a blocked *worker* instead of the whole filesystem. The work is not the
-  pool but giving up the exclusive access the engine is built on — `Provider`
-  takes `&mut self`, and SQLite runs on one connection without locks precisely
-  because the loop guarantees one caller — so it needs a connection per worker or
-  a serialised state layer, plus interior synchronisation for write buffers,
-  readahead windows and pins. See xref:architecture.adoc[_FUSE ↔ async bridge_].
+* ✅ **Serve a stale pinned file when the server is unreachable.** It was a
+  defect, not a missing feature: a pinned blob was served only while its ETag
+  still matched, so once the server copy changed the read fell through to the
+  network even though the complete file was on disk — and offline it simply
+  failed, breaking the pin promise in exactly the situation someone pins for. A
+  transport failure now falls back on the copy we have (a 404 does not: the file
+  is genuinely gone). Serving it is announced rather than silent, once per file,
+  because an application opening it and saving produces a conflicted copy the
+  user never saw coming.
+* ✅ Refresh pinned files when the server copy changes — staleness made
+  *visible* instead of silently fetched. A fifth per-file state (`pinned-stale`),
+  an explicit "Update now" action (`wusel update <path>` and the context menu),
+  and one aggregated notification per sync walk instead of one per file.
+  `[sync] refresh_pinned` is `manual` / `ask` / `auto`, where `auto` fetches only
+  on an unmetered connection — NetworkManager reports it, and anything short of a
+  clear "not metered" degrades to `ask`. Refreshing *on open* is the one moment
+  avoided: that is when someone is waiting and a poor connection hurts most.
+  Whole files either way — Nextcloud has no delta transfer. Design in
+  xref:concurrency.adoc[Concurrency], where the invalidation simply starts the
+  same hydration flow a read would.
+* ⬜ **Concurrent FUSE dispatch** — the fix for interactive *stalls*, not for
+  transfer speed. Today a blocking call serialises the whole mount: a running
+  hydration delays the file manager's emblem lookups behind it. The design — an
+  I/O-free decision thread, a per-inode state machine, and the environment
+  assumptions it refuses to make — has its own page:
+  xref:concurrency.adoc[Concurrency]. Not implemented; stages 1 and 2 there are
+  worth doing on their own.
+* ⬜ **Stream hydration in one response.** A whole-file fetch currently issues one
+  range GET per chunk; `reqwest` can stream a single response to disk with the
+  same bounded memory. Fewer round-trips, and the natural shape for an
+  event-driven read path. Plausibly the larger *throughput* win of the two —
+  which of them dominates is unmeasured, so profile before committing to either.
 * ⬜ Read-ahead/prefetch for sequential reads; optional sparse/range caching for
   huge, partially-read files (whole-file-per-file stays the model).
 * ⬜ Advisory locking (WebDAV LOCK) to warn on the web-editor vs. local-editor case.
@@ -105,6 +183,78 @@ Legend: ✅ done · ◐ works, refinement pending · ⬜ planned
   kernel-coherent).
 * ⬜ Multi-account search; a propagating-root-ETag `Depth: 0` optimisation to skip
   unchanged subtrees.
+
+=== Telling the desktop the truth
+
+Found by using 0.2.0 on a real Fedora/GNOME desktop, and **done**. All four had
+the same shape: the engine knew something had changed and told nobody, so what
+the user saw was right only by accident — the emblem correct on the next view
+reload, the file current after the attribute TTL expired. Correct by timeout is
+not correct.
+
+* ✅ **A file leaving the cache is announced.** Eviction reports the file ids it
+  dropped; a small thread on the engine side turns them into paths, because the
+  cache layer has no state database and should not get one. Pinning and
+  unpinning are announced by whoever performs them — `wusel pin` runs in its own
+  process while the daemon holds the mount, so the daemon's channel cannot know.
+
+* ✅ **The kernel is told when a file's content changed on the server.**
+  `Invalidation::Content` carries the object, and the frontend turns it into
+  `inval_inode`, dropping cached pages *and* attributes. Writing the test found
+  a worse defect behind it: a cold listing asked for a background refresh it had
+  just performed, and that second PROPFIND recorded the server's state before
+  the syncer ever compared — so a change made in between was invisible.
++
+NOTE: This is **not** inotify. FUSE reverse-invalidation does not generate
+fsnotify events, so an editor watching the file is still not woken by itself —
+whether recent kernels have changed that is worth checking before promising
+anything. What is achievable is dependable reloading *on request*.
+
+* ✅ **Errors say what failed.** All 23 arms name the job and the cause, at
+  `debug` — some failures are ordinary, and warning about those would teach
+  people to ignore the warnings. A test reads the source and refuses the shape
+  that throws the error away, because it is a comfortable shape to write.
+
+=== Editing an outdated offline copy
+
+Under `[sync] open_pinned = offline` (and `newest-unmetered` on a metered
+connection) an outdated offline copy is served, and it is **read-only** — see
+xref:concurrency.adoc[Concurrency]. Allowing the edit instead would let somebody
+work on a train, and the conflict machinery to land it already exists. What is
+missing is the part that makes it correct.
+
+**Changing the base version is not an addition to the feature, it is its
+precondition.** An upload names the version its edit is based on, and the server
+accepts or refuses on that basis. Today the write buffer is filled from the
+server's current version and records *that* ETag, so the statement is true. If
+the edit were allowed on the outdated copy without changing it, the upload would
+name a version the edit does not rest on — and the server would accept it,
+replacing the newer file with no conflict raised. The read-only rule exists to
+keep that state from arising at all; it is not caution about a defect, there is
+no defect to be cautious about.
+
+So the work is four changes, and no new conflict handling — the 412 arises by
+itself once the stated base is the real one:
+
+* ⬜ Fill the write buffer from the **local blob** rather than the server.
+  `hydrate_to` copies the blob only when it is fresh and otherwise fetches live.
+* ⬜ Record the **blob's** ETag as the buffer's base, not the row's. That needs
+  a fact for "the version the user is actually looking at", which the read path
+  now decides but does not report.
+* ⬜ Let `cached_bytes` hand out the outdated blob as the three-way merge's
+  base. It is the right base — that is the version that was edited — but the
+  method returns `None` unless the blob is fresh, so today the result would
+  always be a conflict copy rather than a merge.
+* ⬜ Lift the read-only rule for this case.
+
+Then a text file merges against the version that was actually edited, and
+anything else becomes a conflict copy. Offline, the upload simply fails and the
+buffer waits, as it already does.
+
+**Open question before any of it:** whether this should apply to every mode or
+only to `offline`. Under `newest-unmetered` on a metered connection, saving
+would download the server's version for the merge — the very cost the setting
+exists to avoid.
 
 == Later
 
@@ -141,11 +291,72 @@ unclear). A chrome-less editor emulates a "local office" that can still co-edit
 with colleagues — enough for Office files, for now. For plain text, the opt-in
 xref:architecture.adoc[3-way merge] already gives a familiar, git-style middle
 ground.
-* ⬜ *macOS frontend (far-future experiment)*: a native File Provider extension, an
-  adapter over the `Provider` facade — not FUSE.
-* ⬜ *Windows frontend (far-future experiment)*: the Cloud Filter API via
-  `windows-rs` — native placeholders + Explorer status, on the official API (no
-  FUSE-style shim).
+* ⬜ *A second platform (far-future experiment)*. The order is deliberate: the
+  Linux frontend is finished first and completely — a half-built frontend proves
+  nothing about portability — and only then does a second one start. What has to
+  be true *now* so that second frontend costs a port rather than a rewrite is
+  recorded in xref:frontends.adoc[Frontends and portability], together with the
+  reasoning that makes **Windows the structurally easier candidate**.
++
+** ⬜ *Windows*: the Cloud Filter API via `windows-rs` — native placeholders +
+   Explorer status, on the official API (no FUSE-style shim). Range-based
+   hydration, which is the shape our content path already has.
+** ⬜ *macOS*: a native File Provider extension — not FUSE. Additionally demands
+   a signed, notarized app bundle with a sandboxed extension and a bridge into
+   Swift, which is packaging work Windows does not ask for.
+
+* ⬜ *A Flutter management UI over the same core (far-future)*. This is the
+  xref:#_refinements_near_term[configuration UI] point extended past the Linux
+  desktop, and it is where the "maybe a UI one day" question meets our house
+  toolkit. `flutter_rust_bridge` lets a single Flutter codebase call `wusel-core`
+  the way the CLI does — no re-implementation.
++
+The line that must not blur: Flutter is the *control surface*, never the
+filesystem. It carries login, accounts, options, status and pin/conflict
+management; it cannot *be* the FUSE mount, the iOS File Provider extension, or the
+Android `DocumentsProvider`, which are OS-mandated native hosts that link the
+same core. So the shape is two consumers of one `wusel-core`: the Flutter app,
+and the native VFS host beside it.
++
+Two consequences worth recording now. The near-term item keeps the *desktop* UI
+minimal because the desktop already supplies status and notifications (sidebar,
+emblems, freedesktop) — that reasoning inverts on mobile, where none of it
+exists, so the Flutter app must carry the chrome itself: minimal on desktop,
+fuller on mobile, one codebase. And on mobile the app and the native extension
+are separate processes, so the core's state — SQLite, config, `pins.json` — has
+to live in a shared container (iOS App Group, Android shared storage) or the two
+see different truths. On the Linux desktop the daemon owns that state and the UI
+talks to it instead.
++
+.How the app reaches the core, so it is not re-invented later
+There are **two** communication paths, and only the first is uniform across the
+five operating systems:
+
+. *In-process FFI — the universal path.* Where the Flutter app links the core
+  directly (login, accounts, settings, reading state), both live in one process
+  and talk over the C ABI. `flutter_rust_bridge` generates the Dart↔Rust glue —
+  Rust `async` becomes a Dart `Future`, a Rust stream a Dart `Stream`, errors
+  stay typed — and it is identical everywhere because it is just a linked
+  library. Only the *packaging* differs: a `.so`/`.dll`/`.dylib` on the desktop,
+  a per-ABI `.so` via `cargo-ndk` on Android, an `.xcframework` (device +
+  simulator, arm64) on iOS. This is the path the App↔core conversation runs on.
+. *Cross-process coordination — necessarily per-platform.* Where a separate VFS
+  host exists (the Linux daemon, the iOS File Provider extension, the Android
+  `DocumentsProvider`), two processes are involved and there is no single
+  mechanism: a Unix socket or D-Bus on Linux, `ContentResolver.notifyChange` on
+  Android, and on iOS a shared App Group container plus
+  `NSFileProviderManager.signalEnumerator` — iOS forbids arbitrary IPC between an
+  app and its extension.
+
+The design keeps path 2 small by making **shared on-disk state the contract**,
+not a live protocol: `pins.json`, the config, the SQLite database. Each process
+links the same core and applies it to the same files — the pin file's mtime
+reload we already ship is exactly this pattern — so all that is left to send is a
+thin "wake up and re-read" signal, and only *that* signal is platform-specific.
+
+Strictly after a mobile *frontend* exists (see the second-platform item and
+xref:frontends.adoc[Frontends and portability]); a management UI with no VFS host
+under it manages nothing.
 
 [#licensing]
 == Licensing

@@ -50,25 +50,32 @@ fn mount_lists_reads_and_reports_statfs() {
 
     // --- writing through the kernel ---
 
-    // Create a new file: the write reaches the server and reads back.
+    // Create a new file: the write reaches the server (asynchronously) and reads
+    // back from the mount immediately (read-your-writes, served from the buffer).
     std::fs::write(mnt.join("new.txt"), b"created").unwrap();
-    assert_eq!(std::fs::read(fixture.join("new.txt")).unwrap(), b"created");
     assert_eq!(std::fs::read(mnt.join("new.txt")).unwrap(), b"created");
+    common::eventually("new.txt on the server", || {
+        std::fs::read(fixture.join("new.txt")).unwrap_or_default() == b"created"
+    });
 
     // Overwrite an existing file (open O_TRUNC → write → flush).
     std::fs::write(mnt.join("Notes.txt"), b"OVERWRITTEN").unwrap();
-    assert_eq!(
-        std::fs::read(fixture.join("Notes.txt")).unwrap(),
-        b"OVERWRITTEN"
-    );
+    common::eventually("Notes.txt overwritten on the server", || {
+        std::fs::read(fixture.join("Notes.txt")).unwrap_or_default() == b"OVERWRITTEN"
+    });
 
-    // mkdir, rename, unlink.
+    // mkdir (created on the server synchronously), then rename and unlink. The
+    // rename's server effect follows the upload it moves, so it is waited for.
     std::fs::create_dir(mnt.join("NewDir")).unwrap();
     assert!(fixture.join("NewDir").is_dir());
     std::fs::rename(mnt.join("new.txt"), mnt.join("renamed.txt")).unwrap();
-    assert!(fixture.join("renamed.txt").is_file() && !fixture.join("new.txt").exists());
+    common::eventually("rename reflected on the server", || {
+        fixture.join("renamed.txt").is_file() && !fixture.join("new.txt").exists()
+    });
     std::fs::remove_file(mnt.join("renamed.txt")).unwrap();
-    assert!(!fixture.join("renamed.txt").exists());
+    common::eventually("unlink reflected on the server", || {
+        !fixture.join("renamed.txt").exists()
+    });
 
     // `m` drops here: unmount + cleanup.
 }

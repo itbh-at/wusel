@@ -35,6 +35,8 @@ wusel-core = { path = "../wusel-core" }
 wusel-fuse = { path = "../wusel-fuse", optional = true }
 wusel-desktop = { path = "../wusel-desktop" }
 clap = { version = "4", features = ["derive"] }
+serde.workspace = true
+serde_json.workspace = true
 reqwest.workspace = true
 tokio.workspace = true
 anyhow.workspace = true

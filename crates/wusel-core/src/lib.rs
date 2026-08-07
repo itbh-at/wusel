@@ -22,6 +22,7 @@ pub mod auth;
 pub mod capabilities;
 pub mod config;
 pub mod content;
+pub mod diag;
 pub mod credentials;
 pub mod desktop;
 pub mod error;
@@ -29,14 +30,23 @@ pub mod ignore;
 pub mod keyring;
 pub mod model;
 pub mod mount;
+pub mod pins;
 pub mod provider;
 pub mod push;
+pub mod runtime;
 pub mod search;
 pub mod state;
+pub mod storage;
 pub mod tls;
 pub mod webdav;
 
 pub use error::{Error, Result};
+
+/// The tokio runtime handle [`provider::Provider::runtime`] hands out, re-exported
+/// so a frontend can name and store it (to run reads off its dispatch thread)
+/// without taking its own tokio dependency — the crate's dependency-minimalism
+/// rule. Calling `spawn_blocking` on it needs no `tokio` import (inherent method).
+pub use tokio::runtime::Handle as RuntimeHandle;
 
 /// Serializes unit tests that mutate or read process-global environment
 /// variables (the `XDG_*` overrides): `cargo test` runs tests in parallel

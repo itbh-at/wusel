@@ -1,0 +1,116 @@
+////
+  // SPDX-License-Identifier: Apache-2.0
+  // Copyright 2026 IT Beratung Hermann GmbH
+////
+
+= Changelog
+
+User-facing changes, newest first. This page and the RPM's `%changelog`
+(`packaging/rpm/wusel.spec`) describe the same releases and must stay in step —
+the RPM is terse because a package changelog is, this page has room to say why.
+
+The format follows https://keepachangelog.com/en/1.1.0/[Keep a Changelog]; the
+project uses https://semver.org/[Semantic Versioning].
+
+== Unreleased
+
+=== Changed
+
+* **Uploads are asynchronous.** Saving a file — `flush`/`close` — used to wait
+  for the upload to finish, so copying several files into the mount could stall
+  the file manager and a slow or offline server blocked every save. Now `close`
+  returns as soon as the change is durable on local disk, and the upload runs in
+  the background. The change is never at risk: it is written to the local buffer
+  and recorded in the state database *before* `close` returns, so it survives a
+  crash, and a failed upload keeps the bytes. A **transient** failure (a 5xx, a
+  timeout, a dropped connection) is retried automatically, on an interval that
+  backs off while a server keeps refusing; a **permanent** one (wrong
+  permissions, a conflict, no quota) is parked and the user is told once. An
+  upload owed when the daemon stops is **resumed at the next start**. The file
+  manager shows where each change is: an *uploading* emblem while it is on its
+  way, a *sync-error* emblem if it was parked. For anyone who wants the old
+  behaviour — a save meaning "on the server" before it returns — `[sync] upload
+  = sync` waits for the upload and reports its real result.
+
+=== Added
+
+* **`wusel doctor` — a support-diagnostics command.** One run collects what a
+  support case needs — system, the daemon and its per-thread kernel
+  wait-channels, the mount table, the FUSE connection's `waiting` count, a timed
+  responsiveness check, the effective configuration, connectivity — and asks the
+  running daemon for its own view of what each object is doing, served on a
+  per-user socket. A `PASS`/`WARN`/`FAIL` summary leads; the headline check is
+  `waiting` held against the daemon's parked-reply count, the signature of a
+  mount that has stopped answering. Redacted by default and safe to attach to a
+  ticket: the engine view is name-free, no directory is listed, no secret is
+  read, and the home path and username are masked. Prints to stdout; `-o PREFIX`
+  also writes `PREFIX.txt` and `PREFIX.json`. See
+  xref:troubleshooting.adoc[Troubleshooting].
+
+== 0.2.0 — 2026-08-01
+
+The release that made wusel concurrent: FUSE callbacks now run in parallel
+instead of one after another on a single thread, so a slow operation no longer
+blocks the others. It also fixes the defects that first showed up when the
+0.1.0 line was used on a real Fedora/GNOME desktop.
+
+=== Added
+
+* **Concurrency.** Every FUSE callback is now an intent handed to a state
+  machine that decides and performs no I/O, with database readers, a single
+  writer, and network and file pools underneath. 0.1.0 served one request at a
+  time; a slow operation no longer blocks unrelated ones. Configurable with
+  `[mount] dispatch_threads`. See xref:concurrency.adoc[Concurrency].
+* **Choose what a stale pinned file does.** `[sync] refresh_pinned =
+  manual | ask | auto` controls whether an out-of-date offline file is fetched
+  *unasked*, where `auto` fetches only on an unmetered connection (NetworkManager
+  reports it). `[sync] open_pinned = newest | newest-unmetered | offline`
+  controls what *opening* one serves. An outdated offline copy served under these
+  settings is read-only, so an edit cannot silently replace the newer version.
+* **Pinned staleness is visible.** A fifth per-file state, `pinned-stale`, an
+  "Update now" action (`wusel update <path>` and a Nautilus menu entry), and one
+  aggregated notification per sync walk rather than one per file.
+
+=== Changed
+
+* **Pins live in `<config>/pins.json`, not the state database.** They are user
+  intent, not a cache, so they now survive `cache clear`, a rebuilt database, and
+  a roaming home directory.
+* **The state database is kept off NFS/CIFS.** On a network home it is relocated
+  to local storage with a loud message, because SQLite cannot lock reliably
+  there. Overridable with `[state] db_path`; never done silently.
+* **Whole-file hydration is a single streamed GET** instead of one range request
+  per chunk.
+* **Nautilus menu entries are prefixed "Wusel - …"**, so it is clear whose
+  commands they are.
+* **`clippy` checks every crate the host OS can build, tests included** — the
+  FUSE frontend was previously never linted.
+
+=== Fixed
+
+* **Atomic saves work.** Saving in GNOME Text Editor (and anything else built on
+  `g_file_replace`) returned an I/O error: the rename over the existing file hit
+  a uniqueness constraint, and the follow-up upload produced a conflicted copy. A
+  rename now replaces its destination and inherits its server identity, so the
+  save is an ordinary overwrite.
+* **A background listing refresh no longer makes the next caller wait for it.**
+  A second `ls`, or a file manager's per-entry lookups, used to queue behind the
+  PROPFIND the first listing triggered.
+* **The file-manager emblem changes on every route** — a file arriving in the
+  cache is announced whether it came from a read, a background hydration, or a
+  write, and a file *leaving* the cache (eviction, unpin) is announced too.
+* **The kernel is told when a file's content changed on the server**, so
+  reopening or reloading it shows the current version instead of a cached one
+  until a TTL expires.
+* **A failed operation says what failed** in the log, instead of surfacing only
+  an errno to the kernel.
+* **A pinned file stays readable when the server is unreachable**, even if the
+  local copy is out of date — an outdated copy beats an error, and serving it is
+  announced.
+
+== 0.1.0 — 2026-07-28
+
+First public release: a VFS-first Nextcloud mount (online-only, on-demand
+hydration, caching, pinning, write-back) with the GNOME desktop integration
+(Nautilus sidebar, emblems, pin/unpin menu, Shell search) and keyring
+credentials by default.

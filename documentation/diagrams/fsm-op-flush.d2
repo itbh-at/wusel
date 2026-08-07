@@ -1,0 +1,167 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 IT Beratung Hermann GmbH
+#
+# The flush script — shared by flush, fsync and release — with conflict
+# resolution as a sub-script (see pages/fsm-scripts.adoc).
+#
+# Render to a committed SVG with:  mise run docs-diagrams
+#
+# The longest script, and the reason the shape pays off: today this is seven
+# nested blocking calls inside one callback, any of which can stand for
+# minutes. As a script it is seven named steps, each separately testable.
+#
+# One rule governs every exit: the buffer is dropped only on success. A failed
+# upload keeps it, so the next flush retries instead of losing the edit.
+
+...@_steps
+
+vars: {
+  d2-config: {
+    layout-engine: elk
+  }
+}
+
+direction: down
+
+entry: "flush · fsync · release — the same script\nupload the buffer if it is dirty. Idempotent" {
+  class: edge
+}
+
+buffered: "a buffer for this inode?\nin-memory map — no I/O to find out" {
+  class: decide
+}
+nothing: "Answer OK\nnothing buffered: already flushed, or never written" {
+  class: edge
+}
+
+ignored: "an ignored file?\nvim swap files, office lock files: they live entirely\nin the buffer and never reach the server" {
+  class: decide
+}
+keep: "Answer OK — keep the buffer\nit IS the file's content until the file is removed" {
+  class: edge
+}
+
+dirty: "dirty?" {
+  class: decide
+}
+discard: "FileIo  drop the clean buffer" {
+  class: io
+}
+
+row: "DbRead  node_by_inode" {
+  class: db
+}
+vanished: "gone — unlinked meanwhile\n(the editor deleted its own swap file)" {
+  class: decide
+}
+drop: "FileIo  drop the buffer, do not resurrect the file" {
+  class: io
+}
+ok_gone: "Answer OK" {
+  class: edge
+}
+
+size: "FileIo  size of the buffer" {
+  class: io
+}
+
+syncing: "desktop indicator → Syncing" {
+  class: state
+}
+
+pre: "the precondition — a decision, not a request\nnever uploaded before → If-None-Match: *\nknown ETag → If-Match: that one\notherwise → unconditional, never claiming the file is absent" {
+  class: decide
+}
+
+big: "larger than one chunk?" {
+  class: decide
+}
+chunked: "Net  chunked upload\nbounded memory" {
+  class: io
+}
+plain: "FileIo  read the buffer, then\nNet  conditional PUT" {
+  class: io
+}
+
+uploaded: "202 / 204 — uploaded" {
+  class: decide
+}
+epoch: "invalidate listings taken before this upload\nso a stale PROPFIND cannot delete the file\nwe just materialised" {
+  class: decide
+}
+etag: "DbWrite  record the new ETag and size" {
+  class: db
+}
+store: "FileIo  copy the buffer into the blob cache\ncopied, never loaded whole — the cache stays hot\nfor the next read" {
+  class: io
+}
+deferred: "was this a deferred create?" {
+  class: decide
+}
+reload: "Net  PROPFIND the parent\nso the row picks up its server-assigned file id.\nWithout it a later rename or delete would think the\nfile exists only locally" {
+  class: io
+}
+reconcile: "DbWrite  reconcile_children" {
+  class: db
+}
+release_buf: "drop the buffer and the pending mtime\ndesktop indicator → Idle" {
+  class: state
+}
+ok: "Answer OK — the inode is idle again" {
+  class: edge
+}
+
+failed: "transport or server error" {
+  class: decide
+}
+retry: "keep the buffer and the pending mtime\ndesktop indicator → Error, and tell the user their\nedit is still only local — data at risk is worth a\nnotification, and the next flush retries" {
+  class: state
+}
+fail: "Fail — the error to the caller" {
+  class: fail
+}
+
+conflict: "412 — the precondition failed:\nsomebody else changed the file meanwhile.\nThe sub-script records the version, stores the bytes\nand reconciles the parent itself, whichever way it\nresolves — so all that is left here is to let the\nbuffer go. See the conflict diagram" {
+  class: decide
+}
+
+interrupt: "The same callback carries the cancellation signal:\na flush while reads are still outstanding on this\nhandle means nobody is waiting for them any more.\nMeasured — the kernel delivers flush at once and\nholds release back until every read is answered" {
+  class: decide
+}
+
+entry -> buffered
+buffered -> nothing: "no"
+buffered -> ignored: "yes"
+ignored -> keep: "yes"
+ignored -> dirty: "no"
+dirty -> discard: "clean"
+discard -> nothing
+dirty -> row: "dirty"
+row -> vanished: "None"
+vanished -> drop
+drop -> ok_gone
+row -> size: "Some(node)"
+size -> syncing
+syncing -> pre
+pre -> big
+big -> chunked: "yes"
+big -> plain: "no"
+chunked -> uploaded
+plain -> uploaded
+chunked -> conflict
+plain -> conflict
+chunked -> failed
+plain -> failed
+uploaded -> epoch
+epoch -> etag
+etag -> store
+store -> deferred
+deferred -> reload: "yes"
+reload -> reconcile
+reconcile -> release_buf
+deferred -> release_buf: "no"
+release_buf -> ok
+conflict -> release_buf: "resolved — drop the buffer"
+failed -> retry
+retry -> fail
+entry -> interrupt: "" {style.stroke-dash: 3}

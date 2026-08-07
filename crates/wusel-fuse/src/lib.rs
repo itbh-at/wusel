@@ -16,6 +16,10 @@
 //! later — File Provider and Cloud Filter — not FUSE.)
 
 #[cfg(target_os = "linux")]
+mod diag;
+#[cfg(target_os = "linux")]
+mod dispatch;
+#[cfg(target_os = "linux")]
 mod fs;
 
 /// Mounts the filesystem at the path `mountpoint` (blocks until unmount).

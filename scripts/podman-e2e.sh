@@ -64,6 +64,7 @@ podman run --rm \
     --network "$NET" \
     --device /dev/fuse \
     --cap-add SYS_ADMIN \
+    --cap-add NET_ADMIN \
     --security-opt label=disable \
     -v "$WORK":/work:Z \
     -e MISE_TRUSTED_CONFIG_PATHS=/work \
@@ -77,3 +78,16 @@ podman run --rm \
         mise run build-fuse
         exec bash scripts/e2e-nextcloud.sh
     '
+
+# Gate 5: hydrating a whole file must cost ONE GET, not one per 8 MiB chunk. The
+# inner test pinned hydra.bin (a 64 MiB file it never range-reads), so every
+# `GET .../hydra.bin` in Nextcloud's own access log belongs to that hydration.
+# The apache image logs each request to stdout, so this is a direct measurement,
+# not an inference from our logs. Runs only if the E2E above passed (`set -e`).
+GETS="$(podman logs "$NC" 2>&1 \
+    | grep -c 'GET /remote.php/dav/files/admin/hydra.bin' || true)"
+echo ">> hydration of hydra.bin cost $GETS GET request(s) (expected 1)"
+[ "$GETS" = "1" ] || {
+    echo "!! GATE 5 FAIL: hydration cost $GETS GET(s), expected 1" >&2
+    exit 1
+}

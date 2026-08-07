@@ -46,6 +46,11 @@ jobs:
         with:
           # This job never pushes; documentation/build.sh only reads the tree.
           persist-credentials: false
+          # The site build sources every version: the `main` branch and each
+          # release tag. That needs the full history and the tags, which a
+          # default shallow checkout does not fetch.
+          fetch-depth: 0
+          fetch-tags: true
       - uses: jdx/mise-action@9e7f7633ff6f6d6048a9418a68d48f288f50eb14 # v4.2.3
         with:
           install: false
@@ -53,11 +58,12 @@ jobs:
       # but only `antora`. watchexec and browser-sync serve `build.sh watch`
       # locally, d2 renders diagrams whose SVGs are committed, and rust/hawkeye
       # belong to the Rust workflow. Naming them keeps this job's footprint to
-      # what an `antora antora-playbook.yml` actually uses.
+      # what the antora build actually uses.
       - name: Install the pinned docs toolchain (node, antora)
         run: mise install node "npm:antora"
       - name: Build the documentation
-        run: mise exec -- ./documentation/build.sh
+        # `site`, not the default: the multi-version, version-selector build.
+        run: mise exec -- ./documentation/build.sh site
       - name: Upload the site artifact
         uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:

@@ -42,7 +42,9 @@ broken mount. Much later, and only as experiments, they will get their own
 on macOS, a Cloud Filter frontend on Windows — each an adapter over the same
 `Provider` facade. We deliberately avoid a FUSE-compatible shim on those
 platforms: if Wusel ships there, it rides the native framework, not an emulated
-FUSE. This is far down the roadmap (see xref:roadmap.adoc[Roadmap]).
+FUSE. This is far down the roadmap (see xref:roadmap.adoc[Roadmap]) — but what
+has to be true *now* for those frontends to stay affordable later is recorded in
+xref:frontends.adoc[Frontends and portability].
 
 === Testing vs. product
 
@@ -56,30 +58,45 @@ Keep these apart:
 
 == Frontend adapters and the `Provider` facade
 
-Every OS gets its own thin frontend, and they all talk to the same engine through
-*one* frontend-agnostic facade in `wusel-core`:
+Every OS gets its own thin frontend, and they all reach the engine the same way:
+by naming an **intent** and letting the machine decide what that costs.
 
 ....
-wusel_core::Provider
-   · list_dir(inode)          · lookup(parent, name)
-   · stat(inode)              · read(inode, offset, len)
+wusel-fsm                    the decider: occupancy, collision policy, scripts
+   Fetch · Write · Stat · Lookup · Enumerate · Materialise
+   Publish · Remove · Move · SetAttr · State · Refresh · Relist
 
-wusel-fuse          (Linux)   — FUSE callbacks       → Provider   [exists]
-wusel-fileprovider  (macOS)   — File Provider ext.   → Provider   [planned]
-wusel-cfapi         (Windows) — Cloud Filter API     → Provider   [planned]
+wusel-core::runtime          the substrate that carries the steps out
+   N database readers · 1 writer · network pool · file pool
+
+wusel-fuse          (Linux)   — FUSE callbacks       → intents   [exists]
+wusel-fileprovider  (macOS)   — File Provider ext.   → intents   [planned]
+wusel-cfapi         (Windows) — Cloud Filter API     → intents   [planned]
 ....
 
-The `Provider` owns the SQLite state, the WebDAV client and the sync↔async bridge,
-and holds all the logic (lazy PROPFIND, hydration, caching, conflict handling). A
-frontend only translates its OS callbacks into `Provider` calls and formats the
-replies — it carries no engine logic of its own.
+Two words carry this, so they are worth stating plainly. An **intent** is what a
+call is meant to *achieve*, independent of the name an operating system gives it
+— which is why `flush`, `fsync` and `release` are one intent and not three. The
+**substrate** is what carries its steps out: the deciding thread, the database
+readers and writer, and the network and file pools.
 
-That logic lives in `wusel-core` as `Provider` — extracted out of `wusel-fuse`,
-which is now a thin adapter — so the future macOS and Windows frontends reuse one
-implementation. Those frontends are separate, additive projects with their own OS
-glue (Swift + a C ABI on macOS; `windows-rs` on Windows) — none of them change the
-engine. That is the strategic advantage of the split: the hard part (protocol,
-sync, state) is written once.
+The alphabet is what the *engine* does, not what one kernel interface calls it:
+`flush`, `fsync` and `release` are one intent because they are one operation, and
+`unlink` and `rmdir` likewise. A frontend maps its platform's callbacks onto
+these and formats the replies; it carries no engine logic of its own.
+
+That matters for more than tidiness. `wusel-fsm` depends on nothing — not on the
+engine, not on a database, not on an HTTP client, not on a FUSE binding — so
+"the deciding thread performs no I/O" is enforced by the compiler rather than by
+review, and a second frontend is a port rather than a rewrite. The reasoning is
+in xref:frontends.adoc[Frontends and portability]; the scripts themselves are in
+xref:fsm-scripts.adoc[The operation scripts].
+
+`wusel-core` keeps what was never per-request: the WebDAV client, the SQLite
+state, pins, the background syncer, and the conflict and reconcile logic the
+substrate calls. The macOS and Windows frontends remain separate, additive
+projects with their own OS glue (Swift + a C ABI on macOS; `windows-rs` on
+Windows) — neither changes the engine, which is the whole point of the split.
 
 == VFS-first / on-demand hydration
 
@@ -94,7 +111,8 @@ items, Windows Cloud Filter placeholders + hydration callbacks):
 | State (`provider::FileState`) | Meaning
 | `online-only` | No local copy; metadata only (from PROPFIND). The default.
 | `cached`      | A whole, ETag-fresh copy sits in the blob cache — evictable.
-| `pinned`      | Kept offline on purpose (the file, an ancestor directory, or the root is pinned); exempt from eviction.
+| `pinned`      | Kept offline on purpose (the file, an ancestor directory, or the root is pinned); exempt from eviction. The pin list lives in `<config>/pins.json`, not in the cache database — it is intent, and survives `cache clear`.
+| `pinned-stale`| Pinned, but the copy we keep no longer matches the server's. Still served when the server is unreachable — an outdated copy beats an error.
 | `modified`    | A local edit not yet uploaded (an open write buffer, or a deferred create).
 |===
 
@@ -559,39 +577,20 @@ happening:
 Only the *first* listing of a directory is synchronous, because there is nothing
 cached to serve yet.
 
-=== The single dispatch thread is a ceiling, not a design goal
+=== The single dispatch thread was a ceiling, and it has been lifted
 
-Both rules above are *mitigations*: they keep the known slow operations off the
-one thread. The thread itself remains a hard serialisation point — `fuser`'s
-session loop reads and dispatches one request at a time — so anything that does
-block it still blocks everything behind it. Two examples that survive the
-mitigations:
+Both rules above were *mitigations*: they kept the known slow operations off the
+one thread, while the thread itself stayed a hard serialisation point. Anything
+that did block it blocked everything behind it — a hydration delayed the file
+manager's per-file emblem lookups, and a `cp` from the mount and an `ls`
+elsewhere took turns for no reason.
 
-* A large hydration is served in chunks, but each chunk is still a network
-  round-trip on the dispatch thread. Meanwhile the file manager's per-file
-  `getxattr` calls (the emblem lookups, individually microseconds) queue behind
-  it. The extension's assumption that reading the xattr is "cheap and local" is
-  true of the *handler* and false of the *queue*, so a big transfer can make the
-  file manager look frozen.
-* Two users of the mount cannot proceed in parallel at all: a `cp` from the
-  mount and an `ls` in another terminal take turns, however unrelated they are.
-
-The fix is genuine concurrency: dispatch each request to a **worker pool** rather
-than handling it inline, so a blocked request occupies one worker instead of the
-whole filesystem. That is the single largest performance improvement available
-to the frontend, and it would also remove the reason the mitigations above have
-to exist.
-
-The cost is not the pool — it is that the engine is currently built for exclusive
-access, deliberately: `Provider` is driven through `&mut self`, and all SQLite
-access runs on one connection with no locking precisely *because* the session
-loop guarantees one caller at a time (see _State_). Concurrency means giving that
-up: a connection per worker or a pooled/serialised state layer, and interior
-synchronisation for the write buffers, the readahead windows and the pin state —
-each of which is currently free of locks by construction. So this is a deliberate
-0.2-and-later project, not a flag to flip; the ordering of `readdir` chunks and
-the write-back invariants have to survive it. See the
-xref:roadmap.adoc[Roadmap].
+That ceiling is gone as of 0.2.0. Every callback is now an intent handed to a
+state machine that decides and performs no I/O, with database readers, a writer,
+and network and file pools underneath it: see xref:concurrency.adoc[Concurrency]
+for the design and xref:fsm-scripts.adoc[The operation scripts] for what each
+operation does. The paragraph above describes 0.1.0, the mitigated
+single-threaded loop.
 
 === Directory streams see a stable listing
 

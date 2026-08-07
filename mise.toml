@@ -51,8 +51,20 @@ description = "Check that all files carry the license header (for CI)"
 run = "hawkeye check"
 
 [tasks.clippy]
-description = "Linter"
-run = "cargo clippy --workspace --exclude wusel-fuse -- -D warnings"
+description = "Linter — every crate this OS can build, tests included"
+# wusel-fuse needs the Linux FUSE driver, so it cannot even be compiled on
+# macOS; excluding it there is not a choice. On Linux it must be linted like
+# everything else — the exclusion used to be unconditional, and the frontend was
+# the one crate nothing ever checked. `mise run fuse-test` lints it in the
+# container for the macOS case, so no path stays unlinted for long.
+run = '''
+if [ "$(uname -s)" = "Linux" ]; then
+    cargo clippy --workspace --all-targets -- -D warnings
+else
+    cargo clippy --workspace --exclude wusel-fuse --all-targets -- -D warnings
+    echo ">> wusel-fuse skipped: Linux-only. It is linted by 'mise run fuse-test'."
+fi
+'''
 
 # The shell scripts carry the release and E2E logic, so they are linted as
 # strictly as the Rust: every finding is an error (-S style), and `-x` lets
@@ -94,7 +106,7 @@ description = "Interactive Linux shell with /dev/fuse (for testing the mount)"
 run = "./scripts/podman-shell.sh"
 
 [tasks.fuse-test]
-description = "Run the FUSE tests (real mount e2e) in the Linux container"
+description = "Run the Linux-only tests (FUSE mount e2e, network-home relocation) in the container"
 run = "./scripts/podman-test.sh"
 
 [tasks.e2e-local]
@@ -115,9 +127,35 @@ run = "./scripts/podman-rpm.sh"
 [tasks.docs-diagrams]
 description = "Render documentation/diagrams/*.d2 to committed SVGs"
 run = '''
+set -uo pipefail
+failed=""
 for f in documentation/diagrams/*.d2; do
+  # Leading underscore = a shared partial pulled in with `...@name`, not a
+  # diagram of its own (see _steps.d2). Rendering it would produce a stray SVG.
+  case "$(basename "$f")" in _*) continue ;; esac
   out="documentation/modules/ROOT/images/$(basename "${f%.d2}").svg"
   echo ">> $f -> $out"
-  d2 --pad 8 --theme 1 "$f" "$out"   # theme 1 = Neutral Gray
+  # Every source is attempted, rather than stopping at the first error: aborting
+  # mid-loop leaves the remaining SVGs silently stale, which is exactly the
+  # failure this task is supposed to make impossible.
+  if ! d2 --pad 8 --theme 1 "$f" "$out"; then   # theme 1 = Neutral Gray
+    failed="$failed $f"
+  fi
 done
+if [ -n "$failed" ]; then
+  echo "" >&2
+  echo "docs-diagrams: failed to render:$failed" >&2
+  echo "The other SVGs were regenerated; these still hold their previous content." >&2
+  exit 1
+fi
+# Record what the SVGs were rendered from, so documentation/build.sh can catch a
+# stale commit without needing d2 at all.
+./documentation/check-diagrams.sh --write
 '''
+
+# --- Documentation diagram staleness ----------------------------------------
+# Verify the committed SVGs still match their D2 sources. Needs only sha256, no
+# d2, so it also runs in the Pages job. The docs build calls this itself.
+[tasks.docs-diagrams-check]
+description = "Check the committed SVGs are current with their D2 sources"
+run = "./documentation/check-diagrams.sh"

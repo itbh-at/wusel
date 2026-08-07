@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
+  <!-- sync-error: the upload failed for good and needs attention. A white
+       exclamation mark on red — the bytes are safe locally, but this one will
+       not retry on its own. -->
+  <circle cx="8" cy="8" r="7" fill="#e01b24"/>
+  <path d="M8 4.1V9.3" fill="none" stroke="#ffffff" stroke-width="1.7"
+        stroke-linecap="round"/>
+  <circle cx="8" cy="11.7" r="0.95" fill="#ffffff"/>
+</svg>

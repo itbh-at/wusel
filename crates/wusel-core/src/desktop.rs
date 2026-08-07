@@ -72,6 +72,19 @@ pub enum Notice {
     /// The server is unreachable or the app password was rejected — the mount is
     /// now silently stale until it recovers.
     ConnectionLost { server: String },
+    /// Pinned files have gone out of date on the server. One message for all of
+    /// them: a colleague reorganising a shared folder can change hundreds at
+    /// once, and hundreds of notifications is a denial of service dressed as
+    /// helpfulness.
+    PinnedOutOfDate { count: usize, first: String },
+    /// An outdated local copy was handed out. The bytes are real and complete,
+    /// they are simply not the newest — and an application that opens them has
+    /// no other way to know.
+    ///
+    /// The reason changes what the user can do about it, so it changes the
+    /// message: waiting for a connection is not the same advice as "update it
+    /// when you want to".
+    StaleCopyServed { path: String, reason: Stale },
     /// Good news: the connection is back after a [`Notice::ConnectionLost`]. We
     /// notify success only when it *resolves* a problem the user was told about —
     /// never routine success (the "sync finished" spam).
@@ -85,9 +98,28 @@ impl Notice {
         match self {
             Notice::ConnectionRestored { .. } => Severity::Success,
             Notice::ConflictCopy { .. } => Severity::Warning,
+            Notice::StaleCopyServed { .. } | Notice::PinnedOutOfDate { .. } => Severity::Warning,
             Notice::UploadFailed { .. } | Notice::ConnectionLost { .. } => Severity::Error,
         }
     }
+}
+
+/// Why an outdated copy was served.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stale {
+    /// The server could not be reached. Nothing to decide; it resolves itself
+    /// when the connection does.
+    ///
+    /// The file is **not** read-only here: that follows from
+    /// [`crate::config::OpenPinned`], and this path is reached whatever it is
+    /// set to — the engine only learns the server is gone once a fetch has
+    /// already failed, which is too late to have withheld the permission. So
+    /// this message warns rather than reassures.
+    Unreachable,
+    /// The configured open policy asked for it — `offline`, or
+    /// `newest-unmetered` on a connection that costs money. The user has a
+    /// choice here, so the message names it.
+    ByChoice,
 }
 
 /// A localized, ready-to-display notification (what a backend hands to the OS).
@@ -138,6 +170,42 @@ impl Notice {
                      out of date until the connection returns."
                 ),
             },
+            Notice::PinnedOutOfDate { count, first } => Message {
+                title: "Offline files have changed".into(),
+                body: if *count == 1 {
+                    format!(
+                        "'{first}' has a newer version on the server. Update it to keep \
+                             your offline copy current."
+                    )
+                } else {
+                    format!(
+                        "{count} offline files have newer versions on the server, \
+                             including '{first}'. Update them to keep your offline copies \
+                             current."
+                    )
+                },
+            },
+            Notice::StaleCopyServed {
+                path,
+                reason: Stale::Unreachable,
+            } => Message {
+                title: "Opened an older version".into(),
+                body: format!(
+                    "The server could not be reached, so '{path}' was opened from your offline \
+                     copy. It may not be the newest — take care before saving over it."
+                ),
+            },
+            Notice::StaleCopyServed {
+                path,
+                reason: Stale::ByChoice,
+            } => Message {
+                title: "Opened the offline version".into(),
+                body: format!(
+                    "'{path}' was opened from your offline copy, as configured. It is read-only \
+                     while it is out of date: use 'Wusel - Update Now' to fetch the current \
+                     version, or copy it elsewhere if you want to work on it right now."
+                ),
+            },
             Notice::ConnectionRestored { server } => Message {
                 title: "Connection restored".into(),
                 body: format!("wusel is connected to {server} again; your folder is up to date."),
@@ -166,6 +234,44 @@ impl Notice {
                 body: format!(
                     "wusel erreicht {server} gerade nicht. Ihr Nextcloud-Ordner ist \
                      möglicherweise nicht aktuell, bis die Verbindung zurück ist."
+                ),
+            },
+            Notice::PinnedOutOfDate { count, first } => Message {
+                title: "Offline-Dateien haben sich geändert".into(),
+                body: if *count == 1 {
+                    format!(
+                        "Von „{first}“ gibt es auf dem Server eine neuere Fassung. \
+                             Aktualisieren Sie sie, damit Ihre Offline-Kopie aktuell bleibt."
+                    )
+                } else {
+                    format!(
+                        "Von {count} Offline-Dateien gibt es auf dem Server neuere \
+                             Fassungen, darunter „{first}“. Aktualisieren Sie sie, damit Ihre \
+                             Offline-Kopien aktuell bleiben."
+                    )
+                },
+            },
+            Notice::StaleCopyServed {
+                path,
+                reason: Stale::Unreachable,
+            } => Message {
+                title: "Ältere Fassung geöffnet".into(),
+                body: format!(
+                    "Der Server war nicht erreichbar, deshalb wurde „{path}“ aus Ihrer \
+                     Offline-Kopie geöffnet. Sie ist möglicherweise nicht die neueste — \
+                     Vorsicht beim Überschreiben."
+                ),
+            },
+            Notice::StaleCopyServed {
+                path,
+                reason: Stale::ByChoice,
+            } => Message {
+                title: "Offline-Fassung geöffnet".into(),
+                body: format!(
+                    "„{path}“ wurde wie eingestellt aus Ihrer Offline-Kopie geöffnet. Sie ist \
+                     schreibgeschützt, solange sie veraltet ist: „Wusel - Jetzt aktualisieren“ \
+                     holt die aktuelle Fassung, oder kopieren Sie die Datei woanders hin, wenn \
+                     Sie jetzt daran arbeiten wollen."
                 ),
             },
             Notice::ConnectionRestored { server } => Message {
@@ -214,6 +320,16 @@ pub trait Desktop: Send + Sync {
     /// without a manual refresh. `abs_path` is the on-disk path in the mount.
     /// Default: no-op (kernel invalidation alone does not always suffice).
     fn file_changed(&self, _abs_path: &str) {}
+
+    /// Is the active connection metered — a phone hotspot, a mobile stick?
+    ///
+    /// `None` means "we do not know", and callers must treat that as *not
+    /// cheap*. Spending somebody's mobile data on a guess is exactly the harm
+    /// this question exists to prevent, and NetworkManager tells us plainly
+    /// enough that guessing has no excuse.
+    fn is_metered(&self) -> Option<bool> {
+        None
+    }
 }
 
 /// The default backend: do nothing. Used whenever no OS integration is available

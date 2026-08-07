@@ -27,4 +27,10 @@ tokio.workspace = true
 # The integration test drives the real client against this mock — pure Rust,
 # no Nextcloud, no Python — proving the two stay contract-compatible.
 wusel-core = { path = "../wusel-core" }
+# The tests drive the engine through the machine, as the mount does.
+wusel-fsm = { path = "../wusel-fsm" }
 reqwest.workspace = true
+# To write a database in the shape an older wusel left it — pins in a table —
+# and watch the migration take them out. The workspace already builds rusqlite;
+# this adds no third-party code, only a test's access to it.
+rusqlite.workspace = true

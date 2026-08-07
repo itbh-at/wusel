@@ -117,8 +117,33 @@ pub trait ContentSource: Send + Sync {
     /// existence check (no read, unlike [`cached_bytes`](Self::cached_bytes)).
     /// The OS integration queries this per file to show a "local" emblem, so it
     /// must stay network-free and O(1). Default: `false`.
+    /// True when a copy is on disk but no longer matches the server version we
+    /// know of. Default: false — only a caching source keeps copies.
+    ///
+    /// Separate from [`is_cached`](Self::is_cached), which answers "usable
+    /// as-is". A stale copy is not usable as-is and is still worth knowing
+    /// about: for a pinned file it is the difference between a promise kept and
+    /// one half-kept.
+    fn is_stale(&self, _node: &NodeRow) -> bool {
+        false
+    }
+
+    /// Give this source a desktop backend, so it can tell the user when it had
+    /// to fall back on an outdated local copy. Default: ignore it — only a
+    /// caching source has anything to say.
+    fn set_desktop(&self, _desktop: std::sync::Arc<dyn crate::desktop::Desktop>) {}
+
     fn is_cached(&self, _node: &NodeRow) -> bool {
         false
+    }
+
+    /// Serve the local copy even though it is out of date, because the engine
+    /// decided that is what the user wants (see [`crate::config::OpenPinned`]).
+    ///
+    /// `None` when there is nothing on disk, in which case the caller reads
+    /// live as usual. Default: no local copies, so never.
+    fn read_outdated(&self, _node: &NodeRow, _offset: u64, _len: u32) -> Option<Vec<u8>> {
+        None
     }
 
     /// Like [`store`](Self::store), but from a file — so a large upload never
@@ -127,12 +152,21 @@ pub trait ContentSource: Send + Sync {
         Ok(())
     }
 
-    /// Write the node's **full** content to `dest`, streaming in chunks — so it
-    /// works for files of any size (`u64` throughout) with only one chunk in
-    /// memory. This seeds a write buffer's base. Default: via `read`.
+    /// Stream the node's **full** content into an already-open `out`, verifying it
+    /// received all `node.size` bytes. Default: a series of [`FETCH_CHUNK`] range
+    /// reads via [`read`](Self::read). A source backed by a single HTTP request
+    /// (see [`LiveWebDav`]) overrides this to stream one whole-file GET, so
+    /// hydrating a file costs one request instead of one per chunk.
+    fn stream_to(&self, node: &NodeRow, out: &mut File) -> Result<()> {
+        stream_full(self, node, out)
+    }
+
+    /// Write the node's **full** content to `dest`, streaming — so it works for
+    /// files of any size (`u64` throughout) with only one chunk in memory. This
+    /// seeds a write buffer's base. Default: via [`stream_to`](Self::stream_to).
     fn hydrate_to(&self, node: &NodeRow, dest: &Path) -> Result<()> {
         let mut out = File::create(dest)?;
-        if let Err(e) = stream_full(self, node, &mut out) {
+        if let Err(e) = self.stream_to(node, &mut out) {
             drop(out);
             let _ = std::fs::remove_file(dest); // never leave a truncated base
             return Err(e);
@@ -162,6 +196,36 @@ impl ContentSource for LiveWebDav {
             .rt
             .block_on(self.dav.get(&node.path, Some((offset, len as u64))))?;
         Ok(bytes.to_vec())
+    }
+
+    /// One whole-file GET, its body streamed straight into `out` — the crux of
+    /// Etappe 5. The old default did `⌈size / FETCH_CHUNK⌉` range GETs; this is a
+    /// single request. `Response::chunk` streams the body without buffering it or
+    /// pulling in a `Stream` combinator crate (dependency minimalism). The
+    /// short-read check stays: a 200 can be truncated, and a truncated blob must
+    /// never be published as complete.
+    fn stream_to(&self, node: &NodeRow, out: &mut File) -> Result<()> {
+        if node.size == 0 {
+            return Ok(()); // empty file: nothing to fetch, like the chunked path
+        }
+        let dav = &self.dav;
+        let path = node.path.as_str();
+        self.rt.block_on(async move {
+            let mut resp = dav.get_streaming(path).await?;
+            let mut written = 0u64;
+            while let Some(chunk) = resp.chunk().await? {
+                out.write_all(&chunk)?;
+                written += chunk.len() as u64;
+            }
+            out.flush()?;
+            if written < node.size {
+                return Err(crate::Error::Other(format!(
+                    "short read: got {written} of {} bytes for {}",
+                    node.size, node.path
+                )));
+            }
+            Ok(())
+        })
     }
 }
 
@@ -323,6 +387,33 @@ impl Drop for ReadWindow {
 pub struct CachingSource {
     inner: Box<dyn ContentSource>,
     dir: PathBuf,
+    /// Where to tell the user that an outdated copy was handed out. Settable
+    /// after construction because the frontend installs the real backend once
+    /// it is up; until then this is the no-op one.
+    desktop: Mutex<std::sync::Arc<dyn crate::desktop::Desktop>>,
+    /// File ids already announced as stale, so a directory of them produces one
+    /// message rather than one per file — and per read, of which there are
+    /// hundreds.
+    announced: Mutex<std::collections::HashSet<u64>>,
+    /// Where to say that a file's local availability changed, so a file manager
+    /// re-reads its emblem.
+    ///
+    /// It belongs *here*, not at one caller: a blob arrives on three different
+    /// routes — a sequential read's spill, a background hydration, and a store
+    /// after an upload — and for a long while only the hydration announced
+    /// itself. The visible result was that PDFs got the "here" emblem and
+    /// Markdown files never did, because a text editor reads from byte 0 (the
+    /// spill path, silent) and a PDF viewer seeks to the trailer (the hydration
+    /// path, which spoke).
+    invalidations: Option<Sender<Invalidation>>,
+    /// Where to report blobs that *left* the cache, by file id.
+    ///
+    /// By id and not by path, because eviction is the one thing here that knows
+    /// neither: it walks the blob directory and deletes by age and size. Turning
+    /// an id back into a path needs the state database, which this layer has no
+    /// business holding — so the id goes out and somebody who does hold it
+    /// resolves the name.
+    evicted: Option<Sender<u64>>,
     /// LRU eviction budget in bytes; `None` = unlimited.
     max_bytes: Option<u64>,
     /// Drop blobs unused for longer than this; `None` = never.
@@ -377,6 +468,8 @@ impl CachingSource {
                 }
             }
         }
+        let invalidations = hydrate.as_ref().and_then(|h| h.invalidations.clone());
+        let evicted = hydrate.as_ref().and_then(|h| h.evicted.clone());
         let hydrator = hydrate.map(|h| {
             Hydrator::new(
                 h.source,
@@ -384,11 +477,16 @@ impl CachingSource {
                 max_bytes,
                 max_age_secs,
                 h.invalidations,
+                h.evicted,
             )
         });
         Self {
             inner,
             dir,
+            invalidations,
+            evicted,
+            desktop: Mutex::new(std::sync::Arc::new(crate::desktop::NullDesktop)),
+            announced: Mutex::new(std::collections::HashSet::new()),
             max_bytes,
             max_age_secs,
             inflight: Mutex::new(HashMap::new()),
@@ -397,6 +495,80 @@ impl CachingSource {
             seen: Mutex::new(HashMap::new()),
             hydrator,
         }
+    }
+
+    /// Report blobs that just left the cache, so their emblems stop claiming
+    /// they are here.
+    fn announce_gone(&self, file_ids: &[u64]) {
+        announce_gone(self.evicted.as_ref(), file_ids);
+    }
+
+    /// Tell the frontend this file's local availability changed, so a file
+    /// manager re-reads its emblem.
+    ///
+    /// Called after a blob is published or dropped — the two moments the answer
+    /// to "is it here?" changes. Cheap and fire-and-forget: a full channel or a
+    /// frontend that is not listening must never hold up a read.
+    fn announce(&self, node: &NodeRow) {
+        if let Some(tx) = &self.invalidations {
+            let _ = tx.send(Invalidation::Entry {
+                parent: node.parent,
+                name: node.name.clone(),
+                path: node.path.clone(),
+            });
+        }
+    }
+
+    /// Serve an outdated copy, and say so.
+    ///
+    /// `None` when there is nothing on disk to fall back on, in which case the
+    /// caller reports the original failure.
+    ///
+    /// The user is told once per file. A file manager drawing a folder issues
+    /// hundreds of reads, and an indexer walks whole trees: one message per read
+    /// would be a denial of service dressed as helpfulness. The emblem is the
+    /// passive channel; this is the active one, and it fires only when outdated
+    /// bytes are really handed out.
+    fn stale_fallback(&self, node: &NodeRow, offset: u64, len: u32) -> Option<Vec<u8>> {
+        self.serve_local_copy(node, offset, len, crate::desktop::Stale::Unreachable)
+    }
+
+    /// Read the local copy whatever its version says, and tell the user once.
+    ///
+    /// Two callers with two reasons — the server is unreachable, or the user
+    /// asked for the offline copy on a connection they do not want to spend —
+    /// and one obligation: an application that opens outdated bytes and saves
+    /// produces a conflict nobody saw coming. The emblem is the passive channel;
+    /// this is the active one, and it fires only when the bytes really go out.
+    fn serve_local_copy(
+        &self,
+        node: &NodeRow,
+        offset: u64,
+        len: u32,
+        reason: crate::desktop::Stale,
+    ) -> Option<Vec<u8>> {
+        let file_id = node.file_id?;
+        let blob = self.dir.join(file_id.to_string());
+        let bytes = read_range_from_file(&blob, offset, len).ok()?;
+        let first = self
+            .announced
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(file_id);
+        if first {
+            tracing::warn!(path = %node.path, ?reason,
+                "serving the local copy, which is out of date");
+            let desktop = self
+                .desktop
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            desktop.notify(&crate::desktop::Notice::StaleCopyServed {
+                path: node.path.clone(),
+                reason,
+            });
+        }
+        Some(bytes)
     }
 
     /// The per-file-id lock, creating it if absent.
@@ -427,7 +599,7 @@ impl CachingSource {
         }
         let part = blob.with_extension("part");
         let mut out = File::create(&part)?;
-        if let Err(e) = stream_full(&*self.inner, node, &mut out) {
+        if let Err(e) = self.inner.stream_to(node, &mut out) {
             drop(out);
             let _ = std::fs::remove_file(&part); // incomplete — do not publish
             return Err(e);
@@ -439,6 +611,7 @@ impl CachingSource {
             let _ = std::fs::remove_file(&part);
             return Err(e);
         }
+        self.announce(node);
         Ok(())
     }
 
@@ -558,6 +731,7 @@ impl CachingSource {
         match publish_blob(&part, &blob, &node.etag) {
             Ok(()) => {
                 tracing::debug!(path = %node.path, "cached whole file after sequential read");
+                self.announce(node);
                 self.enforce_budget();
             }
             Err(e) => {
@@ -596,14 +770,25 @@ impl CachingSource {
 
     /// Best-effort eviction: age-based expiry, then LRU down to the size budget.
     fn enforce_budget(&self) {
-        if let Err(e) = evict(&self.dir, self.max_bytes, self.max_age_secs) {
-            tracing::warn!(%e, "cache eviction failed");
+        match evict(&self.dir, self.max_bytes, self.max_age_secs) {
+            Ok(gone) => self.announce_gone(&gone),
+            Err(e) => tracing::warn!(%e, "cache eviction failed"),
         }
     }
 }
 
 /// True if a complete, ETag-matching blob is on disk. Free function so the
 /// background hydrator (a plain thread) can use it too.
+/// Report evicted blobs on a channel that may not be wired up — the background
+/// hydrator evicts too, and holds the sender itself rather than through a
+/// source.
+fn announce_gone(tx: Option<&Sender<u64>>, file_ids: &[u64]) {
+    let Some(tx) = tx else { return };
+    for id in file_ids {
+        let _ = tx.send(*id);
+    }
+}
+
 fn blob_is_fresh(blob: &Path, etag: &str) -> bool {
     blob.exists()
         && std::fs::read_to_string(etag_path(blob))
@@ -625,7 +810,7 @@ fn download_whole(
     std::fs::create_dir_all(dir)?;
     let part = dir.join(format!("{file_id}.dl"));
     let mut out = File::create(&part)?;
-    if let Err(e) = stream_full(source, node, &mut out) {
+    if let Err(e) = source.stream_to(node, &mut out) {
         drop(out);
         let _ = std::fs::remove_file(&part); // incomplete — do not publish
         return Err(e);
@@ -642,15 +827,20 @@ fn download_whole(
 
 /// Best-effort cache eviction: age-based expiry, then LRU down to the size
 /// budget. Free function so both the read path and the hydrator can call it.
-fn evict(dir: &Path, max_bytes: Option<u64>, max_age_secs: Option<u64>) -> Result<()> {
+/// Returns the file ids whose blobs went, so the caller can say so. A file
+/// leaving the cache changes what the user is shown just as much as one
+/// arriving, and for a long while only the arrival was announced — the emblem
+/// then claimed a file was there until something else happened to refresh it.
+fn evict(dir: &Path, max_bytes: Option<u64>, max_age_secs: Option<u64>) -> Result<Vec<u64>> {
+    let mut evicted = Vec::new();
     if max_bytes.is_none() && max_age_secs.is_none() {
-        return Ok(());
+        return Ok(evicted);
     }
     // Collect blobs (files without an extension; .etag/.part/.dl are skipped).
     let mut blobs: Vec<(PathBuf, u64, std::time::SystemTime)> = Vec::new();
     let rd = match std::fs::read_dir(dir) {
         Ok(r) => r,
-        Err(_) => return Ok(()),
+        Err(_) => return Ok(evicted),
     };
     for entry in rd {
         let entry = entry?;
@@ -674,7 +864,7 @@ fn evict(dir: &Path, max_bytes: Option<u64>, max_age_secs: Option<u64>) -> Resul
         blobs.retain(|(path, _, mtime)| {
             let age = now.duration_since(*mtime).map(|d| d.as_secs()).unwrap_or(0);
             if age > max_age {
-                evict_blob(path);
+                evicted.extend(evict_blob(path));
                 false
             } else {
                 true
@@ -689,12 +879,12 @@ fn evict(dir: &Path, max_bytes: Option<u64>, max_age_secs: Option<u64>) -> Resul
                 if total <= max {
                     break;
                 }
-                evict_blob(path);
+                evicted.extend(evict_blob(path));
                 total = total.saturating_sub(*sz);
             }
         }
     }
-    Ok(())
+    Ok(evicted)
 }
 
 /// Background whole-file hydration: turns "a file was opened" into "it is in the
@@ -708,6 +898,9 @@ fn evict(dir: &Path, max_bytes: Option<u64>, max_age_secs: Option<u64>) -> Resul
 pub struct HydrationConfig {
     pub source: Box<dyn ContentSource>,
     pub invalidations: Option<Sender<Invalidation>>,
+    /// Blobs this worker's own eviction dropped, by file id. See
+    /// [`CachingSource`]'s field of the same name.
+    pub evicted: Option<Sender<u64>>,
 }
 
 struct Hydrator {
@@ -725,6 +918,7 @@ impl Hydrator {
         max_bytes: Option<u64>,
         max_age_secs: Option<u64>,
         invalidations: Option<Sender<Invalidation>>,
+        evicted: Option<Sender<u64>>,
     ) -> Self {
         let (tx, rx) = std::sync::mpsc::channel::<NodeRow>();
         let pending: Arc<Mutex<std::collections::HashSet<u64>>> = Arc::default();
@@ -740,6 +934,7 @@ impl Hydrator {
                     max_bytes,
                     max_age_secs,
                     invalidations,
+                    evicted,
                 )
             })
             .expect("spawn hydration thread");
@@ -772,6 +967,7 @@ fn hydrate_loop(
     max_bytes: Option<u64>,
     max_age_secs: Option<u64>,
     invalidations: Option<Sender<Invalidation>>,
+    evicted: Option<Sender<u64>>,
 ) {
     while let Ok(node) = rx.recv() {
         let file_id = node.file_id.expect("requested only with a file id");
@@ -782,8 +978,9 @@ fn hydrate_loop(
             match download_whole(&*source, &node, &dir, file_id) {
                 Ok(()) => {
                     tracing::debug!(path = %node.path, bytes = node.size, "hydrated into cache");
-                    if let Err(e) = evict(&dir, max_bytes, max_age_secs) {
-                        tracing::warn!(%e, "cache eviction failed");
+                    match evict(&dir, max_bytes, max_age_secs) {
+                        Ok(gone) => announce_gone(evicted.as_ref(), &gone),
+                        Err(e) => tracing::warn!(%e, "cache eviction failed"),
                     }
                     // Nudge the frontend to re-read this file's info, so its
                     // emblem flips online-only → cached without a manual refresh.
@@ -843,12 +1040,33 @@ impl ContentSource for CachingSource {
         // serving stays efficient. Internal bulk transfers (hydration) already
         // read in FETCH_CHUNK strides — pass them straight through, as does any
         // read of a file without the stable cache key (its file id).
-        match node.file_id {
+        let live = match node.file_id {
             // Serve live now; `read_windowed` also decides, from how much of the
             // file has been read, whether to hydrate the whole thing in the
             // background (never on this FUSE thread) — see `hydrate_trigger`.
             Some(file_id) if len < FETCH_CHUNK => self.read_windowed(node, file_id, offset, len),
             _ => self.inner.read(node, offset, len),
+        };
+        match live {
+            Ok(bytes) => Ok(bytes),
+            // The server is unreachable, and a complete copy of this file is
+            // sitting on disk — outdated, but real. Handing it out beats
+            // failing: an outdated copy is enormously better than an error, and
+            // for a pinned file, failing here breaks the promise ("keep this
+            // offline") in exactly the situation it was made for.
+            //
+            // Only a transport failure. A 404 means the file is genuinely gone,
+            // and serving our copy of it would be inventing a file.
+            // Any HTTP failure — a transport error or a server status — may fall
+            // back to a stale pinned copy; a 404 (Error::NotFound) may not, as
+            // the file is genuinely gone and serving our copy would invent one.
+            Err(e @ (crate::Error::Http(_) | crate::Error::HttpStatus { .. })) => {
+                match self.stale_fallback(node, offset, len) {
+                    Some(bytes) => Ok(bytes),
+                    None => Err(e),
+                }
+            }
+            Err(e) => Err(e),
         }
     }
 
@@ -868,6 +1086,10 @@ impl ContentSource for CachingSource {
         }
         drop(lock);
         self.gc_fetch_lock(file_id);
+        // Unconditionally, not only when something was downloaded: pinning a
+        // file that was already cached changes no bytes but does change the
+        // answer to "is this kept offline?", which is what the emblem shows.
+        self.announce(node);
         Ok(())
     }
 
@@ -895,6 +1117,7 @@ impl ContentSource for CachingSource {
             let _ = std::fs::remove_file(&tmp);
             return Err(e);
         }
+        self.announce(node);
         // Reads no longer fill the cache, so a write is the only place an
         // unpinned blob is born — keep it within budget here.
         self.enforce_budget();
@@ -911,9 +1134,25 @@ impl ContentSource for CachingSource {
         }
     }
 
+    fn is_stale(&self, node: &NodeRow) -> bool {
+        let Some(file_id) = node.file_id else {
+            return false;
+        };
+        let blob = self.dir.join(file_id.to_string());
+        blob.is_file() && !blob_is_fresh(&blob, &node.etag)
+    }
+
+    fn set_desktop(&self, desktop: std::sync::Arc<dyn crate::desktop::Desktop>) {
+        *self.desktop.lock().unwrap_or_else(|e| e.into_inner()) = desktop;
+    }
+
     fn is_cached(&self, node: &NodeRow) -> bool {
         node.file_id
             .is_some_and(|fid| self.is_fresh(&self.dir.join(fid.to_string()), &node.etag))
+    }
+
+    fn read_outdated(&self, node: &NodeRow, offset: u64, len: u32) -> Option<Vec<u8>> {
+        self.serve_local_copy(node, offset, len, crate::desktop::Stale::ByChoice)
     }
 
     fn store_file(&self, node: &NodeRow, src: &Path, etag: &str) -> Result<()> {
@@ -933,6 +1172,7 @@ impl ContentSource for CachingSource {
             let _ = std::fs::remove_file(&tmp);
             return Err(e);
         }
+        self.announce(node);
         self.enforce_budget(); // see `store` — writes are the only cache source now
         Ok(())
     }
@@ -982,10 +1222,15 @@ fn publish_blob(tmp: &Path, blob: &Path, etag: &str) -> Result<()> {
 }
 
 /// Delete a blob and its ETag sidecar.
-fn evict_blob(blob: &Path) {
+/// Returns the file id the blob belonged to, when the name still says which —
+/// a blob is named after it, so this is a parse, not a lookup.
+fn evict_blob(blob: &Path) -> Option<u64> {
     let _ = std::fs::remove_file(blob);
     let _ = std::fs::remove_file(etag_path(blob));
     tracing::debug!(?blob, "evicted from cache");
+    blob.file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.parse().ok())
 }
 
 /// Update a blob's mtime to now, so eviction treats it as recently used.
@@ -1432,6 +1677,62 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The bug behind "PDFs get the emblem, Markdown files never do".
+    ///
+    /// A text editor reads a small file from byte 0, which the sequential-read
+    /// spill caches — and that route used to publish the blob without telling
+    /// anybody, so the file manager kept drawing the cloud for a file that was
+    /// sitting on disk. A PDF viewer seeks to the trailer, so no spill starts,
+    /// background hydration runs instead, and *that* route did announce.
+    ///
+    /// Both routes have to speak, so the assertion is about the announcement,
+    /// not about which route ran.
+    #[test]
+    fn caching_a_file_by_reading_it_from_the_start_announces_itself() {
+        let dir = std::env::temp_dir().join(format!("wusel-announce-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let size: usize = 213; // a small README: one read covers the whole file
+        let data = vec![b'x'; size];
+        let (tx, rx) = std::sync::mpsc::channel();
+        let serving = |data: Vec<u8>| Counting {
+            calls: Arc::new(AtomicUsize::new(0)),
+            data,
+        };
+        let hydrate = HydrationConfig {
+            source: Box::new(serving(data.clone())),
+            invalidations: Some(tx),
+            evicted: None,
+        };
+        let cache = CachingSource::new(
+            Box::new(serving(data.clone())),
+            dir.clone(),
+            None,
+            None,
+            Some(hydrate),
+        );
+
+        let n = node(size as u64, "etag-1");
+        assert_eq!(cache.read(&n, 0, size as u32).unwrap().len(), size);
+        assert!(cache.is_cached(&n), "the spill published the blob");
+
+        let announced = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("caching a file must announce it, or the emblem never changes");
+        match announced {
+            Invalidation::Entry { path, name, .. } => {
+                assert_eq!(path, n.path);
+                assert_eq!(name, n.name);
+            }
+            // The cache announces an *entry* — its availability changed, not
+            // its contents. A content change is the syncer's to report.
+            other => panic!("wrong announcement from the cache: {other:?}"),
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn the_seen_tally_stays_bounded_when_many_files_are_only_peeked_at() {
         // A scanner touching a little of very many files: no file ever reaches
@@ -1450,6 +1751,7 @@ mod tests {
         let hydrate = HydrationConfig {
             source: Box::new(counting(vec![1u8; size])),
             invalidations: None,
+            evicted: None,
         };
         let cache = CachingSource::new(
             Box::new(counting(vec![1u8; size])),

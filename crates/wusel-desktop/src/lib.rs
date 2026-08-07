@@ -271,6 +271,41 @@ mod linux {
         fn file_changed(&self, abs_path: &str) {
             let _ = self.tx.send(Msg::FileChanged(abs_path.to_string()));
         }
+
+        fn is_metered(&self) -> Option<bool> {
+            metered_now()
+        }
+    }
+
+    /// Ask NetworkManager whether the active connection costs money.
+    ///
+    /// `NMMetered` is deliberately five-valued, and we keep all five apart:
+    /// `YES`/`GUESS_YES` mean treat it as metered, `NO`/`GUESS_NO` mean it is
+    /// free, and `UNKNOWN` means **unknown** — never "free". Collapsing unknown
+    /// into free is how a two-gigabyte refresh lands on somebody's phone plan.
+    ///
+    /// A read of one property on the system bus, done fresh each time rather
+    /// than cached: the answer changes when the laptop leaves the office, which
+    /// is exactly when it matters.
+    fn metered_now() -> Option<bool> {
+        use zbus::blocking::Connection;
+        let conn = Connection::system().ok()?;
+        let reply = conn
+            .call_method(
+                Some("org.freedesktop.NetworkManager"),
+                "/org/freedesktop/NetworkManager",
+                Some("org.freedesktop.DBus.Properties"),
+                "Get",
+                &("org.freedesktop.NetworkManager", "Metered"),
+            )
+            .ok()?;
+        let value: zbus::zvariant::OwnedValue = reply.body().deserialize().ok()?;
+        let raw: u32 = u32::try_from(value).ok()?;
+        match raw {
+            1 | 3 => Some(true),  // YES, GUESS_YES
+            2 | 4 => Some(false), // NO, GUESS_NO
+            _ => None,            // UNKNOWN — and unknown is not free
+        }
     }
 
     pub fn backend(account: &str, mount_path: &Path) -> Arc<dyn Desktop> {
