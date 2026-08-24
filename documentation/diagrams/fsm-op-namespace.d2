@@ -1,0 +1,167 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 IT Beratung Hermann GmbH
+#
+# Namespace scripts: create, mkdir, unlink and rmdir
+# (see pages/fsm-scripts.adoc).
+#
+# Render to a committed SVG with:  mise run docs-diagrams
+#
+# Note the asymmetry, and that it is deliberate: mkdir goes to the server
+# immediately, create does not. A directory has to exist before anything can
+# be put in it; a file does not, and deferring it means an editor's probe
+# files never reach the server at all.
+
+...@_steps
+
+vars: {
+  d2-config: {
+    layout-engine: elk
+  }
+}
+
+direction: down
+
+create: "Materialise (file) — deferred: nothing is sent here\n(FUSE: create)" {
+  class: decide
+
+  utf8: "name valid UTF-8?" {
+    class: decide
+  }
+  bad: "Fail EINVAL" {
+    class: fail
+  }
+  exists: "DbRead  child_by_name" {
+    class: db
+  }
+  known: "Answer: the existing node" {
+    class: edge
+  }
+  insert: "DbWrite  insert a local node\nno file id yet — that is what marks it\nas not yet materialised on the server" {
+    class: db
+  }
+  epoch: "invalidate in-flight listings\na new child must survive a PROPFIND\nthat was already on its way" {
+    class: decide
+  }
+  buf: "FileIo  create an empty buffer" {
+    class: io
+  }
+  mark: "register it dirty\nA new file is a pending change even with no bytes,\nso touch still creates it. Created and deleted before\nany flush — an editor probe, a temp file — and the\nserver never hears about it" {
+    class: state
+  }
+  ign: "an ephemeral editor or office file?" {
+    class: decide
+  }
+  local: "keep it local-only\nno upload on flush, no DELETE on remove:\nfewer round-trips, and it dodges server quirks" {
+    class: state
+  }
+  ok: "Answer: the new entry" {
+    class: edge
+  }
+
+  utf8 -> bad: "no"
+  utf8 -> exists: "yes"
+  exists -> known: "Some"
+  exists -> insert: "None"
+  insert -> epoch
+  epoch -> buf
+  buf -> mark
+  mark -> ign
+  ign -> local: "yes"
+  ign -> ok: "no"
+  local -> ok
+}
+
+mkdir: "Materialise (directory) — straight to the server\n(FUSE: mkdir)" {
+  class: decide
+
+  utf8: "name valid UTF-8?" {
+    class: decide
+  }
+  bad: "Fail EINVAL" {
+    class: fail
+  }
+  parent: "DbRead  the parent's path" {
+    class: db
+  }
+  mkcol: "Net  MKCOL" {
+    class: io
+  }
+  epoch: "invalidate in-flight listings" {
+    class: decide
+  }
+  reload: "Net  PROPFIND the parent" {
+    class: io
+  }
+  reconcile: "DbWrite  reconcile_children\nthe new directory arrives with its server ids" {
+    class: db
+  }
+  row: "DbRead  child_by_name" {
+    class: db
+  }
+  ok: "Answer: the new entry" {
+    class: edge
+  }
+
+  utf8 -> bad: "no"
+  utf8 -> parent: "yes"
+  parent -> mkcol
+  mkcol -> epoch
+  epoch -> reload
+  reload -> reconcile
+  reconcile -> row
+  row -> ok
+}
+
+remove: "Remove — one script for both\n(FUSE: unlink, rmdir)" {
+  class: decide
+
+  utf8: "name valid UTF-8?" {
+    class: decide
+  }
+  bad: "Fail EINVAL" {
+    class: fail
+  }
+  row: "DbRead  resolve the child by name\nThe kernel names (parent, name), never an identity,\nso the script starts by finding out which object it\nis about to remove" {
+    class: db
+  }
+  miss: "Fail — no such entry" {
+    class: fail
+  }
+  materialised: "does it exist on the server?\n(a deferred create never got a file id)" {
+    class: decide
+  }
+  del: "Net  DELETE\nrecursive for a directory" {
+    class: io
+  }
+  buf: "FileIo  drop the buffer\nforget the pending mtime and the ignored mark" {
+    class: io
+  }
+  pins: "DbRead / DbWrite  drop the pins this subtree carried,\nand the eviction markers beside its blobs.\nA leftover pin marker is not untidy but harmful: those\nbytes stay exempt from the cache budget forever, and a\nlater file handed the same id inherits the protection" {
+    class: db
+  }
+  rows: "DbWrite  remove_subtree" {
+    class: db
+  }
+  epoch: "invalidate in-flight listings\na PROPFIND already on its way must not re-add it" {
+    class: decide
+  }
+  ok: "Answer OK" {
+    class: edge
+  }
+  wait: "A running upload of this file is let finish first —\nit may already have landed, and the DELETE has to\napply to what is really there.\nA background hydration for a pin is aborted instead:\nthe file is gone, so the rest of the download is waste" {
+    class: decide
+  }
+
+  utf8 -> bad: "no"
+  utf8 -> row: "yes"
+  row -> miss: "None"
+  row -> materialised: "Some"
+  materialised -> del: "yes"
+  materialised -> buf: "no — purely local"
+  del -> buf
+  del -> wait
+  buf -> pins
+  pins -> rows
+  rows -> epoch
+  epoch -> ok
+}

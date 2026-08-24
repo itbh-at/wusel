@@ -13,12 +13,15 @@ site:
 
 content:
   sources:
-    # Repo root (one level above this playbook); the component lives in
-    # documentation/. `branches: HEAD` uses the current working tree including
-    # unsaved changes of the checked-out branch.
+    # LOCAL/dev build. `branches: HEAD` uses the current working tree, including
+    # unsaved changes of the checked-out branch — this is what `build.sh` /
+    # `build.sh watch` preview. The published multi-version site uses
+    # antora-playbook-site.yml instead (main → "latest", release tags → their
+    # numbers); the version is not in antora.yml, so it is supplied here too.
     - url: ..
       branches: HEAD
       start_path: documentation
+      version: latest
 
 runtime:
   log:

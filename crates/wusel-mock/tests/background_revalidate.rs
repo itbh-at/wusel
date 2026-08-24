@@ -11,15 +11,11 @@ mod common;
 
 use std::time::Duration;
 
-use wusel_core::config::Account;
-use wusel_core::provider::Provider;
-use wusel_core::state::{StateDb, ROOT_INODE};
-use wusel_core::webdav::WebDavClient;
+use wusel_core::state::ROOT_INODE;
 
-fn names(provider: &mut Provider) -> Vec<String> {
-    let mut v: Vec<String> = provider
+fn names(engine: &common::Engine) -> Vec<String> {
+    let mut v: Vec<String> = engine
         .list_dir(ROOT_INODE)
-        .unwrap()
         .into_iter()
         .map(|n| n.name)
         .collect();
@@ -43,43 +39,40 @@ fn a_listed_directory_is_served_stale_then_revalidated_in_the_background() {
     let mock = common::Mock::serve(&fixture);
     let addr = mock.addr.clone();
 
-    let account = Account::new("default");
-    let dav = WebDavClient::new(
-        reqwest::Client::new(),
-        &format!("http://{addr}"),
-        "alice",
-        "pw",
-    );
-    std::fs::create_dir_all(account.state_db_path().parent().unwrap()).unwrap();
-    let state = StateDb::open(&account.state_db_path()).unwrap();
-    let mut provider = Provider::new(dav, state, &account).unwrap();
+    let engine = common::Engine::start(&addr);
 
     // Initial (synchronous) load lists the one file.
-    assert_eq!(names(&mut provider), vec!["a.txt".to_string()]);
+    assert_eq!(names(&engine), vec!["a.txt".to_string()]);
 
     // The server gains a file; the local listing is cached (and now stale).
     std::fs::write(fixture.join("b.txt"), b"b").unwrap();
 
-    // The very next access is served from the cache — it schedules a background
-    // revalidation but must NOT block on it, so it still shows only a.txt.
-    assert_eq!(
-        names(&mut provider),
-        vec!["a.txt".to_string()],
-        "a stale listing is served immediately, without waiting for the PROPFIND"
+    // The next access is served from the cache and schedules a refresh nobody
+    // waits for. Whether that refresh has already landed by the time we look
+    // again is genuinely a race — against an in-process mock a PROPFIND takes
+    // microseconds — so the *content* here proves nothing either way and is not
+    // asserted. That the caller is never made to wait for the server is proven
+    // where it can be: `concurrent_read_e2e` in the FUSE crate, against an
+    // injected delay.
+    let served = names(&engine);
+    assert!(
+        served.contains(&"a.txt".to_string()),
+        "the cached listing is served, refresh or no refresh"
     );
 
     // The background PROPFIND completes and a later access applies it.
     let mut saw_b = false;
     for _ in 0..60 {
         std::thread::sleep(Duration::from_millis(50));
-        if names(&mut provider).contains(&"b.txt".to_string()) {
+        if names(&engine).contains(&"b.txt".to_string()) {
             saw_b = true;
             break;
         }
     }
     assert!(
         saw_b,
-        "the background revalidation must eventually surface b.txt"
+        "the refresh nobody asked for must eventually surface b.txt — that is \
+         what makes serving a stale listing acceptable in the first place"
     );
 
     std::env::remove_var("WUSEL_REVALIDATE_SECS");

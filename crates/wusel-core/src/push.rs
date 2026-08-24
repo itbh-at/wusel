@@ -64,6 +64,7 @@ pub fn spawn(
     tls_settings: TlsSettings,
     invalidate_after: Arc<AtomicI64>,
     sync_trigger: std::sync::mpsc::Sender<()>,
+    health: Option<Arc<crate::health::Reachability>>,
 ) -> PushListener {
     let stop = Arc::new(AtomicBool::new(false));
     let (server, login, password) = (
@@ -94,6 +95,7 @@ pub fn spawn(
                 &invalidate_after,
                 &sync_trigger,
                 &stop_thread,
+                health.as_deref(),
             ));
         })
         .expect("spawn notify-push thread");
@@ -114,6 +116,7 @@ async fn run(
     invalidate_after: &AtomicI64,
     sync_trigger: &std::sync::mpsc::Sender<()>,
     stop: &AtomicBool,
+    health: Option<&crate::health::Reachability>,
 ) {
     let client = match tls::client(tls_settings) {
         Ok(c) => c,
@@ -123,12 +126,8 @@ async fn run(
         }
     };
 
-    let info = match capabilities::fetch(&client, server, login, password).await {
-        Ok(info) => info,
-        Err(e) => {
-            tracing::warn!(%e, "notify_push: capability lookup failed — relying on TTL");
-            return;
-        }
+    let Some(info) = discover(&client, server, login, password, stop, health).await else {
+        return;
     };
     if let Some(version) = &info.version {
         tracing::info!(nextcloud_version = %version, "connected to Nextcloud");
@@ -152,17 +151,85 @@ async fn run(
             invalidate_after,
             sync_trigger,
             stop,
+            health,
         )
         .await
         {
             Ok(()) => backoff = 1, // clean close → reconnect promptly
-            Err(e) => tracing::warn!(%e, "notify_push: connection ended, retrying in {backoff}s"),
+            Err(e) => {
+                // The other half of the heartbeat: once the socket is up, this
+                // reconnect loop is the only thing still talking to the server on
+                // an idle mount, so its failures are what notice an outage that
+                // starts while nobody is using the folder.
+                if let Some(health) = health {
+                    health.failed(&e);
+                }
+                tracing::warn!(%e, "notify_push: connection ended, retrying in {backoff}s");
+            }
         }
         if stop.load(Ordering::SeqCst) {
             break;
         }
         tokio::time::sleep(Duration::from_secs(backoff)).await;
-        backoff = (backoff * 2).min(30);
+        backoff = (backoff * 2).min(MAX_BACKOFF_SECS);
+    }
+}
+
+/// The longest wait between endpoint-discovery attempts. Matches the reconnect
+/// cap: often enough that a returning network is noticed while the user is still
+/// waiting for it, rare enough to be free.
+const MAX_BACKOFF_SECS: u64 = 30;
+
+/// Ask the server what it can do — waiting out a network outage instead of
+/// giving up on the mount's live updates.
+///
+/// Discovery happens exactly once per mount, which used to make a hiccup at
+/// start-up permanent: a daemon that comes up before the network (or before DNS)
+/// spent its single attempt on a dead network, logged one `WARN`, and ran
+/// without push until somebody restarted the service. So a **transport** failure
+/// is retried on a growing backoff.
+///
+/// That retry doubles as the mount's heartbeat while nothing else is talking to
+/// the server: every attempt reports to `health`, so even a daemon nobody is
+/// using notices that the server went away — and, more usefully, that it came
+/// back — and can say so (see [`crate::health`]).
+///
+/// A server that *answers* is not retried: a rejected password, or an OCS
+/// endpoint that is simply not there, will answer the same way forever, and TTL
+/// revalidation is the correct fallback for it.
+async fn discover(
+    client: &reqwest::Client,
+    server: &str,
+    login: &str,
+    password: &str,
+    stop: &AtomicBool,
+    health: Option<&crate::health::Reachability>,
+) -> Option<capabilities::ServerInfo> {
+    let mut backoff = 1u64;
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return None;
+        }
+        match capabilities::fetch(client, server, login, password).await {
+            Ok(info) => {
+                if let Some(health) = health {
+                    health.ok();
+                }
+                return Some(info);
+            }
+            Err(e) if e.is_transport() => {
+                if let Some(health) = health {
+                    health.failed(&e);
+                }
+                tracing::warn!(%e, "notify_push: the server cannot be reached — retrying in {backoff}s");
+                tokio::time::sleep(Duration::from_secs(backoff)).await;
+                backoff = (backoff * 2).min(MAX_BACKOFF_SECS);
+            }
+            Err(e) => {
+                tracing::warn!(%e, "notify_push: capability lookup failed — relying on TTL");
+                return None;
+            }
+        }
     }
 }
 
@@ -177,6 +244,7 @@ async fn listen_once(
     invalidate_after: &AtomicI64,
     sync_trigger: &std::sync::mpsc::Sender<()>,
     stop: &AtomicBool,
+    health: Option<&crate::health::Reachability>,
 ) -> Result<()> {
     // reqwest speaks http(s); map the ws(s) scheme the server advertises.
     let http_url = endpoint
@@ -209,6 +277,11 @@ async fn listen_once(
             Message::Text(t) => {
                 let text = t.trim();
                 if text == "authenticated" {
+                    // The unambiguous "the server is there and talking to us"
+                    // moment — and on an idle mount, often the only one.
+                    if let Some(health) = health {
+                        health.ok();
+                    }
                     tracing::info!("notify_push: authenticated");
                 } else if is_file_event(text) {
                     invalidate_after.store(now_secs(), Ordering::SeqCst);
@@ -238,8 +311,18 @@ fn is_file_event(msg: &str) -> bool {
     msg == "notify_file" || msg.starts_with("notify_file ")
 }
 
+/// Map a websocket failure onto our error type, **keeping the transport layer
+/// visible**.
+///
+/// A failed upgrade is an ordinary HTTP failure underneath, and only that layer
+/// can tell "the server refused us" from "the server is not there at all" —
+/// which is exactly what decides whether the user is told about it (see
+/// [`crate::health`]). Folding everything into a string would throw that away.
 fn ws_err(e: reqwest_websocket::Error) -> Error {
-    Error::Other(format!("websocket: {e}"))
+    match e {
+        reqwest_websocket::Error::Reqwest(e) => Error::from(e),
+        other => Error::Other(format!("websocket: {other}")),
+    }
 }
 
 fn now_secs() -> i64 {

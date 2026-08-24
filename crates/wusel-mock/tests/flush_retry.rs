@@ -8,11 +8,6 @@
 
 mod common;
 
-use wusel_core::config::Account;
-use wusel_core::provider::Provider;
-use wusel_core::state::StateDb;
-use wusel_core::webdav::WebDavClient;
-
 #[test]
 fn a_failed_flush_keeps_the_buffer_and_a_retry_uploads() {
     let base = std::env::temp_dir().join(format!("wusel-mock-retry-{}", std::process::id()));
@@ -24,46 +19,39 @@ fn a_failed_flush_keeps_the_buffer_and_a_retry_uploads() {
     std::fs::write(&backing, b"abcdef").unwrap();
 
     common::xdg_sandbox(&base);
+    // Retry the transient failure quickly so the test does not wait on the
+    // production cadence.
+    std::env::set_var("WUSEL_UPLOAD_RETRY_SECS", "1");
 
     let mock = common::Mock::serve(&fixture);
     let addr = mock.addr.clone();
 
-    let account = Account::new("default");
-    let dav = WebDavClient::new(
-        reqwest::Client::new(),
-        &format!("http://{addr}"),
-        "alice",
-        "pw",
-    );
-    std::fs::create_dir_all(account.state_db_path().parent().unwrap()).unwrap();
-    let state = StateDb::open(&account.state_db_path()).unwrap();
-    let mut provider = Provider::new(dav, state, &account).unwrap();
+    let mut engine = common::Engine::start(&addr);
 
-    let node = provider
+    let node = engine
         .resolve("note.fail-once")
         .unwrap()
         .expect("note.fail-once exists");
 
-    provider.write(node.inode, 2, b"XY").unwrap();
+    engine.write(node.inode, 2, b"XY").unwrap();
 
-    // First flush: the server rejects the upload (500). The flush errors — but the
-    // buffered edit must be preserved, and the server file untouched.
-    assert!(
-        provider.flush(node.inode).is_err(),
-        "the injected 500 must surface as a flush error"
-    );
-    assert_eq!(
-        std::fs::read(&backing).unwrap(),
-        b"abcdef",
-        "a failed upload must not change the server file"
-    );
-
-    // Retry: the buffer is still there, so a second flush uploads successfully.
-    provider.flush(node.inode).unwrap();
+    // Flush succeeds locally and is answered; the upload runs behind it and hits
+    // the injected 500 — a *transient* failure, so the change stays queued and
+    // the uploader retries automatically. The second attempt (the mock fails
+    // only once) lands it. No data lost, and no manual step.
+    engine
+        .flush(node.inode)
+        .expect("flush commits locally and returns ok — the upload is async");
+    engine.wait_for_uploads();
     assert_eq!(
         std::fs::read(&backing).unwrap(),
         b"abXYef",
-        "the retry must upload the buffered edit — no data lost"
+        "the automatic retry uploads the buffered edit — no data lost"
+    );
+    assert_eq!(
+        engine.upload_state(node.inode),
+        None,
+        "and the pending record is cleared once it lands"
     );
 
     std::fs::remove_dir_all(&base).ok();

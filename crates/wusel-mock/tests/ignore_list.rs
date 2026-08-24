@@ -9,23 +9,11 @@
 
 mod common;
 
-use wusel_core::config::Account;
-use wusel_core::provider::Provider;
-use wusel_core::state::{StateDb, ROOT_INODE};
-use wusel_core::webdav::WebDavClient;
+use wusel_core::state::ROOT_INODE;
 
-fn provider_for(addr: &str, fixture: &std::path::Path) -> Provider {
-    let account = Account::new("default");
-    let dav = WebDavClient::new(
-        reqwest::Client::new(),
-        &format!("http://{addr}"),
-        "alice",
-        "pw",
-    );
-    std::fs::create_dir_all(account.state_db_path().parent().unwrap()).unwrap();
-    let state = StateDb::open(&account.state_db_path()).unwrap();
-    let _ = fixture; // fixture is served by the mock; provider talks over HTTP
-    Provider::new(dav, state, &account).unwrap()
+fn engine_for(addr: &str, fixture: &std::path::Path) -> common::Engine {
+    let _ = fixture; // fixture is served by the mock; the engine talks over HTTP
+    common::Engine::start(addr)
 }
 
 #[test]
@@ -40,32 +28,43 @@ fn ignored_files_stay_local_and_promote_on_rename() {
     let mock = common::Mock::serve(&fixture);
     let addr = mock.addr.clone();
 
-    let mut provider = provider_for(&addr, &fixture);
+    let engine = engine_for(&addr, &fixture);
 
     // 1. A LibreOffice lock file: kept purely local through its whole lifecycle.
-    let lock = provider.create(ROOT_INODE, ".~lock.notes.odt#").unwrap();
-    provider.write(lock.inode, 0, b"lockdata").unwrap();
-    provider.flush(lock.inode).unwrap();
+    let lock = engine.create(ROOT_INODE, ".~lock.notes.odt#").unwrap();
+    engine.write(lock.inode, 0, b"lockdata").unwrap();
+    engine.flush(lock.inode).unwrap();
     assert!(
         !fixture.join(".~lock.notes.odt#").exists(),
         "an ignored file must never be uploaded"
     );
     // Still fully usable locally: reads come from the buffer.
-    assert_eq!(provider.read(lock.inode, 0, 8).unwrap(), b"lockdata");
+    assert_eq!(engine.read(lock.inode, 0, 8).unwrap(), b"lockdata");
     // Deleting it must not error (nothing to DELETE on the server).
-    provider.remove(ROOT_INODE, ".~lock.notes.odt#").unwrap();
+    engine.remove(ROOT_INODE, ".~lock.notes.odt#").unwrap();
     assert!(!fixture.join(".~lock.notes.odt#").exists());
 
     // 2. Promotion: an ignored temp file renamed onto a real document uploads.
-    let tmp = provider.create(ROOT_INODE, "scratch.tmp").unwrap();
-    provider.write(tmp.inode, 0, b"the document").unwrap();
+    let tmp = engine.create(ROOT_INODE, "scratch.tmp").unwrap();
+    engine.write(tmp.inode, 0, b"the document").unwrap();
     assert!(
         !fixture.join("scratch.tmp").exists(),
         "the temp file itself is never uploaded"
     );
-    provider
+    engine
         .rename(ROOT_INODE, "scratch.tmp", ROOT_INODE, "notes.odt")
         .unwrap();
+    // The promotion upload is scheduled, not performed inside the rename. A
+    // failed upload must not fail the rename — the local rename is already
+    // committed, and reporting failure would tell the kernel it never happened
+    // — so the rename returns and the document appears a moment later.
+    let promoted = fixture.join("notes.odt");
+    for _ in 0..100 {
+        if promoted.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
     assert_eq!(
         std::fs::read(fixture.join("notes.odt")).unwrap(),
         b"the document",

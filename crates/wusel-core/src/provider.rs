@@ -9,16 +9,15 @@
 //! the logic — listing (with lazy PROPFIND) and, from Priority 4, reading
 //! contents. A frontend only translates OS callbacks into these calls.
 
-use std::collections::{HashMap, HashSet};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::collections::HashSet;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::content::{CachingSource, ContentSource, LiveWebDav};
-use crate::desktop::{self, Desktop, Notice, Status};
-use crate::ignore::is_ignored;
+use crate::desktop::{self, Desktop, Notice};
 use crate::model::{basename, RemoteEntry};
 use crate::state::{NodeRow, StateDb, ROOT_INODE};
 use crate::webdav::WebDavClient;
@@ -30,21 +29,46 @@ use crate::{Error, Result};
 /// (see [`Provider::write_epoch`]).
 type RevalResult = (u64, String, Option<Vec<RemoteEntry>>, u64);
 
-/// A file's open local write buffer (strategy B): writes land in a scratch file
-/// beside the cache, keeping the validated read cache clean until the upload
-/// succeeds. Its path is `scratch_dir/<inode>`.
-struct Scratch {
-    dirty: bool,
-    /// ETag of the server version this edit is based on (for conflict detection).
-    base_etag: String,
-}
-
 /// Join a child name onto a parent path (the root parent path is empty).
-fn child_path(parent_path: &str, name: &str) -> String {
+/// Join a parent's server path with a child name.
+///
+/// Public because the substrate builds the same paths when it creates, deletes
+/// or moves on the server — one spelling of the rule, not two.
+pub fn child_path(parent_path: &str, name: &str) -> String {
     if parent_path.is_empty() {
         name.to_string()
     } else {
         format!("{parent_path}/{name}")
+    }
+}
+
+/// Whether an account-relative `path` is inside a freedesktop top-directory
+/// trash — its first segment is `.Trash` or `.Trash-<uid>`. Nothing is ever
+/// created or moved there: deletion should go straight to the server (and
+/// Nextcloud's own trash), not into a `.Trash-<uid>` folder that would sync into
+/// the user's cloud and onto every device. See the desktop integration docs.
+#[must_use]
+pub fn is_trash_path(path: &str) -> bool {
+    let first = path.split('/').next().unwrap_or("");
+    first == ".Trash" || first.starts_with(".Trash-")
+}
+
+#[cfg(test)]
+mod trash_tests {
+    use super::is_trash_path;
+
+    #[test]
+    fn trash_paths_are_recognised_by_their_top_segment() {
+        assert!(is_trash_path(".Trash"));
+        assert!(is_trash_path(".Trash-1000"));
+        assert!(is_trash_path(".Trash-1000/files/report.odt"));
+        assert!(is_trash_path(".Trash-1000/info/report.odt.trashinfo"));
+        // Ordinary paths, including look-alikes without the dot-prefix or a
+        // deeper segment that only resembles one, are not trash.
+        assert!(!is_trash_path("Documents/report.odt"));
+        assert!(!is_trash_path("Trash/report.odt"));
+        assert!(!is_trash_path("Photos/.Trash-1000")); // not at the top
+        assert!(!is_trash_path(""));
     }
 }
 
@@ -76,7 +100,12 @@ fn now_secs() -> u64 {
 }
 
 /// Read a byte range from an open scratch (write buffer) file.
-fn read_range_from_scratch(path: &std::path::Path, offset: u64, len: u32) -> Result<Vec<u8>> {
+/// Read one window out of a write buffer.
+///
+/// Public because the execution substrate serves buffer reads on its own
+/// workers (see [`crate::runtime`]) — the same primitive, called from the pool
+/// that owns file I/O rather than from whoever happens to hold the state.
+pub fn read_range_from_scratch(path: &std::path::Path, offset: u64, len: u32) -> Result<Vec<u8>> {
     let mut f = std::fs::File::open(path)?;
     let end = f.metadata()?.len();
     if len == 0 || offset >= end {
@@ -101,8 +130,15 @@ pub struct Provider {
     dav: WebDavClient,
     /// Sync→async bridge: FUSE/OS callbacks are synchronous, WebDAV is async.
     rt: Arc<tokio::runtime::Runtime>,
-    /// Content delivery: a caching decorator over the live WebDAV source.
-    content: Box<dyn ContentSource>,
+    /// FUSE dispatch-thread count (see [`crate::config::Settings::dispatch_threads`]).
+    /// The frontend reads this to configure the FUSE session; the runtime above is
+    /// already sized to match. 1 = single-threaded (the default).
+    dispatch_threads: usize,
+    /// Content delivery: a caching decorator over the live WebDAV source. An
+    /// `Arc`, not a `Box`, so a read can hand a cheap clone to a blocking task
+    /// off the FUSE dispatch thread (see [`Provider::read_plan`]). `ContentSource`
+    /// is `Send + Sync`, so the shared handle is safe.
+    content: Arc<dyn ContentSource>,
     /// Re-PROPFIND a directory if its last listing is older than this. The
     /// fallback change-detection when notify_push is unavailable.
     revalidate_secs: u64,
@@ -115,15 +151,13 @@ pub struct Provider {
     /// listed at/before this is stale regardless of the TTL. Written by the
     /// push listener thread (see [`crate::push`]), read here.
     invalidate_after: Arc<AtomicI64>,
-    /// Open write buffers, keyed by inode (see [`Scratch`]).
-    scratch: HashMap<u64, Scratch>,
     /// Directory holding scratch files (`<cache>/scratch`).
     scratch_dir: PathBuf,
+    /// Where the state database lives, so the substrate's workers can each open
+    /// their own connection to it.
+    db_path: PathBuf,
     /// Opt-in: try a 3-way text merge on conflict before a conflict copy.
     text_merge: bool,
-    /// mtimes set via `setattr`, to send as `X-OC-Mtime` on the next upload
-    /// (so `cp -p`/`rsync -t` preserve timestamps server-side).
-    pending_mtime: HashMap<u64, i64>,
     /// Monotonic counter bumped on every local mutation of directory membership
     /// (create/mkdir/rename/remove, and an upload that materialises a deferred
     /// create). A background PROPFIND records this before it starts; if it has
@@ -144,19 +178,137 @@ pub struct Provider {
     _reval_handle: std::thread::JoinHandle<()>,
     /// Glob patterns for ephemeral editor/OS files kept purely local.
     ignore_patterns: Vec<String>,
-    /// Inodes of currently-open ignored files (never uploaded). A file leaves the
-    /// set on delete, or on promotion when renamed to a non-ignored name.
-    ignored: HashSet<u64>,
     /// OS-integration backend (notifications + filesystem status). Defaults to a
     /// no-op; the frontend injects a platform backend via [`Self::set_desktop`].
     desktop: Arc<dyn Desktop>,
     /// Trigger the background syncer (a notify_push arrived). Handed to the push
     /// listener; cloneable.
     sync_trigger: Sender<()>,
+    /// The user's "keep this offline" list. Beside the database rather than in
+    /// it, and shared with the syncer and the substrate's workers — see
+    /// [`crate::pins`].
+    pins: Arc<crate::pins::Pins>,
+    /// What to serve when an outdated pinned file is opened.
+    open_pinned: crate::config::OpenPinned,
+    /// Async (default) vs synchronous write-back; see `[sync] upload`.
+    async_upload: bool,
+    /// The connection's cost, cached and shared with every worker.
+    metered: Arc<crate::runtime::Metered>,
+    /// The slot the syncer reads its desktop backend from. Held here so
+    /// [`Provider::set_desktop`] can reach a thread that is already running —
+    /// see [`PinnedRefresh::desktop`].
+    desktop_cell: Arc<Mutex<Arc<dyn Desktop>>>,
     /// Kernel-invalidation events from the syncer, for the frontend to drain and
     /// turn into FUSE notifications. Taken once by the frontend at mount.
     invalidations: Option<Receiver<Invalidation>>,
+    /// The sending half, kept so a reconcile started anywhere reports the same
+    /// add/removes the syncer's does. One place reconciles, one place reports.
+    inval_tx: Sender<Invalidation>,
     _sync_handle: std::thread::JoinHandle<()>,
+}
+
+/// What the syncer needs to act on a pinned file whose server copy moved on.
+///
+/// Carried as one value because the three parts belong together: the policy,
+/// the way to find out what a refresh would cost, and the means to carry one
+/// out.
+/// Swap in this walk's stale set and say whether it brought anything new.
+///
+/// A free function, and therefore testable on its own: the interesting part of
+/// "do not repeat yourself every thirty seconds" is this three-line rule, not
+/// the machinery around it.
+fn anything_new(
+    announced: &mut std::collections::HashSet<u64>,
+    now: std::collections::HashSet<u64>,
+) -> bool {
+    let fresh = now.iter().any(|id| !announced.contains(id));
+    *announced = now;
+    fresh
+}
+
+#[derive(Clone)]
+pub struct PinnedRefresh {
+    pub mode: crate::config::RefreshPinned,
+    pub content: Arc<dyn ContentSource>,
+    /// Where the desktop backend is kept — not the backend itself.
+    ///
+    /// The syncer thread starts before the real backend is known: the daemon
+    /// installs it afterwards, through [`Provider::set_desktop`]. A copy taken
+    /// at start-up would therefore be the no-op placeholder, and would stay the
+    /// placeholder, because `set_desktop` replaces the Provider's field and
+    /// cannot reach into a running thread. `ask` would then never say anything
+    /// — no error, no log, just silence that looks exactly like `manual`.
+    ///
+    /// Pointing both at one slot instead means the thread reads the real
+    /// backend as soon as it is put there.
+    pub desktop: Arc<Mutex<Arc<dyn Desktop>>>,
+    /// Which files we have already told the user about. Without it, `ask` would
+    /// repeat the same message every `revalidate_secs` for as long as the user
+    /// declines to act — which teaches people to ignore our notifications.
+    pub announced: Arc<Mutex<std::collections::HashSet<u64>>>,
+}
+
+impl PinnedRefresh {
+    /// Act on everything one walk found out of date — once, for all of them.
+    ///
+    /// Aggregated on purpose. A colleague reorganising a shared folder can
+    /// change hundreds of pinned files at once, and that has to be one message
+    /// ("12 pinned files changed") rather than hundreds.
+    /// Record this walk's stale set and report whether it holds anything the
+    /// user has not been told about yet.
+    ///
+    /// Replacing the set rather than growing it is what makes a file that is
+    /// updated, and later goes stale a second time, announceable again — while
+    /// an unchanged backlog stays quiet for ever.
+    fn note_and_check_new(&self, stale: &[NodeRow]) -> bool {
+        let mut announced = self.announced.lock().unwrap_or_else(|e| e.into_inner());
+        anything_new(&mut announced, stale.iter().map(|n| n.inode).collect())
+    }
+
+    fn settle(&self, stale: &[NodeRow]) {
+        if stale.is_empty() {
+            // Nothing stale: forget the backlog, so a file that goes stale
+            // again later is announced again rather than silently suppressed.
+            self.announced
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+            return;
+        }
+        let desktop = self
+            .desktop
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        match self.mode.decide(desktop.is_metered()) {
+            crate::config::RefreshAction::ShowOnly => {
+                // The emblem already says so; the user picks the moment.
+                tracing::debug!(count = stale.len(), "pinned files are out of date");
+            }
+            crate::config::RefreshAction::Ask => {
+                // Speak only when there is something new to say. The message
+                // still names the *whole* backlog, so a user who ignored the
+                // first one and comes back later sees the real count, not just
+                // the increment.
+                if self.note_and_check_new(stale) {
+                    desktop.notify(&Notice::PinnedOutOfDate {
+                        count: stale.len(),
+                        first: stale[0].path.clone(),
+                    });
+                }
+            }
+            crate::config::RefreshAction::Fetch => {
+                for node in stale {
+                    if let Err(e) = self.content.pin_file(node) {
+                        // Not fatal: the copy we have is still there, and the
+                        // emblem still says it is out of date.
+                        tracing::warn!(path = %node.path, %e,
+                            "could not bring the pinned copy up to date");
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// The background revalidator: it does only the slow work — the PROPFIND — off
@@ -198,20 +350,51 @@ fn revalidate_loop(
     }
 }
 
-/// A cache entry the kernel should drop after a background sync found a change,
-/// so a file manager sitting in the directory updates without a manual refresh.
-/// The FUSE frontend turns this into a `notify_inval_entry`.
+/// Something a frontend's caches should stop believing, because the engine
+/// found it changed.
+///
+/// # Whose vocabulary this is
+///
+/// Object *ids* and *paths*, never inodes. The engine's stable per-object id
+/// happens to be the number our FUSE frontend hands the kernel as an inode, but
+/// that is the frontend's business: Windows CfAPI and macOS File Provider
+/// identify objects their own way, and naming the field after one platform's
+/// word for it would quietly make this channel FUSE-only. The frontend
+/// translates; this enum says what changed.
+#[derive(Debug)]
 pub enum Invalidation {
-    /// A file/dir entry changed — added, removed, or its cache state flipped.
-    /// `parent` + `name` drive the kernel `notify_inval_entry`; `path` is the
-    /// entry's remote (account-relative) path, which the frontend joins with the
-    /// mountpoint to tell the desktop *which* file to re-read (emblem refresh).
+    /// An entry in a directory changed — added, removed, or its *availability*
+    /// flipped: hydrated, evicted, pinned, unpinned.
+    ///
+    /// `parent` + `name` are what a frontend needs to drop a cached directory
+    /// entry (under FUSE, `notify_inval_entry`); `path` is the remote,
+    /// account-relative path, which it joins with the mountpoint to tell the
+    /// desktop *which* file to re-read for its emblem.
     Entry {
-        parent: u64,
+        parent: ObjectId,
         name: String,
         path: String,
     },
+    /// A file whose *contents* changed on the server. The frontend turns this
+    /// into `notify_inval_inode`, so the kernel drops the pages and attributes
+    /// it has cached for this file.
+    ///
+    /// Without it the kernel keeps serving what it had until the one-second
+    /// attribute TTL runs out, so "reload" in an editor showed the current
+    /// version only by the grace of a timer. This makes it dependable.
+    ///
+    /// It is **not** inotify: FUSE's reverse invalidation does not produce
+    /// fsnotify events, so an editor *watching* the file is still not woken by
+    /// itself. What this buys is that asking for it always works.
+    Content { object: ObjectId, path: String },
 }
+
+/// The engine's stable identity for one object, as this channel speaks it.
+///
+/// A plain `u64` today — the number the state database keys its rows by. It has
+/// a name of its own so each frontend can map it to whatever its platform wants
+/// without the *engine* having picked a side.
+pub type ObjectId = u64;
 
 /// A file's local-availability state, for OS-integration emblems (the
 /// file-manager badges "online-only / here / kept offline"). Deliberately
@@ -224,8 +407,25 @@ pub enum FileState {
     Cached,
     /// Kept offline on purpose — pinned, or under a pinned directory/root.
     Pinned,
-    /// A local edit not yet uploaded (open write buffer, or a deferred create).
+    /// Pinned, and the copy we keep is **out of date**: the server has moved on.
+    ///
+    /// Only pinned files get this. For an ordinary cached file, going stale
+    /// merely means the next read goes live, which is what a VFS does all day.
+    /// A pin promises the file is there when the server is not, and an outdated
+    /// copy is a promise half-kept — so it is worth showing *before* somebody
+    /// opens the file, not only when they are already offline.
+    PinnedStale,
+    /// A local edit not yet committed — an open write buffer being edited,
+    /// before `flush`. Once flushed it becomes [`FileState::Uploading`].
     Modified,
+    /// A committed change on its way to the server: the asynchronous upload is
+    /// queued or in flight. This is the "syncing" symbol the user watches after
+    /// dropping files into the folder.
+    Uploading,
+    /// A committed change whose upload failed for good (wrong permissions, a
+    /// conflict, no quota). The bytes are safe locally and the user has been
+    /// told; it will not retry on its own.
+    SyncError,
 }
 
 impl FileState {
@@ -236,7 +436,10 @@ impl FileState {
             FileState::OnlineOnly => "online-only",
             FileState::Cached => "cached",
             FileState::Pinned => "pinned",
+            FileState::PinnedStale => "pinned-stale",
             FileState::Modified => "modified",
+            FileState::Uploading => "uploading",
+            FileState::SyncError => "sync-error",
         }
     }
 }
@@ -257,10 +460,12 @@ const SYNC_MAX_DEPTH: u32 = 64;
 /// reported for kernel invalidation (see [`Invalidation`]).
 fn sync_loop(
     mut state: StateDb,
+    pins: Arc<crate::pins::Pins>,
     dav: WebDavClient,
     triggers: Receiver<()>,
     invalidations: Sender<Invalidation>,
     write_epoch: Arc<AtomicU64>,
+    pinned: PinnedRefresh,
 ) {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -279,18 +484,24 @@ fn sync_loop(
         if !matches!(state.children_loaded(ROOT_INODE), Ok(true)) {
             continue;
         }
+        // Collected across the whole walk and settled once: hundreds of pinned
+        // files can change together when somebody reorganises a shared folder.
+        let mut stale = Vec::new();
         if let Err(e) = walk_dir(
             &mut state,
+            &pins,
             &dav,
             &rt,
             &invalidations,
             &write_epoch,
+            &mut stale,
             ROOT_INODE,
             "",
             0,
         ) {
             tracing::debug!(%e, "syncer: walk aborted");
         }
+        pinned.settle(&stale);
     }
 }
 
@@ -302,10 +513,14 @@ fn sync_loop(
 #[allow(clippy::too_many_arguments)]
 fn walk_dir(
     state: &mut StateDb,
+    pins: &crate::pins::Pins,
     dav: &WebDavClient,
     rt: &tokio::runtime::Runtime,
     invalidations: &Sender<Invalidation>,
     write_epoch: &AtomicU64,
+    // Pinned files found to have moved on. Collected here and settled once by
+    // the caller: the decision is per walk, not per directory.
+    stale: &mut Vec<NodeRow>,
     inode: u64,
     path: &str,
     depth: u32,
@@ -343,6 +558,26 @@ fn walk_dir(
             });
         }
     }
+    // A file whose contents moved on. Two things follow from it, and they are
+    // for different audiences: the kernel has to drop what it cached, and — if
+    // the file is pinned — the user may want to hear about it.
+    for e in &entries {
+        let name = basename(&e.path);
+        if let Some(o) = old_by_name.get(name) {
+            if o.is_dir || o.etag == e.etag {
+                continue;
+            }
+            let _ = invalidations.send(Invalidation::Content {
+                object: o.inode,
+                path: o.path.clone(),
+            });
+            if pins.is_pinned(&o.path).unwrap_or(false) {
+                // Collected rather than acted on here: the decision is one per
+                // walk, not one per file.
+                stale.push((*o).clone());
+            }
+        }
+    }
     // Added: a listing entry we did not have before.
     for e in &entries {
         let name = basename(&e.path);
@@ -366,10 +601,12 @@ fn walk_dir(
                 let child_path = child_path(path, name);
                 walk_dir(
                     state,
+                    pins,
                     dav,
                     rt,
                     invalidations,
                     write_epoch,
+                    stale,
                     o.inode,
                     &child_path,
                     depth + 1,
@@ -393,18 +630,250 @@ fn blob_stats(dir: &std::path::Path) -> (u64, u64) {
         .fold((0, 0), |(n, bytes), m| (n + 1, bytes + m.len()))
 }
 
+/// Everything the networked write path needs, and nothing borrowed from the
+/// [`Provider`] — so a substrate worker can run it.
+///
+/// Every field is either an `Arc` or cheap to clone, which is not a
+/// coincidence: it is what lets the same logic run on whichever thread the
+/// machine hands the step to, instead of only on whoever happens to own the
+/// state.
+#[derive(Clone)]
+pub struct WriteContext {
+    pub dav: WebDavClient,
+    pub rt: Arc<tokio::runtime::Runtime>,
+    pub content: Arc<dyn ContentSource>,
+    pub desktop: Arc<dyn Desktop>,
+    /// Opt-in: try a 3-way text merge before falling back to a second copy.
+    pub text_merge: bool,
+    /// Bumped on every local mutation of directory membership, so a listing
+    /// taken before it cannot delete what we just made.
+    pub write_epoch: Arc<AtomicU64>,
+    /// Where add/removes are reported for kernel invalidation.
+    pub invalidations: Sender<Invalidation>,
+}
+
+/// Handle an upload the server refused (412): merge if we can, otherwise keep
+/// the server version and park ours beside it under a second name.
+///
+/// This also covers a **deferred create** that lost the race against a
+/// same-named server-side create — its `If-None-Match: *` failed, there is no
+/// merge base, so the copy path runs and the parent reload pulls in theirs.
+///
+/// # Errors
+/// If the network fails, or every candidate copy name is taken.
+pub fn run_conflict_resolution(
+    ctx: &WriteContext,
+    state: &mut StateDb,
+    node: &NodeRow,
+    scratch: &std::path::Path,
+    size: u64,
+) -> Result<()> {
+    if ctx.text_merge {
+        let local = std::fs::read(scratch)?;
+        if let Some((merged, theirs)) = run_text_merge(ctx, node, &local)? {
+            // Upload the merge **conditionally against the very version it was
+            // merged from**. The result is only correct for that "theirs"; an
+            // unconditional PUT here would silently discard a third change that
+            // landed between our GET and this PUT — the exact lost update the
+            // whole 412 machinery exists to prevent.
+            let result = ctx.rt.block_on(ctx.dav.put_conditional(
+                &node.path,
+                merged.clone(),
+                &theirs,
+                None,
+            ))?;
+            match result {
+                crate::webdav::PutResult::Uploaded(new_etag) => {
+                    let new_etag = new_etag.unwrap_or_default();
+                    let size = merged.len() as u64;
+                    state.set_etag_size(node.inode, &new_etag, size)?;
+                    let mut updated = node.clone();
+                    updated.etag = new_etag.clone();
+                    updated.size = size;
+                    ctx.content.store(&updated, &merged, &new_etag)?;
+                    tracing::info!(path = %node.path, "conflict auto-merged");
+                    return Ok(());
+                }
+                crate::webdav::PutResult::Conflict => {
+                    // The server moved on again while we were merging, so the
+                    // merge is stale. Fall through — the bytes survive either way.
+                    tracing::debug!(path = %node.path, "merge raced another server change — falling back to a conflicted copy");
+                }
+            }
+        }
+    }
+    // The copy uploads with `If-None-Match: *` because its timestamped name has
+    // one-second resolution: a second conflict in the same second would
+    // otherwise silently overwrite the first copy.
+    const MAX_COPY_ATTEMPTS: u32 = 4;
+    let fresh = crate::webdav::Precondition::MustNotExist;
+    let mut copy = conflict_copy_path(&node.path, 0);
+    for attempt in 0..MAX_COPY_ATTEMPTS {
+        let result = if size > crate::webdav::CHUNK_SIZE {
+            ctx.rt
+                .block_on(ctx.dav.put_chunked(&copy, scratch, size, &fresh, None))?
+        } else {
+            let local = std::fs::read(scratch)?;
+            ctx.rt
+                .block_on(ctx.dav.put_conditional(&copy, local, &fresh, None))?
+        };
+        match result {
+            crate::webdav::PutResult::Uploaded(_) => break,
+            crate::webdav::PutResult::Conflict if attempt + 1 < MAX_COPY_ATTEMPTS => {
+                copy = conflict_copy_path(&node.path, attempt + 1);
+            }
+            crate::webdav::PutResult::Conflict => {
+                // Vanishingly unlikely, and erroring out is safe: the buffer is
+                // kept, so the content is retried rather than dropped.
+                return Err(Error::Other(format!(
+                    "conflicted copy of {}: every candidate name already exists",
+                    node.path
+                )));
+            }
+        }
+    }
+    tracing::warn!(path = %node.path, copy = %copy, "upload conflict — saved a conflicted copy");
+    // Their edit is safe, but under a name they would not otherwise find.
+    ctx.desktop.notify(&Notice::ConflictCopy {
+        path: node.path.clone(),
+        copy: copy.clone(),
+    });
+    ctx.write_epoch.fetch_add(1, Ordering::SeqCst);
+    run_reload_dir(ctx, state, node.parent)?;
+    Ok(())
+}
+
+/// Attempt a 3-way text merge (base = the cached last-known copy, ours = the
+/// buffer, theirs = the server's current version).
+///
+/// `None` when a merge is not possible: no clean base, non-UTF-8 content, or a
+/// real conflict. On success it returns the merged bytes **and** the
+/// precondition naming the version it merged against, so the caller can upload
+/// conditionally on exactly that one.
+fn run_text_merge(
+    ctx: &WriteContext,
+    node: &NodeRow,
+    local: &[u8],
+) -> Result<Option<(Vec<u8>, crate::webdav::Precondition)>> {
+    let Some(base) = ctx.content.cached_bytes(node) else {
+        return Ok(None); // no clean base to merge against
+    };
+    let (theirs, theirs_etag) = ctx.rt.block_on(ctx.dav.get_with_etag(&node.path))?;
+    // It demonstrably exists — we just read it — so an absent ETag means
+    // "version unknown", never "absent".
+    let pre =
+        crate::webdav::Precondition::for_upload(theirs_etag.as_deref().unwrap_or_default(), true);
+    let (Ok(base), Ok(ours), Ok(theirs)) = (
+        String::from_utf8(base),
+        String::from_utf8(local.to_vec()),
+        String::from_utf8(theirs.to_vec()),
+    ) else {
+        return Ok(None); // binary content → cannot text-merge
+    };
+    match diffy::merge(&base, &ours, &theirs) {
+        Ok(merged) => Ok(Some((merged.into_bytes(), pre))),
+        Err(_conflicted) => Ok(None), // a real conflict → fall back to a copy
+    }
+}
+
+/// Drop the pins a deleted subtree carried, and the eviction markers beside its
+/// cache blobs.
+///
+/// Both are path-keyed promises about files that no longer exist. A leftover
+/// pin marker is not merely untidy: eviction skips a pinned blob **and** does
+/// not count it against the cache budget, so those bytes would be exempt from
+/// it for ever — and a later file handed the same id would inherit the
+/// protection.
+///
+/// # Errors
+/// If the state cannot be read or written.
+pub fn run_unpin_subtree(
+    state: &mut StateDb,
+    pins: &crate::pins::Pins,
+    content: &dyn ContentSource,
+    node: &NodeRow,
+) -> Result<()> {
+    // An ancestor (or root) pin covers this path without being *under* it.
+    let covered = pins.is_pinned(&node.path)?;
+    let removed = pins.remove_under(&node.path)?;
+    if !covered && removed == 0 {
+        return Ok(());
+    }
+    for (_, file_id) in state.descendant_file_ids(&node.path)? {
+        content.unpin_file(file_id);
+    }
+    Ok(())
+}
+
+/// Re-list a directory (PROPFIND + reconcile), so a mutation we just made shows
+/// up with its server-assigned ids.
+///
+/// # Errors
+/// If the listing or the reconcile fails.
+pub fn run_reload_dir(ctx: &WriteContext, state: &mut StateDb, inode: u64) -> Result<()> {
+    let Some(dir) = state.node_by_inode(inode)? else {
+        return Ok(());
+    };
+    let before = state.children_of(inode)?;
+    let entries = ctx.rt.block_on(ctx.dav.propfind_dir(&dir.path))?;
+    state.reconcile_children(inode, &dir.path, &entries)?;
+
+    // Report what changed, exactly as the syncer's own walk does. Whoever
+    // re-lists a directory owes the kernel the same notification, or a file
+    // manager sitting in it keeps showing what is no longer there.
+    let new_names: std::collections::HashSet<&str> =
+        entries.iter().map(|e| basename(&e.path)).collect();
+    let old_names: std::collections::HashSet<&str> =
+        before.iter().map(|n| n.name.as_str()).collect();
+    for n in &before {
+        if n.file_id.is_some() && !new_names.contains(n.name.as_str()) {
+            let _ = ctx.invalidations.send(Invalidation::Entry {
+                parent: inode,
+                name: n.name.clone(),
+                path: n.path.clone(),
+            });
+        }
+    }
+    for e in &entries {
+        let name = basename(&e.path);
+        if !old_names.contains(name) {
+            let _ = ctx.invalidations.send(Invalidation::Entry {
+                parent: inode,
+                name: name.to_string(),
+                path: child_path(&dir.path, name),
+            });
+        }
+    }
+    Ok(())
+}
+
 impl Provider {
     pub fn new(
         dav: WebDavClient,
         state: StateDb,
         account: &crate::config::Account,
     ) -> Result<Self> {
+        let settings = account.settings();
+        // The engine's runtime. Single-threaded by default (behaviour-identical to
+        // before concurrency), so a read/upload `block_on` still serialises with
+        // the others. With `dispatch_threads > 1` it becomes multi-threaded, so the
+        // `spawn_blocking` reads and uploads actually run their network I/O in
+        // parallel rather than contending for one runtime thread — the FUSE
+        // dispatch threads alone would not achieve that.
+        let dispatch_threads = settings.dispatch_threads.max(1);
+        // Always multi-threaded, even for a single dispatch thread. The network
+        // workers each call `block_on` on this runtime; a *current-thread*
+        // runtime lets only one `block_on` proceed at a time, so a single stalled
+        // read would freeze every other network operation — which is exactly how
+        // a stalled content-sniff read wedged a whole directory listing. A
+        // multi-threaded runtime drives all the connections concurrently, so a
+        // stall (bounded by `read_timeout`) stays contained to its own read.
         let rt = Arc::new(
-            tokio::runtime::Builder::new_current_thread()
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(dispatch_threads.max(2))
                 .enable_all()
                 .build()?,
         );
-        let settings = account.settings();
         let live = LiveWebDav::new(dav.clone(), rt.clone());
         let cache_dir = account.blob_cache_dir();
         // One startup line for context: it says how much is served locally —
@@ -435,7 +904,13 @@ impl Provider {
         // so a file manager refreshes without a manual reload. Created here so the
         // hydrator can share it — a finished hydration flips an emblem live.
         let (inval_tx, inval_rx) = std::sync::mpsc::channel::<Invalidation>();
-        let content: Box<dyn ContentSource> = Box::new(CachingSource::new(
+        let sync_inval = inval_tx.clone();
+        // Eviction knows a blob's file id and nothing else — it walks the cache
+        // directory by age and size, and never sees a path. The names are
+        // resolved on this side, where the state database is, and only when
+        // something was actually dropped.
+        let (evicted_tx, evicted_rx) = std::sync::mpsc::channel::<u64>();
+        let content: Arc<dyn ContentSource> = Arc::new(CachingSource::new(
             Box::new(live),
             cache_dir,
             settings.cache_max_bytes,
@@ -443,6 +918,7 @@ impl Provider {
             Some(crate::content::HydrationConfig {
                 source: hydrate_source,
                 invalidations: Some(inval_tx.clone()),
+                evicted: Some(evicted_tx),
             }),
         ));
         // An env override stays handy for tests/tuning; otherwise config.toml wins.
@@ -451,11 +927,33 @@ impl Provider {
             .and_then(|s| s.parse().ok())
             .unwrap_or(settings.revalidate_secs);
 
-        // Any scratch present at startup is orphaned (no open write survives a
-        // restart) — clear it so unflushed leftovers do not leak disk. Its local
-        // nodes (never-materialised files) are then dead too, so drop them.
+        // Scratch present at startup used to be pure garbage — no open write
+        // survived a restart. With asynchronous write-back that is no longer
+        // true: a scratch file with a pending-upload record is a change
+        // committed on close that has not yet reached the server, and must be
+        // resumed, not deleted. So keep those and clear only genuinely orphaned
+        // scratch; the matching local-only nodes are spared by
+        // `remove_unmaterialized_files` for the same reason. The uploader picks
+        // the survivors up when the substrate starts.
+        let db_path = account.state_db_path();
         let scratch_dir = account.cache_dir().join("scratch");
-        let _ = std::fs::remove_dir_all(&scratch_dir);
+        let owed: std::collections::HashSet<u64> = state
+            .pending_uploads()
+            .map(|v| v.iter().map(|p| p.object.0).collect())
+            .unwrap_or_default();
+        if let Ok(entries) = std::fs::read_dir(&scratch_dir) {
+            for e in entries.flatten() {
+                let keep = e
+                    .file_name()
+                    .to_str()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .is_some_and(|id| owed.contains(&id));
+                if !keep {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        }
+        std::fs::create_dir_all(&scratch_dir)?;
         state.remove_unmaterialized_files()?;
 
         // Background revalidator: PROPFINDs of stale directories run off the FUSE
@@ -479,6 +977,23 @@ impl Provider {
         // Background syncer: on a push it walks the cached tree by propagated
         // ETags to find server-side changes (a delete nobody re-listed). It owns a
         // second state connection + its own HTTP client, so it never blocks FUSE.
+        // Pins live beside the configuration, not in the database. A database
+        // written by an older version still carries them, so they are taken
+        // over once — before anything reads them, or the first walk would find
+        // an account with nothing pinned and quietly unprotect every blob.
+        let pins = Arc::new(crate::pins::Pins::new(&account.config_dir()));
+        match pins.migrate_from(&state.legacy_pins().unwrap_or_default()) {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(
+                count = n,
+                file = %pins.file().display(),
+                "moved the pins out of the state database"
+            ),
+            // Not fatal, and deliberately not silent: the pins are still in the
+            // database, so a later start can try again.
+            Err(e) => tracing::warn!(%e, "could not move the pins out of the state database"),
+        }
+
         let (sync_trigger, sync_rx) = std::sync::mpsc::channel::<()>();
         // The syncer opens its own connection to the same DB; make sure the
         // directory exists (the daemon creates it, but a direct Provider caller
@@ -487,36 +1002,97 @@ impl Provider {
             std::fs::create_dir_all(dir)?;
         }
         let sync_state = StateDb::open(&account.state_db_path())?;
+
+        // Turning evicted file ids back into paths needs a database connection,
+        // and the cache has none — deliberately. Its own thread rather than a
+        // job on an existing one: it blocks on a channel that is silent for
+        // hours at a time, and the alternative was giving the cache layer a
+        // database, which is the dependency this arrangement exists to avoid.
+        let evict_db = StateDb::open(&db_path)?;
+        let evict_inval = inval_tx.clone();
+        let _evict_handle = std::thread::Builder::new()
+            .name("wusel-evicted".into())
+            .spawn(move || {
+                while let Ok(file_id) = evicted_rx.recv() {
+                    match evict_db.node_by_file_id(file_id) {
+                        // It is online-only again; the emblem has to stop
+                        // claiming otherwise.
+                        Ok(Some(node)) => {
+                            let _ = evict_inval.send(Invalidation::Entry {
+                                parent: node.parent,
+                                name: node.name.clone(),
+                                path: node.path,
+                            });
+                        }
+                        // A blob whose row is gone: the file was deleted and the
+                        // cache is catching up. Nothing to refresh.
+                        Ok(None) => {}
+                        Err(e) => tracing::debug!(%e, file_id, "could not name an evicted blob"),
+                    }
+                }
+            })
+            .expect("spawn the eviction-name thread");
+
         let sync_dav = dav.with_http_client(crate::tls::client(&settings.tls)?);
         let sync_epoch = write_epoch.clone();
+        // The syncer is where a pinned file is discovered to have moved on, so
+        // it carries the policy for what to do about it. It starts here, before
+        // anybody has installed a desktop backend, so it is given the slot the
+        // backend will land in rather than today's placeholder. Until it does
+        // land, `ask` stays silent — which is the harmless direction: nothing is
+        // ever fetched unasked because a notification could not be delivered.
+        let desktop_cell: Arc<Mutex<Arc<dyn Desktop>>> =
+            Arc::new(Mutex::new(Arc::new(desktop::NullDesktop)));
+        let sync_pinned = PinnedRefresh {
+            mode: settings.refresh_pinned,
+            content: Arc::clone(&content),
+            desktop: Arc::clone(&desktop_cell),
+            announced: Arc::new(Mutex::new(std::collections::HashSet::new())),
+        };
+        let sync_pins = Arc::clone(&pins);
         let sync_handle = std::thread::Builder::new()
             .name("wusel-walk".into())
-            .spawn(move || sync_loop(sync_state, sync_dav, sync_rx, inval_tx, sync_epoch))
+            .spawn(move || {
+                sync_loop(
+                    sync_state,
+                    sync_pins,
+                    sync_dav,
+                    sync_rx,
+                    sync_inval,
+                    sync_epoch,
+                    sync_pinned,
+                )
+            })
             .expect("spawn syncer thread");
 
         Ok(Self {
             state,
+            pins,
+            open_pinned: settings.open_pinned,
+            async_upload: matches!(settings.upload, crate::config::UploadMode::Async),
+            metered: Arc::new(crate::runtime::Metered::new(Arc::clone(&desktop_cell))),
             dav,
             rt,
+            dispatch_threads,
             content,
             revalidate_secs,
             push_floor_secs: settings.push_floor_secs,
             exclude_from_indexers: settings.exclude_from_indexers,
             invalidate_after: Arc::new(AtomicI64::new(0)),
-            scratch: HashMap::new(),
             scratch_dir,
+            db_path,
             text_merge: settings.text_merge,
-            pending_mtime: HashMap::new(),
             write_epoch,
             reval_tx,
             reval_rx,
             reval_pending: HashSet::new(),
             _reval_handle: reval_handle,
             ignore_patterns: settings.ignore_patterns,
-            ignored: HashSet::new(),
             desktop: desktop::null(),
             sync_trigger,
+            desktop_cell,
             invalidations: Some(inval_rx),
+            inval_tx,
             _sync_handle: sync_handle,
         })
     }
@@ -525,6 +1101,13 @@ impl Provider {
     /// frontend calls this once with a platform backend (Linux D-Bus today) — or
     /// leaves the no-op default on headless/unsupported systems. Never required.
     pub fn set_desktop(&mut self, desktop: Arc<dyn Desktop>) {
+        // Down to the cache as well: it is the one that discovers, mid-read,
+        // that the server is unreachable and an outdated copy is all we have.
+        self.content.set_desktop(Arc::clone(&desktop));
+        // And into the slot the syncer reads from. It has been running since
+        // start-up with only the placeholder in there; this is the moment its
+        // notifications start reaching a screen.
+        *self.desktop_cell.lock().unwrap_or_else(|e| e.into_inner()) = Arc::clone(&desktop);
         self.desktop = desktop;
     }
 
@@ -581,695 +1164,68 @@ impl Provider {
         self.state.children_of(inode)
     }
 
-    /// Read `len` bytes at `offset` from a file, through the caching content
-    /// source. Online-only by default: the read serves just that range live. A
-    /// pinned file (or one we just wrote) is served whole from local disk.
-    pub fn read(&mut self, inode: u64, offset: u64, len: u32) -> Result<Vec<u8>> {
-        let node = self
-            .state
-            .node_by_inode(inode)?
-            .ok_or_else(|| Error::Other(format!("read: unknown inode {inode}")))?;
-        if node.is_dir {
-            return Err(Error::Other("read: is a directory".into()));
-        }
-        // If a write buffer is open, serve from it: in-progress edits are visible
-        // immediately (coherence), and a freshly created file — which has no server
-        // copy yet (deferred create) — is readable before its first flush.
-        if self.scratch.contains_key(&inode) {
-            return read_range_from_scratch(&self.scratch_path(inode), offset, len);
-        }
-        match self.content.read(&node, offset, len) {
-            Err(Error::NotFound) => {
-                // Deleted on the server since we last listed it (our cache is
-                // stale). Drop the node now so it disappears from listings — a
-                // desktop file manager sitting in the directory otherwise keeps
-                // reading it and hammering 404s — and report a stale handle.
-                tracing::debug!(path = %node.path, inode, "read: gone on the server (404) — pruning stale node");
-                let _ = self.state.remove_subtree(inode);
-                self.ignored.remove(&inode);
-                Err(Error::NotFound)
-            }
-            other => other,
-        }
+    /// A handle to the provider's tokio runtime. A frontend uses it to run a
+    /// [`ReadPlan::Fetch`] off the dispatch thread: `ContentSource::read` is
+    /// synchronous and blocks inside on this very runtime, so it must run on a
+    /// blocking thread, not the runtime's worker.
+    pub fn runtime(&self) -> tokio::runtime::Handle {
+        self.rt.handle().clone()
     }
 
-    /// The file's local-availability state for OS-integration emblems. `None`
-    /// for an unknown inode or a plain (unpinned) directory — the file manager
-    /// shows no emblem there.
-    ///
-    /// Network-free by contract: a file manager calls this for **every** visible
-    /// entry, so it only consults local state (SQLite + on-disk cache markers)
-    /// and never triggers a PROPFIND or GET.
-    pub fn file_state(&self, inode: u64) -> Result<Option<FileState>> {
-        let Some(node) = self.state.node_by_inode(inode)? else {
-            return Ok(None);
-        };
-        // A pending local edit is the most actionable state, and also covers a
-        // deferred create that has no server copy yet.
-        if self.scratch.contains_key(&inode) {
-            return Ok(Some(FileState::Modified));
-        }
-        // A pin (on the file itself, an ancestor directory, or the root) means
-        // "keep offline" regardless of what is currently on disk.
-        if self.state.is_pinned(&node.path)? {
-            return Ok(Some(FileState::Pinned));
-        }
-        if node.is_dir {
-            return Ok(None); // an unpinned directory carries no content state
-        }
-        if self.content.is_cached(&node) {
-            return Ok(Some(FileState::Cached));
-        }
-        Ok(Some(FileState::OnlineOnly))
+    /// The provider's runtime itself (not just a `Handle`). A frontend uses it to
+    /// `spawn_blocking` a flush and, *inside* that blocking task, `block_on` the
+    /// upload — which must go through the owning `Runtime`, not a `Handle`:
+    /// `Handle::block_on` from inside a `spawn_blocking` on a current-thread
+    /// runtime deadlocks, whereas `Runtime::block_on` drives it correctly (the
+    /// same pattern the read path uses in `content.rs`).
+    pub fn runtime_arc(&self) -> Arc<tokio::runtime::Runtime> {
+        self.rt.clone()
+    }
+
+    /// How many FUSE dispatch threads the frontend should run — the configured
+    /// concurrency (see [`crate::config::Settings::dispatch_threads`]). The engine
+    /// runtime is already sized to match. 1 = single-threaded (the default).
+    pub fn dispatch_threads(&self) -> usize {
+        self.dispatch_threads
     }
 
     // --- Writing (buffer strategy B) ----------------------------------------
 
-    /// Path of a node's scratch file.
-    fn scratch_path(&self, inode: u64) -> PathBuf {
-        self.scratch_dir.join(inode.to_string())
-    }
-
-    /// Forget a node's write buffer: the map entry **and** its on-disk scratch
-    /// file. Dropping only the map entry would leak the file until the next
-    /// process start (the startup sweep is a backstop, not the mechanism).
-    fn drop_scratch(&mut self, inode: u64) {
-        self.scratch.remove(&inode);
-        let _ = std::fs::remove_file(self.scratch_path(inode));
-    }
-
-    /// Ensure a writable scratch exists for `node`, seeded with its current
-    /// content (empty for a fresh, zero-length file).
-    fn ensure_scratch(&mut self, node: &NodeRow) -> Result<()> {
-        if self.scratch.contains_key(&node.inode) {
-            return Ok(());
-        }
-        std::fs::create_dir_all(&self.scratch_dir)?;
-        let path = self.scratch_path(node.inode);
-        if node.size > 0 {
-            // Stream the full base into the scratch — never capped or held in RAM,
-            // so editing a file of any size preserves all of it.
-            tracing::debug!(path = %node.path, bytes = node.size, "hydrating into the write buffer");
-            self.content.hydrate_to(node, &path)?;
-            // Reads no longer populate the cache, so if a later 3-way merge might
-            // run, seed the cache with this base now (cheap: reuse the scratch we
-            // just wrote). Without it, `try_text_merge` finds no base and falls
-            // back to a conflicted copy.
-            if self.text_merge {
-                self.content.store_file(node, &path, &node.etag)?;
-            }
-        } else {
-            std::fs::write(&path, [])?;
-        }
-        self.scratch.insert(
-            node.inode,
-            Scratch {
-                dirty: false,
-                base_etag: node.etag.clone(),
-            },
-        );
-        Ok(())
-    }
-
-    /// Write `data` at `offset` into the file's scratch buffer. Nothing reaches
-    /// the server until [`flush`](Self::flush).
-    pub fn write(&mut self, inode: u64, offset: u64, data: &[u8]) -> Result<u32> {
-        let node = self
-            .state
-            .node_by_inode(inode)?
-            .ok_or_else(|| Error::Other(format!("write: unknown inode {inode}")))?;
-        if node.is_dir {
-            return Err(Error::Other("write: is a directory".into()));
-        }
-        if !node.is_writable() {
-            return Err(Error::Denied);
-        }
-        self.ensure_scratch(&node)?;
-
-        let path = self.scratch_path(inode);
-        let mut file = std::fs::OpenOptions::new().write(true).open(&path)?;
-        file.seek(SeekFrom::Start(offset))?;
-        file.write_all(data)?;
-        let new_len = file.metadata()?.len();
-        drop(file);
-
-        if let Some(s) = self.scratch.get_mut(&inode) {
-            s.dirty = true;
-        }
-        if new_len != node.size {
-            self.state.set_size(inode, new_len)?; // so getattr reflects the growth
-        }
-        Ok(data.len() as u32)
-    }
-
-    /// Resize the file's scratch buffer (`setattr` truncate).
-    pub fn truncate(&mut self, inode: u64, size: u64) -> Result<()> {
-        let node = self
-            .state
-            .node_by_inode(inode)?
-            .ok_or_else(|| Error::Other(format!("truncate: unknown inode {inode}")))?;
-        if node.is_dir {
-            return Err(Error::Other("truncate: is a directory".into()));
-        }
-        if !node.is_writable() {
-            return Err(Error::Denied);
-        }
-        // Truncate-to-zero with no open buffer discards the entire base, so
-        // hydrating it first would be a full download of bytes we are about to
-        // throw away — while blocking the whole single-threaded FUSE loop. This
-        // is the *common* overwrite path: `cp` onto an existing file and every
-        // O_TRUNC editor land here before their first write. Start from an empty
-        // scratch instead. (Without a hydrated base a later 3-way text merge has
-        // no local base and falls back to a conflicted copy — the right price:
-        // a truncate-rewrite replaces the file wholesale anyway.)
-        if size == 0 && !self.scratch.contains_key(&inode) {
-            tracing::debug!(path = %node.path, "truncate to zero — starting from an empty buffer (no hydration)");
-            std::fs::create_dir_all(&self.scratch_dir)?;
-            std::fs::write(self.scratch_path(inode), [])?;
-            self.scratch.insert(
-                inode,
-                Scratch {
-                    dirty: false, // set below, like the hydrated path
-                    base_etag: node.etag.clone(),
-                },
-            );
-        } else {
-            self.ensure_scratch(&node)?;
-        }
-        let path = self.scratch_path(inode);
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)?
-            .set_len(size)?;
-        if let Some(s) = self.scratch.get_mut(&inode) {
-            s.dirty = true;
-        }
-        self.state.set_size(inode, size)?;
-        Ok(())
-    }
-
-    /// Set the mtime for a node (`setattr`). Reflected locally at once and sent
-    /// as `X-OC-Mtime` on the next upload (so `cp -p` preserves timestamps).
-    pub fn set_mtime(&mut self, inode: u64, mtime: i64) -> Result<()> {
-        self.pending_mtime.insert(inode, mtime);
-        self.state.set_mtime(inode, mtime)?;
-        Ok(())
-    }
-
-    /// Upload the scratch if dirty, then update the state (new ETag) and refresh
-    /// the read cache. A clean scratch is simply discarded. Idempotent.
+    /// Everything the execution substrate needs to run this account's work.
     ///
-    /// **The buffer is dropped only on success.** If anything fails — a server
-    /// error (500), a dropped connection — the scratch (and its `pending_mtime`)
-    /// is kept so the next `flush`/`fsync`/`release` retries, instead of silently
-    /// losing the user's edit. Editors trigger exactly this: `vi` writes a swap
-    /// file (`.foo.swp`) whose upload the server may reject, then unlinks it —
-    /// which must not take the real file's buffered content down with it.
-    pub fn flush(&mut self, inode: u64) -> Result<()> {
-        // Peek (don't remove yet): a failed upload must leave the buffer intact.
-        let (dirty, base_etag) = match self.scratch.get(&inode) {
-            Some(s) => (s.dirty, s.base_etag.clone()),
-            None => return Ok(()), // nothing buffered — already flushed, or clean
-        };
-        // An ignored file lives entirely in its scratch and never uploads. Keep
-        // the buffer (it IS the file's content until the file is removed).
-        if self.ignored.contains(&inode) {
-            return Ok(());
-        }
-        let path = self.scratch_path(inode);
-        if !dirty {
-            self.scratch.remove(&inode);
-            let _ = std::fs::remove_file(&path);
-            return Ok(());
-        }
-
-        // If the file was unlinked meanwhile (e.g. the editor deleted its swap
-        // file), there is nothing to upload — drop the buffer, do not resurrect it.
-        let Some(node) = self.state.node_by_inode(inode)? else {
-            self.scratch.remove(&inode);
-            self.pending_mtime.remove(&inode);
-            let _ = std::fs::remove_file(&path);
-            return Ok(());
-        };
-        let size = std::fs::metadata(&path)?.len();
-
-        self.desktop.set_status(Status::Syncing);
-        // One conversion point for *every* failure past this line — the upload
-        // itself, conflict resolution, or the bookkeeping after a success. Any
-        // of them erroring must land the indicator on Error, never leave it
-        // stuck at "Syncing" (the scratch stays, so a later flush retries).
-        if let Err(e) = self.upload_scratch(inode, node, &path, size, &base_etag) {
-            self.desktop.set_status(Status::Error);
-            return Err(e);
-        }
-
-        // Success (uploaded, or the conflict was resolved): the buffer is now on
-        // the server, so it is safe to drop it.
-        self.desktop.set_status(Status::Idle);
-        self.pending_mtime.remove(&inode);
-        self.scratch.remove(&inode);
-        let _ = std::fs::remove_file(&path);
-        Ok(())
-    }
-
-    /// The upload half of [`flush`](Self::flush): the conditional PUT, then the
-    /// state/cache bookkeeping — or conflict resolution on a 412. Extracted so
-    /// `flush` has exactly one place that maps success/failure to the desktop
-    /// status indicator.
-    fn upload_scratch(
-        &mut self,
-        inode: u64,
-        node: NodeRow,
-        path: &std::path::Path,
-        size: u64,
-        base_etag: &str,
-    ) -> Result<()> {
-        let mtime = self.pending_mtime.get(&inode).copied();
-        // What we may legitimately assert about the server. A file id means the
-        // file already exists there, which is what separates a deferred create
-        // (`If-None-Match: *`) from a plain save whose ETag we happen not to know
-        // — the latter must go out unconditionally rather than claim the file is
-        // absent. See [`crate::webdav::Precondition`].
-        let pre = crate::webdav::Precondition::for_upload(base_etag, node.file_id.is_some());
-        // Conditional upload — chunked for large files (bounded memory), else a
-        // plain PUT. Both reject with 412 when the precondition fails. Note we do
-        // NOT `?` the upload: a transient failure must keep the buffer.
-        let result = if size > crate::webdav::CHUNK_SIZE {
-            self.rt
-                .block_on(self.dav.put_chunked(&node.path, path, size, &pre, mtime))
-        } else {
-            let bytes = std::fs::read(path)?;
-            self.rt
-                .block_on(self.dav.put_conditional(&node.path, bytes, &pre, mtime))
-        };
-        match result {
-            Ok(crate::webdav::PutResult::Uploaded(new_etag)) => {
-                // The core success event of a sync tool — INFO, unlike the
-                // request-level PUT debug: this line means state and cache are
-                // updated and the local buffer can be dropped.
-                tracing::info!(path = %node.path, bytes = size, "uploaded");
-                let new_etag = new_etag.unwrap_or_default();
-                let was_deferred = node.file_id.is_none();
-                // The file now exists server-side (a deferred create gains an id via
-                // the reload below). Invalidate any PROPFIND taken before this upload,
-                // so a stale listing cannot delete the just-materialised file.
-                self.bump_write_epoch();
-                self.state.set_etag_size(inode, &new_etag, size)?;
-                // Keep the read cache hot (copy the scratch — never load it whole).
-                let mut updated = node;
-                updated.etag = new_etag.clone();
-                updated.size = size;
-                self.content.store_file(&updated, path, &new_etag)?;
-                // A deferred create had no server identity yet; reconcile the
-                // parent so this row picks up its server-assigned file id.
-                if was_deferred {
-                    self.reload_dir(updated.parent)?;
-                }
-                Ok(())
-            }
-            Ok(crate::webdav::PutResult::Conflict) => {
-                self.resolve_conflict(&node, path, size, base_etag)
-            }
-            Err(e) => {
-                // Keep the scratch + pending_mtime for a later retry, and tell the
-                // user their edit is only local (an actionable, data-at-risk event).
-                tracing::warn!(path = %node.path, %e, "upload failed — keeping the local buffer for retry");
-                self.desktop.notify(&Notice::UploadFailed {
-                    path: node.path.clone(),
-                    reason: e.to_string(),
-                });
-                Err(e)
-            }
+    /// The Provider knows where its own parts live, so it hands them over
+    /// rather than having the frontend assemble them from pieces it would have
+    /// to be told about.
+    #[must_use]
+    pub fn substrate_context(&self) -> crate::runtime::Context {
+        crate::runtime::Context {
+            pins: Arc::clone(&self.pins),
+            open_pinned: self.open_pinned,
+            metered: Arc::clone(&self.metered),
+            db_path: self.db_path.clone(),
+            content: Arc::clone(&self.content),
+            scratch_dir: self.scratch_dir.clone(),
+            ignore_patterns: self.ignore_patterns.clone(),
+            revalidate_secs: self.revalidate_secs,
+            push_floor_secs: self.push_floor_secs,
+            invalidate_after: Arc::clone(&self.invalidate_after),
+            async_upload: self.async_upload,
+            write: Some(self.write_context()),
         }
     }
 
-    /// Handle an upload conflict (412): optionally 3-way-merge text, else keep
-    /// the server version and save our local content as a "conflicted copy".
-    ///
-    /// This also covers a **deferred create** that lost the race against a
-    /// same-named server-side create (its `If-None-Match: *` failed): there is
-    /// no merge base (the node has no file id, so no cached copy), so the copy
-    /// path runs — the user's local content survives under the copy name, and
-    /// the parent reload below pulls in the server's own file.
-    fn resolve_conflict(
-        &mut self,
-        node: &NodeRow,
-        scratch: &std::path::Path,
-        size: u64,
-        base_etag: &str,
-    ) -> Result<()> {
-        if self.text_merge {
-            let local = std::fs::read(scratch)?;
-            if let Some((merged, theirs)) = self.try_text_merge(node, &local, base_etag)? {
-                // Upload the merge **conditionally against the very version it
-                // was merged from**. The merge result is only correct for that
-                // "theirs"; an unconditional PUT here would silently discard a
-                // third change that landed between our GET and this PUT — the
-                // exact lost update the whole 412 machinery exists to prevent.
-                let result = self.rt.block_on(self.dav.put_conditional(
-                    &node.path,
-                    merged.clone(),
-                    &theirs,
-                    None,
-                ))?;
-                match result {
-                    crate::webdav::PutResult::Uploaded(new_etag) => {
-                        let new_etag = new_etag.unwrap_or_default();
-                        let size = merged.len() as u64;
-                        self.state.set_etag_size(node.inode, &new_etag, size)?;
-                        let mut updated = node.clone();
-                        updated.etag = new_etag.clone();
-                        updated.size = size;
-                        self.content.store(&updated, &merged, &new_etag)?;
-                        tracing::info!(path = %node.path, "conflict auto-merged");
-                        return Ok(());
-                    }
-                    crate::webdav::PutResult::Conflict => {
-                        // The server moved on again while we were merging, so the
-                        // merge is stale. Fall through to the conflicted copy —
-                        // the user's bytes survive either way.
-                        tracing::debug!(path = %node.path, "merge raced another server change — falling back to a conflicted copy");
-                    }
-                }
-            }
+    /// The shareable half of this Provider, for work that runs elsewhere.
+    #[must_use]
+    pub fn write_context(&self) -> WriteContext {
+        WriteContext {
+            dav: self.dav.clone(),
+            rt: Arc::clone(&self.rt),
+            content: Arc::clone(&self.content),
+            desktop: Arc::clone(&self.desktop),
+            text_merge: self.text_merge,
+            write_epoch: Arc::clone(&self.write_epoch),
+            invalidations: self.inval_tx.clone(),
         }
-        // Conflict copy: the server version stays; our edit lands beside it
-        // (chunked for large files). The copy uploads with `MustNotExist`
-        // (`If-None-Match: *`) because its timestamped name has 1-second
-        // resolution: a second conflict in the same second would otherwise
-        // silently overwrite the first copy. On a 412, retry under a
-        // de-duplicated name, a small bounded number of times.
-        const MAX_COPY_ATTEMPTS: u32 = 4;
-        let fresh = crate::webdav::Precondition::MustNotExist;
-        let mut copy = conflict_copy_path(&node.path, 0);
-        for attempt in 0..MAX_COPY_ATTEMPTS {
-            let result = if size > crate::webdav::CHUNK_SIZE {
-                self.rt
-                    .block_on(self.dav.put_chunked(&copy, scratch, size, &fresh, None))?
-            } else {
-                let local = std::fs::read(scratch)?;
-                self.rt
-                    .block_on(self.dav.put_conditional(&copy, local, &fresh, None))?
-            };
-            match result {
-                crate::webdav::PutResult::Uploaded(_) => break,
-                crate::webdav::PutResult::Conflict if attempt + 1 < MAX_COPY_ATTEMPTS => {
-                    copy = conflict_copy_path(&node.path, attempt + 1);
-                }
-                crate::webdav::PutResult::Conflict => {
-                    // Every candidate name taken — vanishingly unlikely, but
-                    // erroring out is safe: flush keeps the scratch, so the
-                    // user's content is retried rather than dropped.
-                    return Err(Error::Other(format!(
-                        "conflicted copy of {}: every candidate name already exists",
-                        node.path
-                    )));
-                }
-            }
-        }
-        tracing::warn!(path = %node.path, copy = %copy, "upload conflict — saved a conflicted copy");
-        // Tell the user: their edit is safe but under a new name (data they would
-        // otherwise not find).
-        self.desktop.notify(&Notice::ConflictCopy {
-            path: node.path.clone(),
-            copy: copy.clone(),
-        });
-        // The original now reflects the server version; the copy appears.
-        self.bump_write_epoch(); // the copy is a new server-backed child — protect it
-        self.reload_dir(node.parent)?;
-        Ok(())
-    }
-
-    /// Attempt a 3-way text merge (base = cached last-known, ours = local,
-    /// theirs = current server). `None` if a merge is not possible (no clean
-    /// base, non-UTF-8, or a merge conflict).
-    ///
-    /// On success it returns the merged bytes **and** the precondition naming the
-    /// "theirs" it merged against, so the caller can upload the result
-    /// conditionally on exactly that version (see [`Self::resolve_conflict`]).
-    fn try_text_merge(
-        &mut self,
-        node: &NodeRow,
-        local: &[u8],
-        _base_etag: &str,
-    ) -> Result<Option<(Vec<u8>, crate::webdav::Precondition)>> {
-        let Some(base) = self.content.cached_bytes(node) else {
-            return Ok(None); // no clean base to merge against
-        };
-        let (theirs, theirs_etag) = self.rt.block_on(self.dav.get_with_etag(&node.path))?;
-        // The file demonstrably exists (we just read it), so an absent ETag means
-        // "version unknown" → upload unconditionally, never `If-None-Match: *`.
-        let pre = crate::webdav::Precondition::for_upload(
-            theirs_etag.as_deref().unwrap_or_default(),
-            true,
-        );
-        let (Ok(base), Ok(ours), Ok(theirs)) = (
-            String::from_utf8(base),
-            String::from_utf8(local.to_vec()),
-            String::from_utf8(theirs.to_vec()),
-        ) else {
-            return Ok(None); // binary content → cannot text-merge
-        };
-        match diffy::merge(&base, &ours, &theirs) {
-            Ok(merged) => Ok(Some((merged.into_bytes(), pre))),
-            Err(_conflicted) => Ok(None), // real conflict → fall back to a copy
-        }
-    }
-
-    /// Force-re-list a directory (PROPFIND + reconcile), so a mutation we just
-    /// made is reflected in the state with its server-assigned ids.
-    fn reload_dir(&mut self, inode: u64) -> Result<()> {
-        if let Some(dir) = self.state.node_by_inode(inode)? {
-            let entries = self.rt.block_on(self.dav.propfind_dir(&dir.path))?;
-            self.state.reconcile_children(inode, &dir.path, &entries)?;
-        }
-        Ok(())
-    }
-
-    /// Create a file under `parent` and return its node. Writes then flow through
-    /// [`write`](Self::write) / [`flush`](Self::flush).
-    ///
-    /// **Deferred materialisation:** nothing is sent to the server here — no PUT,
-    /// no PROPFIND. We only add a local node (no file id yet) and an empty scratch
-    /// marked dirty, so the first [`flush`](Self::flush) uploads the file (even if
-    /// never written, so `touch` still creates it). A file that is created and
-    /// deleted before any flush — an editor probe, a temp file — never touches the
-    /// server at all. If the name already exists locally, return that node.
-    pub fn create(&mut self, parent: u64, name: &str) -> Result<NodeRow> {
-        if let Some(existing) = self.state.child_by_name(parent, name)? {
-            return Ok(existing);
-        }
-        let node = self.state.insert_local_file(parent, name)?;
-        self.bump_write_epoch(); // a new child — invalidate any in-flight PROPFIND
-        std::fs::create_dir_all(&self.scratch_dir)?;
-        std::fs::write(self.scratch_path(node.inode), [])?;
-        self.scratch.insert(
-            node.inode,
-            Scratch {
-                dirty: true, // a new file is a pending change even with no bytes yet
-                base_etag: String::new(),
-            },
-        );
-        // Ephemeral editor/OS file (vim swap, LibreOffice/MS Office lock, …): keep
-        // it purely local — it never reaches the server (no upload on flush, no
-        // DELETE on remove), which saves round-trips and dodges server quirks.
-        if is_ignored(name, &self.ignore_patterns) {
-            tracing::debug!(path = %node.path, "create: ignored — kept local-only");
-            self.ignored.insert(node.inode);
-        } else {
-            tracing::debug!(path = %node.path, "create (deferred — uploads on first flush)");
-        }
-        Ok(node)
-    }
-
-    /// Create a directory under `parent` and return its node.
-    pub fn mkdir(&mut self, parent: u64, name: &str) -> Result<NodeRow> {
-        let pnode = self
-            .state
-            .node_by_inode(parent)?
-            .ok_or_else(|| Error::Other(format!("mkdir: unknown parent {parent}")))?;
-        let path = child_path(&pnode.path, name);
-        self.rt.block_on(self.dav.mkcol(&path))?;
-        self.bump_write_epoch(); // new server-backed dir — invalidate in-flight PROPFINDs
-        self.reload_dir(parent)?;
-        self.state
-            .child_by_name(parent, name)?
-            .ok_or_else(|| Error::Other(format!("mkdir: {name} did not appear")))
-    }
-
-    /// Delete a file or directory (with its subtree) under `parent`.
-    pub fn remove(&mut self, parent: u64, name: &str) -> Result<()> {
-        let node = self
-            .state
-            .child_by_name(parent, name)?
-            .ok_or_else(|| Error::Other(format!("remove: no such entry {name}")))?;
-        // A file with no file id was never materialised on the server (a deferred
-        // create that was deleted before its first flush) — there is nothing to
-        // DELETE remotely; just drop the local buffer and node.
-        if node.file_id.is_some() {
-            self.rt.block_on(self.dav.delete(&node.path, node.is_dir))?;
-        }
-        self.drop_scratch(node.inode);
-        self.pending_mtime.remove(&node.inode);
-        self.ignored.remove(&node.inode);
-        self.unpin_removed_subtree(&node)?;
-        self.state.remove_subtree(node.inode)?;
-        self.bump_write_epoch(); // a child vanished — an in-flight PROPFIND must not re-add it
-        Ok(())
-    }
-
-    /// Drop the pins a deleted subtree carried, and the eviction markers beside
-    /// its cache blobs.
-    ///
-    /// Both are path-keyed promises about files that no longer exist. A leftover
-    /// `.pin` marker is not merely untidy: eviction skips a pinned blob **and**
-    /// does not count it against `cache_max_bytes`, so those bytes would be
-    /// exempt from the cache budget forever — and a later file handed the same
-    /// Nextcloud file id would inherit the protection.
-    ///
-    /// Called before the rows go away, since the file ids come from them. The
-    /// scan over the node table only happens when a pin actually covers this
-    /// subtree — a plain `rm` of unpinned files stays a pure local delete.
-    fn unpin_removed_subtree(&mut self, node: &NodeRow) -> Result<()> {
-        // An ancestor (or root) pin covers this path without being *under* it.
-        let covered = self.state.is_pinned(&node.path)?;
-        let removed = self.state.remove_pins_under(&node.path)?;
-        if !covered && removed == 0 {
-            return Ok(());
-        }
-        for (_, file_id) in self.state.descendant_file_ids(&node.path)? {
-            self.content.unpin_file(file_id);
-        }
-        Ok(())
-    }
-
-    /// Drop the eviction markers of a destination that a rename is about to
-    /// replace — **without** touching the pin rows.
-    ///
-    /// The distinction matters: on a delete the path goes away, so its pins go
-    /// with it ([`unpin_removed_subtree`](Self::unpin_removed_subtree)). On an
-    /// overwrite the path survives and carries new content, so a pin on it must
-    /// stay and now cover the *new* object. What must not survive is the
-    /// replaced object's `.pin` marker: its blob is keyed by the old file id
-    /// and is about to become unreachable, yet a pin marker would keep it
-    /// exempt from eviction — a leak that never shrinks, since the eviction
-    /// budget deliberately does not count pinned blobs.
-    fn drop_replaced_eviction_markers(&mut self, replaced: &NodeRow) -> Result<()> {
-        for (_, file_id) in self.state.descendant_file_ids(&replaced.path)? {
-            self.content.unpin_file(file_id);
-        }
-        Ok(())
-    }
-
-    /// Move/rename an entry from `(parent, name)` to `(newparent, newname)`.
-    ///
-    /// A source that was never materialised on the server — a local-only file (a
-    /// deferred create, or an ignored file) — has no server object to MOVE. It is
-    /// renamed locally; then, if the **new** name is ignored it stays local-only,
-    /// otherwise it is **promoted**: the buffer is uploaded under the new name.
-    /// This is exactly the atomic-save pattern of office suites (write an ignored
-    /// temp, rename it onto the real document).
-    pub fn rename(&mut self, parent: u64, name: &str, newparent: u64, newname: &str) -> Result<()> {
-        let node = self
-            .state
-            .child_by_name(parent, name)?
-            .ok_or_else(|| Error::Other(format!("rename: no such entry {name}")))?;
-        self.bump_write_epoch(); // membership of the parent(s) changes — invalidate PROPFINDs
-
-        if node.file_id.is_none() {
-            // Free the destination name locally if it is taken (an overwrite): the
-            // promotion upload below replaces the server copy, an ignored rename
-            // just supersedes it locally.
-            if let Some(existing) = self.state.child_by_name(newparent, newname)? {
-                if existing.inode != node.inode {
-                    self.drop_scratch(existing.inode);
-                    self.ignored.remove(&existing.inode);
-                    self.drop_replaced_eviction_markers(&existing)?;
-                    self.state.remove_subtree(existing.inode)?;
-                    // The promotion MUST overwrite the replaced destination —
-                    // this is the office-suite atomic save (write an ignored
-                    // temp, rename it onto the real document). Adopt the
-                    // replaced row's ETag as the buffer's base version, so the
-                    // flush below uploads with `If-Match: <that etag>` (safe
-                    // replace; 412 only on a *concurrent* server change) rather
-                    // than the deferred-create `If-None-Match: *`, which would
-                    // wrongly flag the existing document as a conflict.
-                    if !existing.etag.is_empty() {
-                        if let Some(s) = self.scratch.get_mut(&node.inode) {
-                            s.base_etag = existing.etag.clone();
-                        }
-                    }
-                }
-            }
-            self.state.rename_node(node.inode, newparent, newname)?;
-            if is_ignored(newname, &self.ignore_patterns) {
-                self.ignored.insert(node.inode); // still ephemeral → stays local-only
-            } else {
-                // Promotion: the file must now exist on the server under the new
-                // name. Flush uploads the buffer to the (renamed) path and
-                // reconciles it, so it gains a real file id.
-                self.ignored.remove(&node.inode);
-                if let Some(s) = self.scratch.get_mut(&node.inode) {
-                    s.dirty = true;
-                }
-                // A failed upload must NOT fail the rename. The local rename is
-                // already committed above, so returning an error here would tell
-                // the kernel "the rename did not happen" while our state says it
-                // did — and the kernel's dentry cache would keep the old name,
-                // permanently out of step with us. It is also the wrong answer
-                // for the user: this is the office-suite atomic save, where EIO
-                // on the rename reads as "your document could not be saved",
-                // although the content is safe in the scratch and only the
-                // upload is outstanding.
-                //
-                // So the rename succeeds locally and the upload is retried by
-                // the next flush/fsync/release (`flush` keeps the buffer on
-                // failure). The user is not left in the dark: `flush` has
-                // already put the desktop indicator on Error and sent the
-                // `UploadFailed` notification.
-                if let Err(e) = self.flush(node.inode) {
-                    let path = self
-                        .state
-                        .node_by_inode(node.inode)?
-                        .map(|n| n.path)
-                        .unwrap_or_default();
-                    tracing::warn!(
-                        %path, %e,
-                        "promotion upload failed — the rename stands locally, the buffer is kept for a later retry"
-                    );
-                }
-            }
-            return Ok(());
-        }
-
-        // A real server file → server MOVE (overwrite allowed).
-        let np = self
-            .state
-            .node_by_inode(newparent)?
-            .ok_or_else(|| Error::Other(format!("rename: unknown parent {newparent}")))?;
-        let dst = child_path(&np.path, newname);
-        self.rt
-            .block_on(self.dav.move_(&node.path, &dst, node.is_dir))?;
-        // The MOVE replaced any same-named destination on the server; mirror
-        // that locally first so the moved row can take the (parent, name) slot.
-        if let Some(existing) = self.state.child_by_name(newparent, newname)? {
-            if existing.inode != node.inode {
-                self.drop_scratch(existing.inode);
-                self.ignored.remove(&existing.inode);
-                self.drop_replaced_eviction_markers(&existing)?;
-                self.state.remove_subtree(existing.inode)?;
-            }
-        }
-        // Move the row (and its subtree's paths) ourselves instead of letting
-        // the reconcile below delete + re-insert it: that keeps the inode
-        // alive, so open file handles and a pending write buffer keyed by it
-        // survive the rename (a dropped buffer would silently lose the edit).
-        self.state.move_subtree(node.inode, newparent, newname)?;
-        self.reload_dir(parent)?;
-        if newparent != parent {
-            self.reload_dir(newparent)?;
-        }
-        Ok(())
     }
 
     // --- Pins ("always keep offline") ---------------------------------------
@@ -1308,7 +1264,7 @@ impl Provider {
                 .ok_or_else(|| Error::Other(format!("pin: path not found: {path}")))?;
             (node.inode, node.is_dir)
         };
-        self.state.set_pin(&path, is_dir)?;
+        self.pins.set(&path, is_dir)?;
         if is_dir {
             self.hydrate_dir(inode)
         } else {
@@ -1319,6 +1275,69 @@ impl Provider {
             self.content.pin_file(&node)?;
             Ok(1)
         }
+    }
+
+    /// Fetch the current content for pinned files that have gone out of date.
+    ///
+    /// Deliberately **not** "unpin, then pin again". That would drop the
+    /// eviction marker first, so a re-download that failed — no network, server
+    /// down, disk full — would leave the file worse off than before: still
+    /// outdated *and* no longer protected. Re-fetching in place keeps the
+    /// promise intact throughout, and a failure leaves exactly what was there.
+    ///
+    /// Only pinned paths, because only a pin promises the file is there when
+    /// the server is not. Returns how many files were actually re-fetched;
+    /// those already current are not touched and not counted.
+    ///
+    /// # Errors
+    /// If the path is unknown, is not pinned, or a download fails.
+    pub fn refresh(&mut self, path: &str) -> Result<usize> {
+        let path = path.trim_matches('/').to_string();
+        if !self.pins.is_pinned(&path)? {
+            return Err(Error::Other(format!(
+                "not pinned, so there is nothing to keep up to date: {path}"
+            )));
+        }
+        let (inode, is_dir) = if path.is_empty() {
+            (ROOT_INODE, true)
+        } else {
+            let node = self
+                .resolve(&path)?
+                .ok_or_else(|| Error::Other(format!("update: path not found: {path}")))?;
+            (node.inode, node.is_dir)
+        };
+        if is_dir {
+            self.refresh_dir(inode, 0)
+        } else {
+            let node = self
+                .state
+                .node_by_inode(inode)?
+                .ok_or_else(|| Error::Other(format!("update: vanished: {path}")))?;
+            if !self.content.is_stale(&node) {
+                return Ok(0);
+            }
+            self.content.pin_file(&node)?;
+            Ok(1)
+        }
+    }
+
+    /// [`refresh`](Self::refresh) over a directory, depth-capped like the sync
+    /// walk — the same guard against a pathological tree exhausting the stack.
+    fn refresh_dir(&mut self, inode: u64, depth: u32) -> Result<usize> {
+        if depth >= SYNC_MAX_DEPTH {
+            tracing::warn!(inode, "update: depth cap reached — not descending further");
+            return Ok(0);
+        }
+        let mut done = 0;
+        for child in self.state.children_of(inode)? {
+            if child.is_dir {
+                done += self.refresh_dir(child.inode, depth + 1)?;
+            } else if self.content.is_stale(&child) {
+                self.content.pin_file(&child)?;
+                done += 1;
+            }
+        }
+        Ok(done)
     }
 
     /// Recursively hydrate and protect every file under a directory.
@@ -1349,9 +1368,9 @@ impl Provider {
     /// longer covers (they become normal, evictable cache entries).
     pub fn unpin(&mut self, path: &str) -> Result<()> {
         let path = path.trim_matches('/');
-        self.state.remove_pin(path)?;
+        self.pins.remove(path)?;
         for (node_path, file_id) in self.state.descendant_file_ids(path)? {
-            if !self.state.is_pinned(&node_path)? {
+            if !self.pins.is_pinned(&node_path)? {
                 self.content.unpin_file(file_id);
             }
         }
@@ -1359,8 +1378,11 @@ impl Provider {
     }
 
     /// All pins as `(path, is_dir)`.
+    ///
+    /// # Errors
+    /// If the pins file cannot be read.
     pub fn pins(&self) -> Result<Vec<(String, bool)>> {
-        self.state.pins()
+        self.pins.all()
     }
 
     /// Ensure a directory's children are in the state and fresh. Skips the
@@ -1407,14 +1429,6 @@ impl Provider {
         {
             self.reval_pending.remove(&inode); // worker gone — undo
         }
-    }
-
-    /// Mark that local directory membership changed, so any background PROPFIND
-    /// currently in flight is treated as stale on return (its listing predates this
-    /// write). Call after every create/mkdir/rename/remove and after an upload that
-    /// materialises a deferred create. See [`Self::write_epoch`].
-    fn bump_write_epoch(&self) {
-        self.write_epoch.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Apply any directory listings the background revalidator has finished, then
@@ -1522,121 +1536,45 @@ mod tests {
         assert_eq!(kids[0].name, "Notes.txt");
         assert!(provider.lookup(ROOT_INODE, "Notes.txt").unwrap().is_some());
     }
+}
 
-    #[test]
-    fn truncate_to_zero_needs_no_hydration() {
-        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // Overwriting an existing file (`cp` onto it, an O_TRUNC editor) starts
-        // with truncate-to-zero. That must NOT hydrate the old content first —
-        // the dummy server here is unreachable, so any attempted download fails
-        // the test. (A 1 GiB size also makes the cost of regressing obvious.)
-        let mut state = StateDb::open_in_memory().unwrap();
-        state
-            .reconcile_children(
-                ROOT_INODE,
-                "",
-                &[RemoteEntry {
-                    path: "big.bin".into(),
-                    is_dir: false,
-                    size: 1 << 30,
-                    etag: "e1".into(),
-                    mtime: 0,
-                    file_id: Some(7),
-                    permissions: "RGDNVW".into(),
-                }],
-            )
-            .unwrap();
+#[cfg(test)]
+mod pinned_refresh_tests {
+    use super::anything_new;
+    use std::collections::HashSet;
 
-        let tmp = std::env::temp_dir().join(format!("nc-prov-unit-{}", std::process::id()));
-        std::env::set_var("XDG_STATE_HOME", tmp.join("state"));
-        std::env::set_var("XDG_CACHE_HOME", tmp.join("cache"));
-        let account = crate::config::Account::new("truncate-test");
-        let mut provider = Provider::new(dummy_dav(), state, &account).unwrap();
-
-        let inode = provider
-            .lookup(ROOT_INODE, "big.bin")
-            .unwrap()
-            .unwrap()
-            .inode;
-        provider.truncate(inode, 0).unwrap();
-        assert_eq!(provider.node(inode).unwrap().unwrap().size, 0);
-        // The scratch is the file now: reading it yields the truncated content.
-        assert!(provider.read(inode, 0, 4096).unwrap().is_empty());
+    fn set(ids: &[u64]) -> HashSet<u64> {
+        ids.iter().copied().collect()
     }
 
     #[test]
-    fn file_state_reflects_pins_cache_and_edits() {
-        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let entry = |name: &str, dir: bool, fid: u64, etag: &str| RemoteEntry {
-            path: name.into(),
-            is_dir: dir,
-            size: 10,
-            etag: etag.into(),
-            mtime: 0,
-            file_id: Some(fid),
-            permissions: "RGDNVW".into(),
-        };
-        let mut state = StateDb::open_in_memory().unwrap();
-        state
-            .reconcile_children(
-                ROOT_INODE,
-                "",
-                &[
-                    entry("online.txt", false, 11, "e1"),
-                    entry("cached.txt", false, 12, "e2"),
-                    entry("pinned.txt", false, 14, "e4"),
-                    entry("Photos", true, 13, "e3"),
-                ],
-            )
-            .unwrap();
-        // Pin one file *before* handing the state to the provider (pinning via
-        // the provider would hydrate, i.e. hit the unreachable dummy server).
-        state.set_pin("pinned.txt", false).unwrap();
+    fn the_first_stale_file_is_worth_saying() {
+        let mut announced = HashSet::new();
+        assert!(anything_new(&mut announced, set(&[7])));
+    }
 
-        let tmp = std::env::temp_dir().join(format!("nc-fstate-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::env::set_var("XDG_STATE_HOME", tmp.join("state"));
-        std::env::set_var("XDG_CACHE_HOME", tmp.join("cache"));
-        let account = crate::config::Account::new("fstate");
-        // Seed a fresh cache blob for cached.txt (file_id 12, etag e2).
-        let blobs = account.blob_cache_dir();
-        std::fs::create_dir_all(&blobs).unwrap();
-        std::fs::write(blobs.join("12"), b"xxxxxxxxxx").unwrap();
-        std::fs::write(blobs.join("12.etag"), "e2").unwrap();
+    #[test]
+    fn the_same_backlog_on_the_next_walk_stays_quiet() {
+        let mut announced = HashSet::new();
+        assert!(anything_new(&mut announced, set(&[7, 8])));
+        assert!(!anything_new(&mut announced, set(&[7, 8])));
+        // Even a shrinking backlog: nothing new happened to the user.
+        assert!(!anything_new(&mut announced, set(&[7])));
+    }
 
-        let mut provider = Provider::new(dummy_dav(), state, &account).unwrap();
-        let ino = |p: &mut Provider, name: &str| p.lookup(ROOT_INODE, name).unwrap().unwrap().inode;
+    #[test]
+    fn one_more_file_going_stale_speaks_up_again() {
+        let mut announced = HashSet::new();
+        assert!(anything_new(&mut announced, set(&[7])));
+        assert!(anything_new(&mut announced, set(&[7, 9])));
+    }
 
-        let online = ino(&mut provider, "online.txt");
-        let cached = ino(&mut provider, "cached.txt");
-        let pinned = ino(&mut provider, "pinned.txt");
-        let photos = ino(&mut provider, "Photos");
-        assert_eq!(
-            provider.file_state(online).unwrap(),
-            Some(FileState::OnlineOnly)
-        );
-        assert_eq!(
-            provider.file_state(cached).unwrap(),
-            Some(FileState::Cached)
-        );
-        assert_eq!(
-            provider.file_state(pinned).unwrap(),
-            Some(FileState::Pinned)
-        );
-        assert_eq!(
-            provider.file_state(photos).unwrap(),
-            None,
-            "unpinned dir: no emblem"
-        );
-        assert_eq!(provider.file_state(999_999).unwrap(), None, "unknown inode");
-
-        // A freshly created (deferred, not-yet-uploaded) file reads as Modified.
-        let draft = provider.create(ROOT_INODE, "draft.txt").unwrap();
-        assert_eq!(
-            provider.file_state(draft.inode).unwrap(),
-            Some(FileState::Modified)
-        );
-
-        let _ = std::fs::remove_dir_all(&tmp);
+    #[test]
+    fn a_file_that_goes_stale_twice_is_announced_twice() {
+        let mut announced = HashSet::new();
+        assert!(anything_new(&mut announced, set(&[7])));
+        // Updated: the backlog empties, and with it the memory of it.
+        announced.clear();
+        assert!(anything_new(&mut announced, set(&[7])));
     }
 }

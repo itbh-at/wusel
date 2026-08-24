@@ -19,6 +19,9 @@ use clap::{Parser, Subcommand};
 
 use wusel_core::config::{self, Account};
 
+mod doctor;
+mod status;
+
 /// wusel — a virtual Nextcloud filesystem.
 #[derive(Parser)]
 #[command(
@@ -70,6 +73,11 @@ enum Command {
         /// Path to unpin; empty = the whole-account pin.
         path: Option<String>,
     },
+    /// Fetch the current version of pinned files that have gone out of date.
+    Update {
+        /// Path to bring up to date; empty = every pin in the account.
+        path: Option<String>,
+    },
     /// List the pins for the account.
     Pins,
     /// List configured accounts.
@@ -92,6 +100,32 @@ enum Command {
     /// Run the GNOME Shell search provider (a D-Bus service, normally started on
     /// demand by GNOME Shell — see the file-manager integration docs).
     SearchProvider,
+    /// Show what the mount is doing right now, by file name: uploads owed to the
+    /// server (including any parked after a permanent failure), files coming
+    /// down, and the rest of the work in flight. For the person whose files
+    /// these are — unlike `doctor`, which is name-free and made to be shared.
+    Status {
+        /// Keep redrawing until interrupted. Individual reads are far too short
+        /// to be caught by a single print.
+        #[arg(long)]
+        watch: bool,
+    },
+    /// Collect diagnostics for a support case: system, daemon, mount, the FUSE
+    /// connection's waiting count, the daemon's internal state, and a redacted
+    /// journal tail. Prints a report and, with `-o`, writes `<PREFIX>.txt` and
+    /// `<PREFIX>.json`. Redacted by default, so it is safe to attach to a ticket.
+    Doctor {
+        /// Also write `<PREFIX>.txt` and `<PREFIX>.json` next to stdout.
+        #[arg(short = 'o', long, value_name = "PREFIX")]
+        output: Option<String>,
+        /// Include full paths and file names — turns redaction off, for a
+        /// consenting deep dive.
+        #[arg(long)]
+        include_listing: bool,
+        /// Omit the journal tail from the report.
+        #[arg(long)]
+        no_logs: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -191,6 +225,7 @@ fn main() -> anyhow::Result<()> {
         Command::Service { action } => cmd_service(&account, action),
         Command::Pin { path } => cmd_pin(&account, path.as_deref().unwrap_or("")),
         Command::Unpin { path } => cmd_unpin(&account, path.as_deref().unwrap_or("")),
+        Command::Update { path } => cmd_update(&account, path.as_deref().unwrap_or("")),
         Command::Pins => cmd_pins(&account),
         Command::Accounts => cmd_accounts_list(),
         Command::Account { action } => match action {
@@ -201,6 +236,20 @@ fn main() -> anyhow::Result<()> {
             CacheCmd::Clear { path } => cmd_cache_clear(&account, path.as_deref()),
         },
         Command::SearchProvider => cmd_search_provider(&account),
+        Command::Status { watch } => status::run(&status::Options {
+            account: account.name().to_string(),
+            watch,
+        }),
+        Command::Doctor {
+            output,
+            include_listing,
+            no_logs,
+        } => doctor::run(&doctor::Options {
+            account: account.name().to_string(),
+            output: output.map(std::path::PathBuf::from),
+            include_listing,
+            no_logs,
+        }),
         Command::Desktop { action } => match action {
             DesktopCmd::Notify { severity } => cmd_desktop_notify(severity),
             DesktopCmd::InstallProvider { dir } => {
@@ -391,11 +440,20 @@ async fn cmd_login(account: &Account, server: &str, use_keyring: bool) -> anyhow
 fn cmd_mount(account: &Account, mountpoint: Option<&str>) -> anyhow::Result<()> {
     let creds_path = account.credentials_path();
     let creds = wusel_core::credentials::load(&creds_path, account.name()).with_context(|| {
-        format!(
-            "no credentials at {} — run `wusel login{} <server-url>` first",
-            creds_path.display(),
-            account_flag(account),
-        )
+        // Only claim the credentials are missing when they actually are. A file
+        // that exists but cannot be used fails for a reason the cause below
+        // states precisely — a keyring entry that is gone, one that cannot be
+        // read, a corrupt file — and prefixing all of them with "no credentials
+        // at …" buried that reason under a wrong summary.
+        if creds_path.exists() {
+            format!("could not load the credentials at {}", creds_path.display())
+        } else {
+            format!(
+                "no credentials at {} — run `wusel login{} <server-url>` first",
+                creds_path.display(),
+                account_flag(account),
+            )
+        }
     })?;
 
     let settings = account.settings();
@@ -410,25 +468,55 @@ fn cmd_mount(account: &Account, mountpoint: Option<&str>) -> anyhow::Result<()> 
     };
     let mountpoint = mountpoint.as_path();
 
+    // The daemon owns the mountpoint, so a systemd unit stays trivial.
+    std::fs::create_dir_all(mountpoint).ok();
+    let target = mountpoint
+        .canonicalize()
+        .unwrap_or_else(|_| mountpoint.to_path_buf());
+
+    // The platform OS-integration backend (Linux notifications + the file-manager
+    // cloud-provider status for this account's mountpoint; a no-op elsewhere or
+    // when D-Bus is absent — fail-soft). Built *before* the first network call,
+    // not after the provider: the very first thing that can go wrong is that the
+    // server cannot be reached, and a start-up that says nothing is exactly the
+    // silence this exists to break.
+    let desktop = wusel_desktop::backend(account.name(), &target);
+    // One shared answer to "can we reach the server?", fed by every request the
+    // engine makes, and the only thing allowed to notify about it.
+    let health = std::sync::Arc::new(wusel_core::health::Reachability::new(
+        &creds.server,
+        std::sync::Arc::clone(&desktop),
+    ));
+
     let http = build_http_client(&settings.tls)?;
+    let dav_user = resolve_dav_user(
+        &http,
+        &creds.server,
+        &creds.login_name,
+        &creds.app_password,
+        Some(&health),
+    );
     let dav = wusel_core::webdav::WebDavClient::new(
         http,
         &creds.server,
         &creds.login_name,
         &creds.app_password,
-    );
+    )
+    .with_health(std::sync::Arc::clone(&health));
+    let dav = match dav_user {
+        Some(uid) => dav.with_dav_user(&uid),
+        None => dav,
+    };
 
-    let db_path = account.state_db_path();
-    if let Some(dir) = db_path.parent() {
-        std::fs::create_dir_all(dir).context("could not create the state directory")?;
-    }
-    let state =
-        wusel_core::state::StateDb::open(&db_path).context("could not open the state database")?;
+    let state = open_state(&account)?;
 
     let mut provider = wusel_core::provider::Provider::new(dav, state, account)
         .context("could not initialise the provider")?;
 
-    // Instant cache invalidation over notify_push; degrades to TTL if absent.
+    // Instant cache invalidation over notify_push; degrades to TTL if absent. Its
+    // retry loops keep talking to the server when nothing else does, which makes
+    // them the mount's heartbeat: an otherwise idle daemon still learns that the
+    // connection went away — and came back — and tells the user.
     let _push = wusel_core::push::spawn(
         &creds.server,
         &creds.login_name,
@@ -436,18 +524,10 @@ fn cmd_mount(account: &Account, mountpoint: Option<&str>) -> anyhow::Result<()> 
         settings.tls.clone(),
         provider.invalidation_handle(),
         provider.sync_trigger(),
+        Some(std::sync::Arc::clone(&health)),
     );
 
-    // The daemon owns the mountpoint, so a systemd unit stays trivial.
-    std::fs::create_dir_all(mountpoint).ok();
-    let target = mountpoint
-        .canonicalize()
-        .unwrap_or_else(|_| mountpoint.to_path_buf());
-
-    // Plug in the platform OS-integration backend (Linux notifications + the
-    // file-manager cloud-provider status for this account's mountpoint; a no-op
-    // elsewhere or when D-Bus is absent — fail-soft).
-    provider.set_desktop(wusel_desktop::backend(account.name(), &target));
+    provider.set_desktop(desktop);
 
     // Refuse to mount where it would clobber another mount (a shared or nested
     // mountpoint between accounts, or a plain double-mount).
@@ -837,20 +917,116 @@ fn build_provider(account: &Account) -> anyhow::Result<wusel_core::provider::Pro
             )
         })?;
     let http = build_http_client(&account.settings().tls)?;
+    // No reachability tracking here: this builds a provider for a one-shot
+    // command (search, diagnostics), where a failure is reported in the terminal
+    // the user is looking at — a desktop notification would be redundant noise.
+    let dav_user = resolve_dav_user(
+        &http,
+        &creds.server,
+        &creds.login_name,
+        &creds.app_password,
+        None,
+    );
     let dav = wusel_core::webdav::WebDavClient::new(
         http,
         &creds.server,
         &creds.login_name,
         &creds.app_password,
     );
-    let db_path = account.state_db_path();
-    if let Some(dir) = db_path.parent() {
-        std::fs::create_dir_all(dir).context("could not create the state directory")?;
-    }
-    let state =
-        wusel_core::state::StateDb::open(&db_path).context("could not open the state database")?;
+    let dav = match dav_user {
+        Some(uid) => dav.with_dav_user(&uid),
+        None => dav,
+    };
+    let state = open_state(account)?;
     wusel_core::provider::Provider::new(dav, state, account)
         .context("could not initialise the provider")
+}
+
+/// Resolve the account's canonical **user id** for building DAV paths.
+///
+/// The login flow stores the `loginName` — the credential the user signed in
+/// with, which some providers make an email — and that works for Basic auth and
+/// for `/dav/files/<user>/`, but Nextcloud's chunked-upload endpoint
+/// `/dav/uploads/<user>/` rejects a login alias with 403. So the path segment
+/// must be the real user id (see [`wusel_core::webdav::WebDavClient::with_dav_user`]).
+///
+/// Best-effort: if the lookup fails (offline, an older server), return `None`
+/// and let the caller keep the login name — the previous behaviour, which still
+/// serves reads and small uploads.
+///
+/// This is usually the mount's **first** request, so it is also where an outage
+/// is first seen: the outcome goes to `health` like any other, and the user is
+/// told once it is clear the server is really gone rather than briefly busy.
+fn resolve_dav_user(
+    http: &reqwest::Client,
+    server: &str,
+    login: &str,
+    password: &str,
+    health: Option<&wusel_core::health::Reachability>,
+) -> Option<String> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+    match rt.block_on(wusel_core::capabilities::whoami(
+        http, server, login, password,
+    )) {
+        Ok(id) => {
+            if let Some(health) = health {
+                health.ok();
+            }
+            if id != login {
+                tracing::info!(user_id = %id, "resolved the DAV user id (the login name is an alias)");
+            }
+            Some(id)
+        }
+        Err(e) => {
+            if let Some(health) = health {
+                health.failed(&e);
+            }
+            tracing::warn!(error = %e, "could not resolve the user id; using the login name for DAV paths");
+            None
+        }
+    }
+}
+
+/// The account's pins, taking them out of an older database on the way if that
+/// is where they still are.
+///
+/// Every command that touches pins goes through here, so the migration cannot
+/// depend on which one the user happened to run first.
+fn open_pins(account: &Account) -> anyhow::Result<wusel_core::pins::Pins> {
+    let pins = wusel_core::pins::Pins::new(&account.config_dir());
+    let db = account.state_db_path();
+    if !pins.file().exists() && db.exists() {
+        if let Ok(state) = wusel_core::state::StateDb::open_existing(&db) {
+            let legacy = state.legacy_pins().unwrap_or_default();
+            match pins.migrate_from(&legacy) {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(count = n, "moved the pins out of the state database"),
+                Err(e) => tracing::warn!(%e, "could not move the pins out of the database"),
+            }
+        }
+    }
+    Ok(pins)
+}
+
+/// Open the state database, saying out loud when it is not where the user would
+/// expect it to be.
+///
+/// The announcement belongs here rather than in the engine: a relocation is
+/// something a *person* needs to know about — their metadata now lives outside
+/// their home directory and does not travel with their roaming profile — and
+/// the engine has no channel to a person.
+fn open_state(account: &Account) -> anyhow::Result<wusel_core::state::StateDb> {
+    let location = account.db_location();
+    if let Some(message) = location.message() {
+        tracing::warn!("{message}");
+    }
+    location
+        .prepare()
+        .context("could not create the state directory")?;
+    wusel_core::state::StateDb::open(location.path()).context("could not open the state database")
 }
 
 fn pin_label(path: &str) -> String {
@@ -888,9 +1064,11 @@ fn cmd_cache_clear(account: &Account, path: Option<&str>) -> anyhow::Result<()> 
     let path = path.map(|p| p.trim_matches('/')).filter(|p| !p.is_empty());
     match path {
         None => {
-            // Whole account: state DB (metadata + pins) and the cache directory
+            // Whole account: the state DB (metadata) and the cache directory
             // (content blobs + scratch) — the next mount starts like a fresh
-            // connection.
+            // connection. Pins are NOT touched: they are what the user said,
+            // not something we fetched, and somebody clearing space before a
+            // trip is exactly who must not lose them.
             let mut freed = 0u64;
             let db = account.state_db_path();
             for suffix in ["", "-wal", "-shm"] {
@@ -909,9 +1087,17 @@ fn cmd_cache_clear(account: &Account, path: Option<&str>) -> anyhow::Result<()> 
                 fmt_bytes(freed)
             );
             println!(
-                "Metadata, content cache and pins are gone — the next mount starts like a \
-                 fresh connection. Credentials and config are kept."
+                "Metadata and content cache are gone — the next mount starts like a \
+                 fresh connection. Credentials, config and pins are kept."
             );
+            match open_pins(account).and_then(|p| p.all().map_err(Into::into)) {
+                Ok(pins) if !pins.is_empty() => println!(
+                    "{} pin(s) remain; their files download again on first use \
+                     (`wusel pins` to see them, `wusel unpin` to drop one).",
+                    pins.len()
+                ),
+                _ => {}
+            }
         }
         Some(p) => {
             let db_path = account.state_db_path();
@@ -1093,10 +1279,33 @@ fn cmd_pin(account: &Account, path: &str) -> anyhow::Result<()> {
     let (account, remote) = resolve_pin_target(account, path)?;
     let mut provider = build_provider(&account)?;
     let count = provider.pin(&remote).context("could not pin")?;
+    announce_emblem(&account, &remote);
     println!(
         "Pinned {} — {count} file(s) downloaded and kept offline.",
         pin_label(&remote)
     );
+    Ok(())
+}
+
+/// Bring pinned files that have gone out of date back in step with the server.
+///
+/// Not "unpin and pin again": that would drop the eviction marker first, so a
+/// failed re-download would leave the file outdated *and* unprotected. This
+/// re-fetches in place, so a failure leaves exactly what was there.
+fn cmd_update(account: &Account, path: &str) -> anyhow::Result<()> {
+    let (account, remote) = resolve_pin_target(account, path)?;
+    let mut provider = build_provider(&account)?;
+    let count = provider
+        .refresh(&remote)
+        .context("could not bring the pinned copy up to date")?;
+    if count == 0 {
+        println!("{} is already up to date.", pin_label(&remote));
+    } else {
+        println!(
+            "Updated {} — {count} file(s) re-downloaded.",
+            pin_label(&remote)
+        );
+    }
     Ok(())
 }
 
@@ -1105,8 +1314,29 @@ fn cmd_unpin(account: &Account, path: &str) -> anyhow::Result<()> {
     let (account, remote) = resolve_pin_target(account, path)?;
     let mut provider = build_provider(&account)?;
     provider.unpin(&remote).context("could not unpin")?;
+    announce_emblem(&account, &remote);
     println!("Unpinned {}.", pin_label(&remote));
     Ok(())
+}
+
+/// Tell the desktop this path's emblem is out of date.
+///
+/// Whoever *performs* the change announces it, and pinning is performed here —
+/// `wusel pin` and the Nautilus menu entry both run this binary, in their own
+/// process, while the daemon holds the mount. The daemon's own channel cannot
+/// help: nothing in it knows this happened.
+///
+/// Best-effort by design. A file manager that is not running, a session bus
+/// that is not there, a headless machine — none of that should make an unpin
+/// fail. The state is already correct either way; this is only how quickly it
+/// is *shown*.
+fn announce_emblem(account: &Account, remote: &str) {
+    let mount = account
+        .settings()
+        .mount_point
+        .unwrap_or_else(|| account.default_mountpoint());
+    let desktop = wusel_desktop::backend(account.name(), &mount);
+    desktop.file_changed(&mount.join(remote).to_string_lossy());
 }
 
 /// Run the GNOME Shell search provider: forward queries to Nextcloud Unified
@@ -1195,16 +1425,13 @@ fn spawn_and_reap(mut cmd: std::process::Command) -> std::io::Result<u32> {
     Ok(pid)
 }
 
-/// List the pins for an account (reads only the state DB).
+/// List the pins for an account.
+///
+/// Reads the pins file and nothing else — no database, so it answers on a
+/// machine whose cache has been cleared, and it is the same answer a running
+/// daemon would give.
 fn cmd_pins(account: &Account) -> anyhow::Result<()> {
-    let db_path = account.state_db_path();
-    if !db_path.exists() {
-        println!("No pins.");
-        return Ok(());
-    }
-    let state =
-        wusel_core::state::StateDb::open(&db_path).context("could not open the state database")?;
-    let pins = state.pins().context("could not read pins")?;
+    let pins = open_pins(account)?.all().context("could not read pins")?;
     if pins.is_empty() {
         println!("No pins.");
         return Ok(());

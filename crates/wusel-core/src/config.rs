@@ -64,6 +64,33 @@ pub fn cache_dir() -> PathBuf {
     xdg_dir("XDG_CACHE_HOME", ".cache").join("wusel")
 }
 
+/// `$XDG_RUNTIME_DIR/wusel` — the per-user, per-session tmpfs the kernel clears
+/// at logout. Home to the diagnostics socket, which is transient and
+/// user-private by construction. Falls back to the temp dir only when
+/// `XDG_RUNTIME_DIR` is unset, which on a real desktop session it is not.
+pub fn runtime_dir() -> PathBuf {
+    if let Ok(val) = std::env::var("XDG_RUNTIME_DIR") {
+        if !val.is_empty() {
+            return PathBuf::from(val).join("wusel");
+        }
+    }
+    std::env::temp_dir().join("wusel")
+}
+
+/// The diagnostics socket for a mount, where it serves its state and
+/// `wusel doctor` reads it. Keyed on the mountpoint — hashed, so the path stays
+/// well inside the 108-byte unix-socket limit however deep the mountpoint —
+/// so the mount and a separate `doctor` run derive the same path from the same
+/// resolved mountpoint without sharing anything else.
+pub fn diag_socket_for_mount(mountpoint: &std::path::Path) -> PathBuf {
+    use std::hash::{Hash, Hasher};
+    // `DefaultHasher::new` has fixed keys — deterministic within a build, which
+    // is all that is needed: producer and consumer are the same binary.
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    mountpoint.hash(&mut h);
+    runtime_dir().join(format!("diag-{:016x}.sock", h.finish()))
+}
+
 /// The configuration file (settings).
 pub fn config_path() -> PathBuf {
     config_dir().join("config.toml")
@@ -166,8 +193,30 @@ impl Account {
     pub fn config_path(&self) -> PathBuf {
         self.config_dir().join("config.toml")
     }
+    /// Where this account's state database actually opens.
+    ///
+    /// The resolved path, not the nominal one: on a machine with a network home
+    /// directory these differ, and a caller that used the nominal path would
+    /// address a database nobody is writing to. `cache clear` deleting the wrong
+    /// file is the kind of bug that follows from the other arrangement.
     pub fn state_db_path(&self) -> PathBuf {
-        self.state_dir().join("state.sqlite")
+        self.db_location().path().to_path_buf()
+    }
+
+    /// Where the state database goes, and why.
+    ///
+    /// Resolved on each call rather than cached: it costs one small read of
+    /// `/proc/self/mounts`, it happens a handful of times at start-up, and a
+    /// cache would have to be invalidated when the account's configuration is
+    /// re-read — a subtlety worth more than the microseconds it saves.
+    #[must_use]
+    pub fn db_location(&self) -> crate::storage::DbLocation {
+        crate::storage::resolve(
+            self.state_dir().join("state.sqlite"),
+            self.settings().db_path,
+            crate::storage::fallback_dir(self.name()).map(|d| d.join("state.sqlite")),
+            crate::storage::mount_table().as_deref(),
+        )
     }
     /// Directory for this account's hydrated blobs.
     pub fn blob_cache_dir(&self) -> PathBuf {
@@ -224,10 +273,17 @@ pub fn list_accounts() -> Vec<String> {
 /// revalidate_secs = 30   # re-list a directory older than this (no-push fallback)
 /// push_floor_secs = 5    # min interval between push-triggered re-lists of a dir
 /// text_merge = false     # opt-in: 3-way-merge text on conflict (else a copy)
+/// refresh_pinned = "ask" # manual | ask | auto — what to do when a pinned
+///                        # file's server copy has moved on
+/// upload = "async"       # async (default): flush returns once the change is
+///                        # durable, upload in the background. sync: flush waits
+///                        # for the upload and reports its real result.
 /// ignore_patterns = [".*.sw?", "~$*", …]  # kept local; REPLACES the default set
 /// [tls]
-/// ca_cert  = "/etc/wusel/my-ca.pem"  # extra trusted CA (self-hosted certs)
-/// insecure = false                     # true = disable TLS verification (DANGER)
+/// ca_cert    = "/etc/wusel/my-ca.pem"  # extra trusted CA (self-hosted certs)
+/// insecure   = false                    # true = disable TLS verification (DANGER)
+/// http1_only = false                    # true = force HTTP/1.1 (proxies that
+///                                        #        mangle HTTP/2 upload bodies)
 /// [auth]
 /// keyring = true     # default; false = keep the app password in the 0600 file
 /// [mount]
@@ -249,10 +305,36 @@ pub struct Settings {
     pub tls: TlsSettings,
     /// Mountpoint override; falls back to the account's default mountpoint.
     pub mount_point: Option<PathBuf>,
+    /// How many FUSE dispatch threads serve kernel requests, and how many worker
+    /// threads the engine's runtime uses for concurrent network I/O. Independent
+    /// operations (reads, uploads, listings) run in parallel up to this many.
+    ///
+    /// The default is now several, not one. It used to be 1 — "exactly the
+    /// pre-concurrency behaviour, opt in to more" — but that was a mistake on a
+    /// real desktop: a file manager listing a folder issues many reads at once
+    /// (it sniffs each file's content type), and with one thread they serialise
+    /// behind whichever is slowest, so a single slow or stalled read stalls the
+    /// whole listing. Concurrency is the point of the engine; making it opt-in
+    /// defeated it. Clamped to a sane ceiling on load.
+    pub dispatch_threads: usize,
     /// Opt-in: on an upload conflict, try a 3-way text merge before falling back
     /// to a conflict copy. Off by default — the reference client always makes a
     /// conflict copy.
     pub text_merge: bool,
+    /// What to do when a pinned file's server copy has moved on. See
+    /// [`RefreshPinned`].
+    pub refresh_pinned: RefreshPinned,
+
+    /// Whether `flush` waits for the upload (`sync`) or returns as soon as the
+    /// change is durable and uploads in the background (`async`, the default).
+    pub upload: UploadMode,
+    /// What to serve when an out-of-date pinned file is opened. See
+    /// [`OpenPinned`].
+    pub open_pinned: OpenPinned,
+    /// Where the state database goes, overriding both the default location and
+    /// the relocation off a network filesystem. An explicit choice is always
+    /// honoured — see [`crate::storage`].
+    pub db_path: Option<PathBuf>,
     /// Glob patterns (matched on the basename) for ephemeral editor/OS files that
     /// are kept purely local and never uploaded. Defaults to
     /// [`crate::ignore::DEFAULT_IGNORE_PATTERNS`]; a config value replaces it.
@@ -273,6 +355,17 @@ pub struct Settings {
     pub exclude_from_indexers: bool,
 }
 
+/// The default dispatch-thread count: the machine's parallelism, floored at 4 so
+/// a file manager's burst of reads never serialises, capped at 8 so the worker
+/// pools and their SQLite connections stay modest. A user can still set any
+/// value in `[mount] dispatch_threads` (clamped to 1..16 on load).
+fn default_dispatch_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(4, 8)
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -282,7 +375,12 @@ impl Default for Settings {
             cache_max_age_secs: None,
             tls: TlsSettings::default(),
             mount_point: None,
+            dispatch_threads: default_dispatch_threads(),
             text_merge: false,
+            refresh_pinned: RefreshPinned::default(),
+            upload: UploadMode::default(),
+            open_pinned: OpenPinned::default(),
+            db_path: None,
             ignore_patterns: crate::ignore::DEFAULT_IGNORE_PATTERNS
                 .iter()
                 .map(|s| s.to_string())
@@ -303,6 +401,11 @@ pub struct TlsSettings {
     pub ca_cert: Option<std::path::PathBuf>,
     /// Disable certificate verification. Dangerous; logged loudly on start.
     pub insecure: bool,
+    /// Force HTTP/1.1 instead of negotiating HTTP/2. A robustness escape hatch:
+    /// some reverse proxies mishandle HTTP/2 request bodies for WebDAV chunked
+    /// uploads (Nextcloud logs "expected N bytes, got 0") — HTTP/1.1 sidesteps
+    /// that entirely. Off by default (HTTP/2 is used where the server offers it).
+    pub http1_only: bool,
 }
 
 /// Load the default account's settings.
@@ -339,27 +442,205 @@ struct RawConfig {
     auth: RawAuth,
     #[serde(default)]
     desktop: RawDesktop,
+    #[serde(default)]
+    state: RawState,
+}
+#[derive(serde::Deserialize, Default)]
+struct RawState {
+    db_path: Option<String>,
 }
 #[derive(serde::Deserialize, Default)]
 struct RawCache {
     max_size: Option<String>,
     max_age: Option<String>,
 }
+/// What to serve when a pinned file is *opened* and the local copy is out of
+/// date.
+///
+/// A different question from [`RefreshPinned`], which decides whether we fetch
+/// **unasked, in the background**. Opening a file is asking, and the answer used
+/// to be fixed: the local copy no longer matches, so read it live. That is right
+/// on a desk and wrong on a train — a pin exists so the file is *there*, and a
+/// hotel connection can make "there" cost more than the outdated copy is worth.
+///
+/// The stale copy is never served silently: whenever it is handed out, the user
+/// is told, because an application that opens it and saves produces a conflict
+/// nobody saw coming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OpenPinned {
+    /// Always fetch the current version. What a VFS does by default, and the
+    /// behaviour before this setting existed.
+    #[default]
+    Newest,
+    /// Fetch the current version, but not over a metered connection — there,
+    /// serve the copy that is already paid for.
+    NewestUnmetered,
+    /// Always serve the local copy. Bringing it up to date is then a deliberate
+    /// act: "Update now", or `wusel update <path>`.
+    Offline,
+}
+
+/// What [`OpenPinned`] decided for one open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenAction {
+    /// Read from the server; the local copy is out of date.
+    Fetch,
+    /// Serve the outdated local copy, and say so.
+    ServeLocal,
+}
+
+impl OpenPinned {
+    /// Decide, given what is known about the connection's cost.
+    ///
+    /// Unknown metering counts as **metered**, exactly as in
+    /// [`RefreshPinned::decide`]: an unknown cost is not a licence to spend, and
+    /// somebody who chose `NewestUnmetered` said the connection's cost is what
+    /// decides. The rule is the same in both — unknown means do not fetch — and
+    /// only the effect of not fetching differs: there it skips a background
+    /// update, here it makes the open serve the outdated copy. That is the price
+    /// of caution on an unknown line, and the safe direction: stale bytes beat a
+    /// surprise bill.
+    #[must_use]
+    pub fn decide(self, metered: Option<bool>) -> OpenAction {
+        match self {
+            Self::Newest => OpenAction::Fetch,
+            Self::Offline => OpenAction::ServeLocal,
+            Self::NewestUnmetered => match metered {
+                Some(false) => OpenAction::Fetch,
+                Some(true) | None => OpenAction::ServeLocal,
+            },
+        }
+    }
+
+    /// Parse the configured value; `None` for anything unrecognised, so the
+    /// caller can warn rather than pick silently.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "newest" | "online" => Some(Self::Newest),
+            "newest-unmetered" | "newest_unmetered" | "unmetered" => Some(Self::NewestUnmetered),
+            "offline" | "local" => Some(Self::Offline),
+            _ => None,
+        }
+    }
+}
+
+/// What happens when a pinned file's server copy has moved on.
+///
+/// A pin promises "keep this offline". When the server version changes, that
+/// promise needs a decision — and it is the user's, because the cost is theirs:
+/// the file may be two gigabytes and the link may be a phone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RefreshPinned {
+    /// Show the state and do nothing else. The user picks the moment, with
+    /// "Update now".
+    Manual,
+    /// Ask — one debounced, aggregated notification with an action. The default,
+    /// because `manual` is invisible to anyone who does not read emblems and
+    /// `auto` spends someone else's bandwidth on their behalf.
+    #[default]
+    Ask,
+    /// Fetch by itself, **but only when it is cheap**: an unmetered connection.
+    /// Otherwise it behaves as [`RefreshPinned::Ask`] — pulling two gigabytes
+    /// over a mobile link because a colleague touched a file is exactly the harm
+    /// this project exists to avoid.
+    Auto,
+}
+
+/// What to actually do about a pinned file that has gone out of date.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshAction {
+    /// Nothing beyond the emblem the file already carries.
+    ShowOnly,
+    /// Tell the user, with an action they can trigger.
+    Ask,
+    /// Fetch it now, without asking.
+    Fetch,
+}
+
+impl RefreshPinned {
+    /// Decide what to do, given what we know about the connection.
+    ///
+    /// `metered` is `None` when the answer is unknown, and unknown counts as
+    /// *not cheap*: `auto` then behaves as `ask`. The alternative — assuming an
+    /// unmetered link — is how a two-gigabyte refresh lands on somebody's phone
+    /// plan because a colleague reorganised a shared folder.
+    ///
+    /// The design also names an idle machine as a condition for `auto`.
+    /// Idleness is not detected yet, so it is not part of this decision; only
+    /// the cost check is.
+    #[must_use]
+    pub fn decide(self, metered: Option<bool>) -> RefreshAction {
+        match self {
+            Self::Manual => RefreshAction::ShowOnly,
+            Self::Ask => RefreshAction::Ask,
+            Self::Auto => match metered {
+                Some(false) => RefreshAction::Fetch,
+                Some(true) | None => RefreshAction::Ask,
+            },
+        }
+    }
+
+    /// Parse a configured value. `None` for anything else, so the caller can
+    /// warn rather than guess.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "manual" => Some(Self::Manual),
+            "ask" => Some(Self::Ask),
+            "auto" => Some(Self::Auto),
+            _ => None,
+        }
+    }
+}
+
+/// When a `flush` is answered relative to the upload it triggers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UploadMode {
+    /// Answer `flush` as soon as the change is durable on local disk, and upload
+    /// in the background. The default: a slow or offline server never blocks a
+    /// save, and a file manager copying several files does not stall.
+    #[default]
+    Async,
+    /// Hold `flush` until the upload actually lands, and report its real result.
+    /// The pre-async behaviour, kept as a fallback for anyone who wants a save to
+    /// mean "on the server" before it returns.
+    Sync,
+}
+
+impl UploadMode {
+    /// Parse a configured value; `None` for anything else, so the caller warns
+    /// rather than guessing.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "async" => Some(Self::Async),
+            "sync" => Some(Self::Sync),
+            _ => None,
+        }
+    }
+}
+
 #[derive(serde::Deserialize, Default)]
 struct RawSync {
     revalidate_secs: Option<u64>,
     push_floor_secs: Option<u64>,
     text_merge: Option<bool>,
+    refresh_pinned: Option<String>,
+    open_pinned: Option<String>,
+    upload: Option<String>,
     ignore_patterns: Option<Vec<String>>,
 }
 #[derive(serde::Deserialize, Default)]
 struct RawTls {
     ca_cert: Option<String>,
     insecure: Option<bool>,
+    http1_only: Option<bool>,
 }
 #[derive(serde::Deserialize, Default)]
 struct RawMount {
     point: Option<String>,
+    dispatch_threads: Option<usize>,
 }
 #[derive(serde::Deserialize, Default)]
 struct RawAuth {
@@ -384,6 +665,46 @@ fn parse_settings(text: &str) -> crate::Result<Settings> {
         s.ignore_patterns = v; // an explicit list REPLACES the built-in default
     }
     s.text_merge = raw.sync.text_merge.unwrap_or(false);
+    // An empty string is not a path: it would resolve to the current working
+    // directory, which for a daemon is wherever it happened to be started.
+    s.db_path = raw
+        .state
+        .db_path
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    // A typo must not silently pick a policy the user did not choose — least of
+    // all `auto`, which spends their bandwidth. Warn, name the bad value, and
+    // keep the documented default.
+    // Same rule as below: name the bad value, keep the documented default.
+    if let Some(v) = raw.sync.open_pinned {
+        match OpenPinned::parse(&v) {
+            Some(p) => s.open_pinned = p,
+            None => tracing::warn!(
+                value = %v,
+                "config.toml: unknown [sync] open_pinned; keeping 'newest' \
+                 (newest | newest-unmetered | offline)"
+            ),
+        }
+    }
+    if let Some(v) = raw.sync.upload {
+        match UploadMode::parse(&v) {
+            Some(m) => s.upload = m,
+            None => tracing::warn!(
+                value = %v,
+                "config.toml: unknown [sync] upload; keeping 'async' (async | sync)"
+            ),
+        }
+    }
+    if let Some(v) = raw.sync.refresh_pinned {
+        match RefreshPinned::parse(&v) {
+            Some(mode) => s.refresh_pinned = mode,
+            None => tracing::warn!(
+                value = %v,
+                "config.toml: [sync] refresh_pinned must be manual, ask or auto — keeping \"ask\""
+            ),
+        }
+    }
     s.auth_keyring = raw.auth.keyring.unwrap_or(true);
     // A malformed value must NOT silently mean "unlimited"/"never" (fail-open —
     // a typo like "5G" would quietly disable the cache budget). Warn, naming the
@@ -410,11 +731,17 @@ fn parse_settings(text: &str) -> crate::Result<Settings> {
     }
     s.tls.ca_cert = raw.tls.ca_cert.filter(|p| !p.is_empty()).map(Into::into);
     s.tls.insecure = raw.tls.insecure.unwrap_or(false);
+    s.tls.http1_only = raw.tls.http1_only.unwrap_or(false);
     s.mount_point = raw
         .mount
         .point
         .filter(|p| !p.is_empty())
         .map(|p| expand_tilde(&p));
+    if let Some(n) = raw.mount.dispatch_threads {
+        // Clamp to a sane range: 0 is meaningless, and an unbounded value would
+        // spawn a thread storm. Keep the default (1) for anything outside it.
+        s.dispatch_threads = n.clamp(1, 16);
+    }
     s.exclude_from_indexers = raw.desktop.exclude_from_indexers.unwrap_or(true);
     Ok(s)
 }
@@ -504,6 +831,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_diag_socket_path_is_deterministic_and_within_the_unix_limit() {
+        let a = diag_socket_for_mount(std::path::Path::new("/home/gnome/Wusel"));
+        let b = diag_socket_for_mount(std::path::Path::new("/home/gnome/Wusel"));
+        assert_eq!(
+            a, b,
+            "same mountpoint, same socket — producer and consumer agree"
+        );
+        assert_ne!(
+            a,
+            diag_socket_for_mount(std::path::Path::new("/home/gnome/Other")),
+            "different mountpoints do not collide"
+        );
+        // However deep the mountpoint, the hashed file name is a fixed short
+        // length — `diag-` + 16 hex + `.sock` — so the socket path stays well
+        // inside the 108-byte unix limit under any real `$XDG_RUNTIME_DIR`.
+        let deep = diag_socket_for_mount(std::path::Path::new(
+            "/run/user/1000/very/deep/nested/mount/point/that/keeps/going/Wusel",
+        ));
+        assert_eq!(
+            deep.file_name().unwrap().len(),
+            "diag-0123456789abcdef.sock".len(),
+            "the hashed name is constant length regardless of mountpoint depth"
+        );
+    }
+
+    #[test]
     fn sanitize_strips_scheme_chars() {
         assert_eq!(
             sanitize("https://cloud.example.org"),
@@ -552,13 +905,27 @@ mod tests {
 
     #[test]
     fn parses_tls_section() {
-        let s =
-            parse_settings("[tls]\nca_cert = \"/etc/wusel/ca.pem\"\ninsecure = true\n").unwrap();
+        let s = parse_settings(
+            "[tls]\nca_cert = \"/etc/wusel/ca.pem\"\ninsecure = true\nhttp1_only = true\n",
+        )
+        .unwrap();
         assert_eq!(
             s.tls.ca_cert.as_deref(),
             Some(std::path::Path::new("/etc/wusel/ca.pem"))
         );
         assert!(s.tls.insecure);
+        assert!(s.tls.http1_only);
+    }
+
+    #[test]
+    fn http1_only_defaults_off() {
+        assert!(
+            !parse_settings("[tls]\ninsecure = false\n")
+                .unwrap()
+                .tls
+                .http1_only
+        );
+        assert!(!parse_settings("").unwrap().tls.http1_only);
     }
 
     #[test]
@@ -675,5 +1042,114 @@ mod tests {
             .credentials_path()
             .ends_with("accounts/Work_Client_/credentials.json"));
         assert_ne!(work.state_db_path(), state_db_path());
+    }
+}
+
+#[cfg(test)]
+mod open_pinned_tests {
+    use super::{OpenAction, OpenPinned};
+
+    #[test]
+    fn newest_always_goes_to_the_server() {
+        for metered in [Some(true), Some(false), None] {
+            assert_eq!(OpenPinned::Newest.decide(metered), OpenAction::Fetch);
+        }
+    }
+
+    #[test]
+    fn offline_always_serves_what_is_here() {
+        for metered in [Some(true), Some(false), None] {
+            assert_eq!(OpenPinned::Offline.decide(metered), OpenAction::ServeLocal);
+        }
+    }
+
+    #[test]
+    fn unmetered_fetches_only_on_a_connection_that_costs_nothing() {
+        assert_eq!(
+            OpenPinned::NewestUnmetered.decide(Some(false)),
+            OpenAction::Fetch
+        );
+        assert_eq!(
+            OpenPinned::NewestUnmetered.decide(Some(true)),
+            OpenAction::ServeLocal
+        );
+    }
+
+    /// Somebody who chose this said the connection's cost decides. An unknown
+    /// cost is therefore not a licence to spend — even though erring this way
+    /// means serving something outdated.
+    #[test]
+    fn an_unknown_connection_is_not_treated_as_free() {
+        assert_eq!(
+            OpenPinned::NewestUnmetered.decide(None),
+            OpenAction::ServeLocal
+        );
+    }
+
+    #[test]
+    fn the_spellings_a_person_would_write_are_understood() {
+        assert_eq!(OpenPinned::parse("newest"), Some(OpenPinned::Newest));
+        assert_eq!(
+            OpenPinned::parse("newest-unmetered"),
+            Some(OpenPinned::NewestUnmetered)
+        );
+        assert_eq!(OpenPinned::parse(" Offline "), Some(OpenPinned::Offline));
+        // A typo must not silently pick one — the caller warns and keeps the
+        // default, which is the behaviour that existed before the setting.
+        assert_eq!(OpenPinned::parse("offlien"), None);
+        assert_eq!(OpenPinned::default(), OpenPinned::Newest);
+    }
+}
+
+#[cfg(test)]
+mod refresh_pinned_tests {
+    use super::{RefreshAction, RefreshPinned};
+
+    #[test]
+    fn manual_only_shows_and_ask_only_asks() {
+        // Neither spends anything, so the connection is irrelevant to them.
+        for metered in [Some(true), Some(false), None] {
+            assert_eq!(
+                RefreshPinned::Manual.decide(metered),
+                RefreshAction::ShowOnly
+            );
+            assert_eq!(RefreshPinned::Ask.decide(metered), RefreshAction::Ask);
+        }
+    }
+
+    #[test]
+    fn auto_fetches_only_on_a_connection_known_to_be_free() {
+        assert_eq!(
+            RefreshPinned::Auto.decide(Some(false)),
+            RefreshAction::Fetch
+        );
+    }
+
+    #[test]
+    fn auto_degrades_to_asking_when_the_link_is_metered() {
+        assert_eq!(RefreshPinned::Auto.decide(Some(true)), RefreshAction::Ask);
+    }
+
+    #[test]
+    fn auto_degrades_to_asking_when_the_link_is_unknown() {
+        // The dangerous case, and the reason this is a three-valued question:
+        // treating "do not know" as "free" is how a large refresh lands on
+        // somebody's mobile plan.
+        assert_eq!(RefreshPinned::Auto.decide(None), RefreshAction::Ask);
+    }
+
+    #[test]
+    fn a_misspelt_mode_is_rejected_rather_than_guessed() {
+        assert_eq!(RefreshPinned::parse("auto"), Some(RefreshPinned::Auto));
+        assert_eq!(RefreshPinned::parse("  ASK "), Some(RefreshPinned::Ask));
+        assert_eq!(RefreshPinned::parse("automatic"), None);
+        assert_eq!(RefreshPinned::parse(""), None);
+    }
+
+    #[test]
+    fn the_default_asks() {
+        // `manual` is invisible to anyone who does not read emblems, and `auto`
+        // spends someone else's bandwidth on their behalf.
+        assert_eq!(RefreshPinned::default(), RefreshPinned::Ask);
     }
 }

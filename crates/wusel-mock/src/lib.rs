@@ -398,6 +398,15 @@ async fn assemble_upload(
     let _ = std::fs::remove_dir_all(&chunk_dir);
     set_file_mtime(&dest, req.oc_mtime);
 
+    // Test-only fault injection: a target whose name contains `.proxy-403`
+    // assembles normally (the file is now complete on disk) but the MOVE is
+    // answered with 403 — modelling a reverse proxy that mangles the long
+    // server-side assembly MOVE while Nextcloud completes it. The client must
+    // recognise that the file landed regardless (see `put_chunked`).
+    if dest_rel.contains(".proxy-403") {
+        return respond(stream, "403 Forbidden", "text/plain", &[], b"proxy says no").await;
+    }
+
     respond(
         stream,
         "201 Created",
@@ -475,6 +484,15 @@ async fn put(
     req: &Request,
     fs_path: &Path,
 ) -> std::io::Result<()> {
+    // Test-only latency injection, the upload counterpart of the GET/PROPFIND
+    // delays: hold the PUT so a test can prove what must NOT wait on an upload in
+    // flight — a `getattr` on the very file being uploaded.
+    if let Some(ms) = std::env::var("WUSEL_MOCK_PUT_DELAY_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+    }
     // Test-only fault injection (see `Config::failed_once`): fail the first PUT to
     // a `*.fail-once` file, so a test can assert the client retries and the buffer
     // survives.
@@ -494,6 +512,11 @@ async fn put(
             )
             .await;
         }
+    }
+    // A `*.fail-perm` file's PUT is refused *permanently* (403), so a test can
+    // assert the client parks it as a sync error rather than retrying for ever.
+    if req.rel.ends_with(".fail-perm") {
+        return respond(stream, "403 Forbidden", "text/plain", &[], b"forbidden").await;
     }
     if !precondition_ok(req, fs_path) {
         return respond(
@@ -700,6 +723,16 @@ async fn propfind(
     req: &Request,
     fs_path: &Path,
 ) -> std::io::Result<()> {
+    // Test-only latency injection, the listing counterpart of the one in `get`:
+    // a slow PROPFIND is what makes a background refresh long enough to notice,
+    // which is how "does a refresh delay the next listing?" becomes a test
+    // rather than a stopwatch on somebody's laptop.
+    if let Some(ms) = std::env::var("WUSEL_MOCK_PROPFIND_DELAY_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+    }
     let Ok(meta) = std::fs::metadata(fs_path) else {
         return respond(stream, "404 Not Found", "text/plain", &[], b"not found").await;
     };
@@ -743,6 +776,16 @@ async fn propfind(
 /// derives an upload from what it just read (the 3-way merge) needs to name the
 /// exact version it read.
 async fn get(stream: &mut TcpStream, req: &Request, fs_path: &Path) -> std::io::Result<()> {
+    // Test-only latency injection: a concurrency test sets WUSEL_MOCK_GET_DELAY_MS
+    // to make GET slow, so it can prove a read in flight no longer blocks
+    // unrelated FUSE operations. The mock is a test/dev server only, so this hook
+    // lives here rather than behind a separate wrapper.
+    if let Some(ms) = std::env::var("WUSEL_MOCK_GET_DELAY_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+    }
     let data = match std::fs::read(fs_path) {
         Ok(d) => d,
         Err(e) => return respond_missing_or_io_error(stream, &e).await,

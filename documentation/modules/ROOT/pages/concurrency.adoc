@@ -1,0 +1,712 @@
+////
+  // SPDX-License-Identifier: Apache-2.0
+  // Copyright 2026 IT Beratung Hermann GmbH
+////
+
+= Concurrency: getting off the single dispatch thread
+
+NOTE: Wusel 0.1.0 served FUSE requests one at a time. This page is how that
+changed in 0.2.0, why it is shaped the way it is, and how each step is proven.
+See <<_status>> for what is in and what is not, and the xref:roadmap.adoc[Roadmap]
+for where the whole sits.
+
+== The ceiling
+
+`fuser`'s session loop reads and dispatches one request at a time. The engine
+mitigates that — reads serve only their range, revalidation runs off-thread (see
+xref:architecture.adoc[_FUSE ↔ async bridge_]) — but the thread itself stays a
+hard serialisation point. Two effects survive the mitigations:
+
+* A hydration is chunked, but every chunk is still a network round-trip on the
+  dispatch thread. The file manager's per-file `getxattr` calls — individually
+  microseconds — queue behind it. The extension's assumption that reading the
+  xattr is "cheap and local" is true of the *handler* and false of the *queue*,
+  so a large transfer can make the file manager look frozen.
+* Two users of the mount cannot proceed in parallel at all: a `cp` from the mount
+  and an `ls` in another terminal take turns, however unrelated they are.
+
+What fixing this buys is **responsiveness, not throughput**. It removes a
+structural stall; it makes no single transfer faster.
+
+`fuser` does not have to be modified. Its reply objects are `Send` and carry
+their own request id, and the FUSE protocol matches replies by that id — so a
+callback may move its reply to another thread and answer out of order. The
+concurrency is ours to add at the boundary.
+
+== The rule that replaces "fast enough"
+
+The obvious design — share the state behind locks — was rejected. Not because it
+cannot be made to work, but because it introduces a lock hierarchy that every
+future contribution has to keep correct, and because it caps out anyway: SQLite
+serialises writers regardless.
+
+Instead, one rule, applied without exception:
+
+[IMPORTANT]
+====
+**The FSM thread performs no I/O. None.** Not network, not files, not the
+database.
+====
+
+The temptation is to soften this — "a local SQLite read is only microseconds",
+"a 4 MiB file read is only milliseconds". That reasoning assumes a healthy
+machine. The machines this runs on are business laptops: home directories on
+NFS or CIFS, virus scanners holding database files, network storage that stalls
+for seconds without warning. Nothing about those latencies is knowable in
+advance, and a benchmark on a developer workstation will never show them.
+
+So the rule is absolute, and the FSM thread becomes a pure decider: hold state,
+resolve collisions, hand out work, process completions. Everything that can
+block on a stranger's machine is somewhere else by construction rather than by
+assumption.
+
+The gain is uniformity. There is one kind of work: a `lookup` and a 200 MB
+upload run through the same mechanism — job, transition, completion. No two
+classes of I/O with two sets of rules, and no borderline cases to argue about.
+
+== The architecture
+
+// Rendered from documentation/diagrams/fsm-dispatch.d2 (mise run docs-diagrams).
+image::fsm-dispatch.svg[Event-driven dispatch architecture,900]
+
+Two consequences the picture makes explicit:
+
+**Nobody replies from the FSM thread.** `reply.data()` writes to `/dev/fuse`,
+which is I/O. The reply object travels with the work and is sent by whoever
+finishes it.
+
+**The syncer hands its writes to the DB writer** instead of holding a second
+connection. That removes write-lock contention between the syncer and the
+mount — the problem disappears rather than being managed with a busy timeout.
+
+Readers are separate from the writer because WAL allows many readers alongside
+one writer, and the common operations — `getattr`, `lookup`, `readdir` — are
+reads. A metadata lookup should not wait behind a write that a virus scanner is
+holding up.
+
+== The state machine
+
+=== Two levels
+
+Picture a switchboard with **one clipboard per file**: what is running for this
+file, which step it is on, and who is waiting behind it. The switchboard never
+makes the calls itself.
+
+The machine has two levels, and keeping them apart is what stops it turning into
+an unreadable graph:
+
+* **Occupancy, per object.** Tiny: idle, or busy with one flow plus a FIFO queue.
+  This is where collisions are decided, and the FIFO is where `write` → `flush`
+  ordering comes from — without a lock.
+* **The script of the running operation.** A straight sequence of steps, not a
+  graph.
+
+Operations that address no object at all (`statfs`, under FUSE) bypass the
+machine entirely.
+
+The machine says *object*, not *inode*, on purpose: an inode is what one kernel
+interface happens to call an identity, and the machine may not depend on that.
+Under FUSE it is the inode; xref:frontends.adoc[Frontends and portability] has
+the reasoning and what it costs to get wrong.
+
+=== A script, not a graph
+
+Between any two steps the FSM thread does nothing but decide. All waiting happens
+elsewhere. `read` is short:
+
+....
+1  DbRead   fetch the node row                → DB reader
+2  (decision only, no I/O)
+   scratch present? → 3a   blob fresh? → 3b   otherwise → 3c
+3a FileIo   read the scratch                  → I/O worker
+3b FileIo   read the blob                     → I/O worker
+3c Net      range GET                         → I/O worker
+4  Reply    the object is idle again
+....
+
+`flush` is the longest, and the reason the shape pays off:
+
+....
+1  DbRead   node row + scratch metadata
+2  FileIo   size of the scratch
+3  Net      PUT or chunked upload, with its precondition
+4  on 412 → sub-script: conflict resolution
+           (Net: fetch theirs → FileIo: merge → Net: PUT)
+5  DbWrite  record the new ETag and size
+6  FileIo   copy the scratch into the blob cache
+7  Reply    the object is idle again
+....
+
+Today that sequence is seven nested blocking calls inside `flush`, any of which
+can stand for minutes. As a script it is seven named steps, each one separately
+readable and testable.
+
+Every implemented callback is drawn this way — step by step, with the executing
+thread colour-coded — in xref:fsm-scripts.adoc[The operation scripts]. That page
+is the reference; this one is the argument.
+
+=== The three functions
+
+[source,rust]
+----
+/// What one object is doing. Not in the map = idle.
+struct Busy {
+    flow: Flow,                 // the running script and where it stands
+    outstanding: Option<Job>,   // the step handed out, for its bookkeeping
+    queue: VecDeque<Request>,   // FIFO — this is where write→flush ordering lives
+}
+
+/// Entry point: a request arrives from a dispatch thread. Returns what the
+/// caller should *do* — the machine never does it.
+fn on_request(&mut self, request: Request) -> Vec<Action> {
+    match self.busy.get_mut(&request.object) {
+        None => self.begin(request),                   // idle → begin the script
+        Some(busy) => match collision(&busy.flow, &request.intent, &facts) {
+            Collision::Queue => busy.queue.push_back(request),
+            Collision::Join  => busy.flow.waiters.push(request.id),
+            Collision::Abort => busy.flow.abort = true, // a request, not an act
+            Collision::Skip  => /* answer at once, nothing to do */,
+        },
+    }
+}
+
+/// The machine itself: a step finished — what is the next one?
+///
+/// Pure: no I/O, no clock, no randomness. That is what lets a full upload,
+/// conflict and all, be walked in a unit test.
+fn advance(flow: Flow, completion: Completion, facts: &Facts) -> (Flow, Next);
+
+enum Next {
+    Do(Job),          // hand to a database thread or an I/O worker
+    Done,             // answer everyone waiting; release the object
+    Fail(Failure),    // the same, with an error the frontend maps to its own
+    Abandoned,        // given up; nobody is waiting, so nobody is told
+}
+----
+
+Two things the signatures carry that prose would only claim. `advance` takes its
+facts as an argument rather than reading them from a map, which is what keeps it
+a pure function of its inputs. And `Failure` is not an errno: that is one
+platform's vocabulary, and the frontend puts it back on at the boundary.
+
+Everything difficult lives in exactly one place: ordering in the FIFO, collisions
+in `collision`, the course of an operation in `advance`. The state becomes a
+value that can be logged, compared in a test and looked at in a debugger, instead
+of being spread across which map holds an entry and where each thread happens to
+stand.
+
+The compiler enforces completeness — a new operation cannot be added without
+`match` demanding every pairing. That guarantee only holds while there is no
+`_ =>` arm, which is a rule, not a preference.
+
+== The collision policy
+
+This table is the actual logic. It belongs in the doc comment above `collision`,
+next to the `match` that implements it, with **one test per row, named after the
+row** — so it is demonstrated rather than asserted.
+
+[cols="1,1,1,3"]
+|===
+|Running |Arriving |Decision |Why
+
+|Hydration |`write` |**Wait** |preparing the buffer needs the base for a later
+3-way merge; aborting destroys it
+
+|Hydration (background, pin) |`unlink`, `unpin` |**Abort** |the file or the
+intent is gone; the rest of the download is waste
+
+|Hydration |second `read`, same range |**Join** |one transfer, two answers
+
+|Upload |`write` |**Queue** (the `flush`; the `write` reaches the scratch at
+once) |aborting mid-chunked-upload leaves half an object on the server
+
+|Upload |`unlink` |**Wait**, then delete |the upload may already have landed
+
+|Upload |`rename` |**Queue** |the office-suite atomic save; ordering is everything
+
+|Conflict resolution |anything |**Queue** |it owns the scratch
+
+|Listing |second listing |**Join** |one PROPFIND answers both
+
+|Anything |pin refresh |**Skip** if a local edit is pending |a server-side change
+must never overwrite an unsaved local one
+|===
+
+WARNING: "Newest wins" is *not* a valid general rule. An editor saving every two
+seconds would keep aborting the hydration of the merge base, which would then
+never finish. Abort only when the arriving request makes the running one
+**pointless** — never when it merely wants to overtake it.
+
+== Cancellation
+
+Only one case makes cancellation *necessary*: **unmount and shutdown**. Without
+it, unmounting waits for a 2 GB transfer, and logging out hangs.
+
+Everything else is an optimisation with real weight. A `cat` killed after one
+second leaves 2 GB still downloading; over a throttled or metered link that is
+the user's bandwidth and possibly their money.
+
+[IMPORTANT]
+====
+**Abort is a request, not an act.** The flow is marked, and the mark is checked
+at every transition. Steps that only produce a value (`DbRead`, GET, file read)
+may be dropped immediately. Steps with side effects run to completion and are
+then either committed or **compensated** — an in-flight chunked upload is not
+shot down, it finishes and the existing cleanup removes the collection.
+====
+
+Abort points therefore lie *between* steps, with one exception: the streamed
+hydration, where dropping the future genuinely stops the transfer. For a
+`spawn_blocking` step, `abort()` only discards the result — the transfer keeps
+running. That is the second reason for the bounded-channel design, alongside
+backpressure.
+
+`fuser` has no `interrupt` callback — 44 methods on its 0.18 `Filesystem` trait
+and none of them is it, exactly as in 0.14. Ignoring interrupts is explicitly
+allowed by the protocol, so a killed reader can only be noticed through the
+descriptor teardown — and whether that arrives *while* the read is still in
+flight decides whether cancellation is reachable at all.
+
+**Measured** (`crates/wusel-fuse/tests/interrupt_probe.rs`, Linux 6.x, fuser
+0.18; a `cat` killed one second into a read answered after six):
+
+....
+   2 ms  open
+   2 ms  read start (offset 0, 262144 B)
+1002 ms  flush            <- the reader died here; the read is still open
+6005 ms  read reply sent
+6005 ms  release          <- only after the reply
+....
+
+**`flush` yes, `release` no.** The kernel reports the dead reader immediately
+through `flush`, but holds `release` back until every outstanding request has
+been answered. So the design hooks `flush`, and the rule is: *a `flush` while
+reads are still outstanding on that handle means nobody is waiting for them any
+more — abandon them.* A design resting on `release` would have been dead on
+arrival.
+
+The conclusion survived the upgrade, which is why it was worth measuring twice.
+Under 0.14 the same probe showed the kernel issuing **two** readahead requests of
+128 KiB, both answered out of order after the reader was gone and neither
+erroring — so the `Send` reply objects work in practice, not just on paper. Under
+0.18 it is a single 256 KiB request. How many reads are in flight, and how large,
+is a kernel and ABI detail; that `flush` precedes `release` is what the design
+rests on, and that held across both.
+
+The probe stays in the tree as a regression guard: if a future kernel or `fuser`
+stops delivering `flush` early, it fails, and the assumption is caught rather
+than silently lost.
+
+== Keeping pinned files current
+
+A pin promises "keep this offline". Today it delivers hydration at pin time and
+protection from eviction — but not currency, and, worse, not even availability.
+
+[NOTE]
+====
+**A stale pinned file used to be unavailable offline. That is fixed.**
+
+`CachingSource::read` served a local blob only while `is_fresh(&blob,
+&node.etag)` held. Once the server copy changed, the ETag no longer matched, so
+the read fell through to the live path — and with no network it failed, even
+though the pinned blob was sitting on disk, complete and readable. That broke the
+pin promise twice over, in exactly the situation someone pins for.
+
+Now a transport failure falls back on the copy we have. Only a transport
+failure: a 404 means the file is genuinely gone, and serving our copy of it would
+be inventing a file. `crates/wusel-mock/tests/stale_offline.rs` holds the line,
+and duly fails when the fallback is removed.
+====
+
+=== Serving a stale copy must be announced, not just emblazoned
+
+The emblem tells a *human* who is looking at the folder. An application is not
+looking. LibreOffice opening the outdated version and saving it produces a
+conflict — resolved correctly, but the user never saw it coming and now has a
+"(conflicted copy)" they did not ask for.
+
+So whenever a stale copy is actually served, we say so:
+`Notice::StaleCopyServed`, localized like the rest, naming the file. Once per
+file and not once per read — a file manager drawing a folder issues hundreds of
+them, and an indexer walks whole trees. The emblem remains the passive channel;
+this is the active one, and it fires only when the outdated bytes are really
+handed out.
+
+Beside it, the fifth per-file state (`pinned-stale`) makes staleness visible
+before anyone opens the file, and "Update now" gives the user something to do
+about it. What remains of this section is the *policy* below — when a refresh
+should happen without being asked for.
+
+=== Why "refresh when it is opened" is the worst possible moment
+
+It is the one moment with a deadline attached: somebody is waiting for the file.
+A poor connection hurts most precisely there. Every other moment is better,
+because nobody is blocked by it. Today's behaviour — stale blob, live read on
+open — does exactly the wrong thing.
+
+=== Make staleness visible, and let the user spend the bandwidth
+
+The engine already surfaces per-file state through the `user.wusel.state` xattr
+(xref:file-manager.adoc[File-manager integration]), and the design principle
+there is that every state is *always visible*. Staleness gets the same treatment:
+
+* **A fifth state, for pinned files only.** An unpinned cached file that goes
+  stale needs no marking — "the next read goes live" is ordinary VFS behaviour.
+  Only a pin makes a promise that staleness breaks.
+* **An explicit "Update now" action**, shown only while a pinned file is stale.
+  Built: `wusel update <path>`, and a context-menu entry that appears for a
+  `pinned-stale` selection. Not "pin it again" — unpin/pin would drop the
+  eviction marker first, so a failed re-download would leave the file worse off
+  than before.
+* **Notifications aggregated and debounced.** A colleague reorganising a shared
+  folder can change hundreds of pinned files at once; that must be one message
+  ("12 pinned files changed — Update now / Later") with an action, not hundreds.
+  It fits the existing localized `desktop::Notice` enum.
+
+=== The policy, not a boolean
+
+Built, and configured as `[sync] refresh_pinned`:
+
+[cols="1,4"]
+|===
+|Value |Behaviour
+
+|`manual` |Emblem only. The user picks the moment.
+|`ask` |One aggregated notification, naming the first file and counting the
+rest. The default.
+|`auto` |Fetches by itself — **but only when it is cheap**: an unmetered
+connection. Otherwise it degrades to `ask`.
+|===
+
+`auto` without the cost check would be the very harm this project tries to
+avoid — pulling 2 GB over a mobile link because somebody touched a file.
+NetworkManager answers that over D-Bus, which we already speak through zbus:
+`Metered` on `/org/freedesktop/NetworkManager` is the *active* connection's
+value, so no per-device walk is needed.
+
+`NMMetered` is five-valued and we keep all five apart, because the interesting
+one is the fifth:
+
+[cols="1,3"]
+|===
+|`NMMetered` |Read as
+
+|`YES` (1), `GUESS_YES` (3) |metered — degrade to `ask`
+|`NO` (2), `GUESS_NO` (4) |not metered — fetch
+|`UNKNOWN` (0), no NetworkManager, no bus |**unknown, which is not "free"** — degrade to `ask`
+|===
+
+Collapsing unknown into "not metered" is how a two-gigabyte refresh lands on
+somebody's phone plan. So the failure of every part of this lookup — no system
+bus, no NetworkManager, an unparseable reply — has one outcome, and it is the
+safe one: `auto` behaves as `ask`. The mapping is a pure function
+(`RefreshPinned::decide`) and is unit-tested for each of the five inputs; the
+D-Bus read is the only part that needs a Linux desktop to exercise.
+
+The value is read fresh on each walk rather than cached at start-up: the answer
+changes when the laptop leaves the office, which is exactly when it matters.
+
+Cost is the only condition. **Machine idleness deliberately is not one**: it is
+a comfort rather than a cost, and Linux offers no signal for it that means the
+same thing on a laptop, a server and a workstation. Gating on a guess would make
+`auto` fail the way a background feature must not — silently doing nothing, with
+no way to tell why.
+
+`ask` is the default: `manual` is invisible to anyone who does not read emblems,
+and `auto` spends someone else's bandwidth on their behalf.
+
+=== Opening one is a different question
+
+`refresh_pinned` is about fetching **unasked**. Opening a file is asking, and
+that answer used to be fixed: the local copy no longer matches, so read the
+current one. Right on a desk, wrong on a train — a pin exists so the file is
+*there*, and a hotel connection can make "there" cost more than the outdated
+copy is worth.
+
+[cols="1,4"]
+|===
+|`[sync] open_pinned` |Behaviour
+
+|`newest` |Always the current version. The default, and what happened before
+this setting existed.
+|`newest-unmetered` |The current version, unless the connection is metered —
+then the copy that is already paid for.
+|`offline` |Always the local copy. Bringing it up to date is then deliberate:
+"Update now", or `wusel update <path>`.
+|===
+
+Unknown metering counts as metered here too — an unknown cost is not a licence
+to spend, exactly as for the background refresh. The rule is the same in both,
+unknown means do not fetch; only the effect differs. For the refresh, not
+fetching just skips an unasked update; here it makes the open serve the outdated
+copy. That is the price of caution on an unknown line, and the safe direction:
+stale bytes beat a surprise bill.
+
+==== An outdated offline copy is read-only
+
+Whatever made it outdated. Not a precaution — the alternative is a silent lost
+update:
+
+* The write buffer is seeded from the **server's** current version, because that
+  is what a hydration fetches. So the bytes being edited are not the bytes that
+  were read.
+* The buffer records the *server's* ETag as its base. The upload then asserts it
+  started from the version it never saw, the server accepts, and the newer
+  version is gone with no conflict raised.
+
+So the write permission is withdrawn on the row the engine hands out. One place,
+and both consequences follow: the machine refuses the write with `EACCES`, and
+the frontend reports a mode without the write bits — which is the half that
+matters, because an editor then opens the file read-only instead of letting
+somebody type for ten minutes and fail at save.
+
+The better end state is to allow the edit, seed the buffer from the copy that
+was *read*, and record *its* ETag — the upload then gets its 412 and the
+existing conflict resolution does what it is for. That is a deeper change than
+this one, and until it exists, refusing is the honest answer.
+
+=== How it lands in the machine
+
+Nothing here needs new machinery. Staleness is **derived** — blob present, ETag
+differing, pinned — exactly like `FileState` is derived today, so no new column.
+The syncer already detects the change and emits an invalidation; the FSM resolves
+the object, checks the pin, and starts the same hydration flow a read would start.
+Different trigger, same script.
+
+The policy sits at the one place that already knows: the syncer's tree walk,
+which is where a pinned file is *found* to have moved on. It collects the stale
+pinned rows for the whole walk and settles them once at the end — one decision
+per walk rather than one per file. That is the aggregation, and it falls out of
+where the check runs rather than needing a debounce timer.
+
+Across walks, `ask` speaks only when the backlog has grown. A walk runs every
+`revalidate_secs`; repeating the same message every thirty seconds until the user
+gives in is how notifications get muted for good. So the stale set is remembered
+and the message suppressed while it holds nothing new — but when it is announced
+it names the *whole* backlog, not the increment, so someone who ignored the first
+one and looks later sees the real number. An emptied backlog forgets itself,
+which is what lets a file that goes stale a second time be announced a second
+time.
+
+Two rules it contributes to the collision table:
+
+* An arriving refresh meets a running upload or a dirty scratch → **skip**, not
+  queue. Until the upload lands, our copy *is* the server copy, and the next
+  invalidation will tell us the truth anyway.
+* At most one running plus one pending refresh per object. A web editor with
+  autosave would otherwise queue one hydration per keystroke.
+
+=== Whole files only
+
+Nextcloud has no delta synchronisation — a long-standing open feature request,
+and the official client transfers whole files too. The protocol gives one opaque
+ETag per file, and `OC-Checksum` covers the whole file, so there is no way to
+learn *which* bytes changed without fetching them. What can be optimised is
+fetching only on an actual ETag change, and doing it as a single streamed
+response rather than one range GET per chunk.
+
+== Assumptions we refuse to make
+
+Business machines put home directories on NFS and CIFS. For wusel that is not a
+performance question but a correctness one, because the state database would land
+there. SQLite is unambiguous:
+
+[quote,SQLite documentation]
+____
+All processes using a database must be on the same host computer; WAL does not
+work over a network filesystem.
+____
+
+[quote,SQLite FAQ]
+____
+This locking mechanism might not work correctly if the database file is kept on
+an NFS filesystem. This is because fcntl() file locking is broken on many NFS
+implementations.
+____
+
+Wusel is exactly that case: several connections to one database. So:
+
+* **The state database must live on local storage.** Built: the filesystem type
+  under the database is read at start-up, and a network one moves it to
+  `/var/tmp/wusel-<uid>/<account>/` with a message saying what happened and why.
+  Never silently, and never against an explicit `[state] db_path` — a path the
+  user named is honoured, and warned about instead.
+* **Pins move out of the database.** Built: they live in
+  `<config>/pins.json`, beside the configuration. They are user intent, not a
+  cache — losing them to a wiped cache would break the offline promise precisely
+  when somebody was clearing space before a trip. A small, rarely written file
+  stays in a network home without trouble, travels with a roaming profile, and
+  survives `cache clear`, which no longer touches them.
+* Configuration and credentials stay in the home directory. Small, rarely read,
+  and they belong to a roaming profile.
+
+With pins out, the database is genuinely a pure cache: relocating it, clearing
+it or rebuilding it after corruption costs nothing worse than a cold start.
+
+=== What replaces SQLite for the pins
+
+The database was doing two jobs for pins, and both had to be replaced rather
+than dropped — `wusel pin` runs as its own process while the daemon is mounted,
+so this is genuinely shared state.
+
+[cols="1,3"]
+|===
+|What SQLite gave |What the file does
+
+|Writers do not lose each other |A lock *directory* (`mkdir` is atomic
+everywhere, including the network filesystems this file exists to survive),
+then read, change, and rename a temporary file over the old one. The rename is
+the commit, so a reader never sees half a file.
+|A reader sees the latest write |Before answering, the file's mtime and length
+are compared with what was last loaded, and it is re-read when they differ. A
+pin made from the command line therefore reaches the running daemon without
+being told — which is what the shared database did for free.
+|===
+
+Two failure modes are decided rather than left to chance. A file that cannot be
+parsed is an **error**, never "nothing is pinned" — the second reading would
+quietly unprotect every blob. And a file written by a *newer* wusel is refused
+rather than read partially, for the same reason.
+
+The semantics — a directory pin covers its subtree, a rename carries the
+promise, a delete drops it — are plain functions over a map, tested without a
+disk. What the database still owes them is the pair of paths a rename went
+between: `move_subtree` returns `(old, new)` so the caller can carry the pins,
+and a failure there is logged loudly rather than rolled back, because a pin that
+ends silently is the outcome that matters.
+
+Migrating is one-way and happens once: if there is no pins file and the database
+still has the old table, the rows are taken over. Only then — a second
+migration would resurrect a pin the user has since removed.
+
+=== How the type is found, and why not `statfs`
+
+`statfs(2)` answers with a magic number and needs `libc` plus a `target_os`
+gate. `/proc/self/mounts` answers in text that has been stable for decades,
+costs one small read, and is simply *absent* where there is none — which is the
+answer we want there: cannot tell, so change nothing. Detection therefore adds
+no dependency and no platform gate to `wusel-core`.
+
+The list of network filesystem types is explicit rather than "anything not
+known to be local". An unfamiliar type is far more likely to be a new local
+filesystem than a new network one, and relocating somebody's database by
+mistake is worse than leaving it where they put it.
+
+Two more refusals, both of which have a test:
+
+* If `/var/tmp` is *itself* on the file server, nothing is moved — trading one
+  broken location for another is not an improvement, so the warning stands
+  instead.
+* If the uid cannot be read, nothing is moved either: `/var/tmp` is shared, and
+  a directory without an owner in its name is one two users collide in.
+
+=== Proving it without a file server
+
+Mounting real NFS in a test needs a server, a kernel module and privileges no
+test suite should have. `scripts/check-network-home.sh` instead runs the check
+twice — once normally, where it must *not* relocate, and once in a mount
+namespace whose `/proc` says the home is NFS, where it must. Nothing is
+actually mounted; the detection is handed the input a machine with a network
+home would hand it, which is the thing under test. It runs as part of
+`mise run fuse-test`, since it needs the same container.
+
+The policy itself — which types count, what wins over what — is decided by pure
+functions over a mount table passed in as a string, so it is tested without
+touching a disk on any platform. Only reading the table and the uid is
+Linux-shaped; a macOS frontend would add `getfsstat(2)`, which reports the same
+type names, and inherit the policy unchanged.
+
+== What this does not solve
+
+* **Throughput.** Concurrency removes stalls. Whether it or the streamed
+  hydration matters more for a given workload is **unmeasured**; profiling should
+  precede either.
+* **Delta transfer.** Not available from the protocol.
+* **The blocking that remains.** Workers block — that is their job. The claim is
+  not "nothing blocks", it is "nothing blocks where a decision is made".
+
+== Implementation in stages, with gates
+
+Each stage ends with a gate on three levels: static (compiles, lints, formats,
+licence headers), mock (the deterministic suites), and **a real Nextcloud** via
+`mise run e2e-local`. A gate that fails is not carried into the next stage.
+
+All seven were built in this order, and each gate was made to fail before it
+was made to pass — a gate nobody has seen red proves nothing.
+
+[cols="1,3,2,1"]
+|===
+|Stage |What it does |Gate proves |State
+
+|1 Offload reads |`read` hands its reply to a worker and returns. No shared
+state; `ContentSource` is already `Send + Sync`. Works on today's `fuser`.
+|An unrelated `stat` is served while a large read is in flight |done
+
+|2 `fuser` 0.14 → 0.18 |Overdue maintenance; brings `Config::n_threads`, so the
+worker pool is no longer our code |Behaviour identical to stage 1 |done
+
+|3 The machine |Per-object occupancy, the collision table, `advance`; database readers alongside one writer
+|One test per policy row; no operation stalls the FSM |done
+
+|4 Event-driven writes |Every network step split into start and completion; the
+per-object queue carries ordering |The 3-way merge on a real 412 still works;
+three consecutive green runs |done
+
+|5 Streamed hydration |One request instead of one per chunk |The Nextcloud access
+log shows 1 GET where it showed 32 |done
+
+|6 Turn concurrency on |`n_threads`, frontend state behind its own lock |Parallel
+transfers measurably overlap |done
+
+|7 Cancellation |Shutdown first, then the collision-driven aborts |An interrupted
+read leaves no in-flight slot behind |done
+|===
+
+Because a fast machine hides every one of these problems, the gates **inject**
+the adverse condition rather than hoping for it:
+
+* **Network:** `tc netem` throttling (about 3 Mbit with added latency). Without
+  it the responsiveness test is not reliably red beforehand, and then it proves
+  nothing afterwards.
+* **Database:** a helper holding `BEGIN IMMEDIATE` — a deterministic write-lock
+  stall, no timing luck required.
+* **File I/O:** a test-only delay in the blob and scratch paths, to stand in for
+  a virus scanner.
+* **Network home:** a Samba container in the same podman network, mounted as the
+  home directory, to exercise the relocation.
+
+== Status
+
+**Built and released in 0.2.0.** Wusel 0.1.0 served one request at a time;
+stages 1 to 6 are in place and the machine is what serves every callback.
+
+`wusel-fsm` holds the decider: per-object occupancy with a FIFO queue, the
+collision policy below, and every operation as a script over a pure `advance`.
+It has **no dependencies at all** — `cargo tree -p wusel-fsm` is one line — so
+the rule this page turns on is enforced by the compiler rather than by review.
+`wusel-core::runtime` is the substrate underneath it: a deciding thread, N
+database readers each with its own connection, one writer, and network and file
+pools.
+
+What that replaced is worth naming, because it looked finished and was not. A
+single owner thread used to hold the whole engine and run each operation to
+completion. It removed a mutex without removing the serialisation — a `getattr`
+still read SQLite on that thread, so one slow filesystem stalled every other
+callback — and coordination was hand-written per operation, with `FlushCoord`
+providing Join and Queue for uploads and nothing else.
+
+Proven where it can fail. Against a real Nextcloud
+(`mise run e2e-local`): the mount stays responsive during both a large download
+and a large upload over a throttled 3 Mbit link, writes to one file keep their
+order, a hydration costs one GET, and two concurrent transfers overlap —
+7.6 s against 8.7 s sequential. Deterministically, without a server:
+`concurrent_read_e2e.rs`, `concurrent_reads_overlap_e2e.rs`, and one test per
+row of the collision table named after its row.
+
+**Stage 7, cancellation, is built too.** `open` hands out real file handles —
+without them there is no telling one reader's outstanding work from another's —
+and the frontend remembers which reads each handle has in flight. A `flush` on a
+handle that still has reads open means the reader is gone, so those flows are
+given up at their next step boundary. Turning the abort off makes
+`crates/wusel-fsm/tests/occupancy.rs` fail, which is the only convincing form of
+that claim.

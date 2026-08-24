@@ -67,6 +67,9 @@ async fn notify_file_stamps_invalidation() {
         wusel_core::config::TlsSettings::default(),
         invalidate_after.clone(),
         sync_tx,
+        // No reachability tracker: this test is about the push protocol, and the
+        // listener behaves identically without one.
+        None,
     );
 
     // 4) The file event must stamp the timestamp within a few seconds.

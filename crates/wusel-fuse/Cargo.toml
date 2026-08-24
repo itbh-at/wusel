@@ -26,15 +26,23 @@ path = "src/lib.rs"
 
 [dependencies]
 wusel-core = { path = "../wusel-core" }
+# The decision core: the adapter speaks its vocabulary and nothing else.
+wusel-fsm = { path = "../wusel-fsm" }
 anyhow.workspace = true
 tracing.workspace = true
 
-# `abi-7-12` enables the kernel-notification API (`Session::notifier`,
-# `Notifier::inval_entry`) used to push server-side add/removes into the kernel's
-# cache. ABI 7.12 is ancient (Linux 2.6.31) — supported everywhere we run.
+# fuser 0.18: the old per-ABI cargo feature flags are gone — the crate negotiates
+# the kernel ABI at runtime instead. The kernel-notification API
+# (`Session::notifier`, `Notifier::inval_entry`), which we use to push
+# server-side add/removes into the kernel's cache, is always available now, with
+# no feature flag needed.
 [target.'cfg(target_os = "linux")'.dependencies]
-fuser = { version = "0.14", features = ["abi-7-12"] }
+fuser = "0.18"
 libc = "0.2"
+# The owner thread (src/owner.rs) hands the Provider off to a single thread and
+# talks to it over channels: `sync` (mpsc/oneshot) is the only tokio feature this
+# crate needs — the runtime itself lives in wusel-core.
+tokio = { workspace = true }
 
 # The mount end-to-end test drives a real FUSE mount against the in-process
 # wusel-mock server. It runs only on Linux with /dev/fuse (the podman container).
@@ -42,3 +50,15 @@ libc = "0.2"
 wusel-mock = { path = "../wusel-mock" }
 reqwest = { workspace = true }
 tokio = { workspace = true }
+
+# `interrupt_probe` builds its own minimal filesystem to measure kernel
+# behaviour, so it needs `fuser` and `libc` directly — an integration test sees
+# only the crate's public API plus its dev-dependencies, not its dependencies.
+#
+# It must be the *same* version as the dependency above. Two versions here are
+# not a conflict cargo resolves: both get built, and linking wusel-fuse then
+# fails with "multiple candidates for rlib dependency fuser" (E0464). The
+# no-feature spelling is deliberate — 0.18 negotiates the kernel ABI at runtime.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+fuser = "0.18"
+libc = "0.2"

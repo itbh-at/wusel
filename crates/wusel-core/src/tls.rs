@@ -31,9 +31,27 @@ pub fn client(settings: &TlsSettings) -> Result<reqwest::Client> {
         // (nginx/Apache in front of Nextcloud) to have closed it: a stale reuse
         // surfaces as the opaque "error sending request for url …" and breaks
         // reads/PROPFINDs. Well under the usual 60–75 s server keep-alive.
-        .pool_idle_timeout(std::time::Duration::from_secs(20));
+        .pool_idle_timeout(std::time::Duration::from_secs(20))
+        // An *idle* read timeout, not a whole-request one: it fires only when no
+        // body bytes have arrived for this long, and resets on every chunk, so a
+        // long but progressing transfer is never cut off. It exists because the
+        // opposite — a server that accepts the request and then stalls the body
+        // forever — used to hang a network worker indefinitely, and with it
+        // (before the runtime was made multi-threaded) every other network read.
+        // A file manager listing a folder sniffs each file's content type by
+        // reading its first bytes, so one stalled read wedged the whole listing.
+        .read_timeout(std::time::Duration::from_secs(30));
     // NOTE: deliberately no whole-request `.timeout()` — it would abort long,
-    // legitimate uploads/downloads. `connect_timeout` bounds only the handshake.
+    // legitimate uploads/downloads. `connect_timeout` bounds the handshake,
+    // `read_timeout` bounds a *stalled* (not a slow) body.
+
+    if settings.http1_only {
+        // Pin HTTP/1.1: some reverse proxies mangle HTTP/2 request bodies for
+        // WebDAV chunked uploads (the upload arrives at Nextcloud as 0 bytes).
+        // HTTP/1.1 avoids that; concurrent reads still parallelise across the
+        // connection pool, so the only cost is a few more connections.
+        builder = builder.http1_only();
+    }
 
     if settings.insecure {
         // No chain, hostname, or expiry checks. Only for trusted networks/tests.
@@ -89,8 +107,8 @@ qnQQxRg5qa8Lv+Jzwh67J/aQPC+bydnLZA==\n\
     fn default_and_insecure_build() {
         assert!(client(&TlsSettings::default()).is_ok(), "OS-store client");
         let insecure = TlsSettings {
-            ca_cert: None,
             insecure: true,
+            ..Default::default()
         };
         assert!(client(&insecure).is_ok(), "insecure client");
     }
@@ -101,7 +119,7 @@ qnQQxRg5qa8Lv+Jzwh67J/aQPC+bydnLZA==\n\
         std::fs::write(&path, TEST_CA).unwrap();
         let s = TlsSettings {
             ca_cert: Some(path.clone()),
-            insecure: false,
+            ..Default::default()
         };
         assert!(client(&s).is_ok(), "a valid CA PEM must be accepted");
         std::fs::remove_file(&path).ok();
@@ -111,7 +129,7 @@ qnQQxRg5qa8Lv+Jzwh67J/aQPC+bydnLZA==\n\
     fn missing_or_invalid_ca_errors() {
         let missing = TlsSettings {
             ca_cert: Some("/no/such/ca.pem".into()),
-            insecure: false,
+            ..Default::default()
         };
         assert!(client(&missing).is_err(), "unreadable ca_cert must fail");
 
@@ -119,7 +137,7 @@ qnQQxRg5qa8Lv+Jzwh67J/aQPC+bydnLZA==\n\
         std::fs::write(&bad, b"not a certificate").unwrap();
         let s = TlsSettings {
             ca_cert: Some(bad.clone()),
-            insecure: false,
+            ..Default::default()
         };
         assert!(client(&s).is_err(), "garbage ca_cert must fail");
         std::fs::remove_file(&bad).ok();

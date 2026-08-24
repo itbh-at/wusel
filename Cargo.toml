@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/wusel-core",
+    "crates/wusel-fsm",
     "crates/wusel-fuse",
     "crates/wusel-desktop",
     "crates/wusel",
@@ -13,7 +14,7 @@ members = [
 # simply does not get it, so a new field added below is only live once the crate
 # manifests reference it.
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.97"
 license = "Apache-2.0"
@@ -40,13 +41,15 @@ publish = false
 # rt-multi-thread — Runtime::new / #[tokio::main] / multi_thread test runtimes;
 # macros — #[tokio::main] / #[tokio::test]; net — TcpListener/TcpStream (mock,
 # in-process test servers); io-util — AsyncReadExt/AsyncWriteExt; time — sleep
-# backoffs. Crates like reqwest/tokio-rustls enable their own tokio features.
+# backoffs; sync — mpsc/oneshot for the FUSE owner thread (wusel-fuse). Crates
+# like reqwest/tokio-rustls enable their own tokio features.
 tokio = { version = "1", features = [
     "rt-multi-thread",
     "macros",
     "net",
     "io-util",
     "time",
+    "sync",
 ] }
 reqwest = { version = "0.12", default-features = false, features = [
     # Native OS trust store (what browsers/curl use) — the right default for

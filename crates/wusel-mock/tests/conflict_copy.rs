@@ -9,11 +9,7 @@ mod common;
 
 use std::sync::{Arc, Mutex};
 
-use wusel_core::config::Account;
 use wusel_core::desktop::{Desktop, Notice, Status};
-use wusel_core::provider::Provider;
-use wusel_core::state::StateDb;
-use wusel_core::webdav::WebDavClient;
 
 /// A test OS-integration backend that just records what the engine reports.
 #[derive(Default)]
@@ -44,28 +40,24 @@ fn conflict_saves_a_copy_and_keeps_the_server_version() {
     let mock = common::Mock::serve(&fixture);
     let addr = mock.addr.clone();
 
-    let account = Account::new("default");
-    let dav = WebDavClient::new(
-        reqwest::Client::new(),
-        &format!("http://{addr}"),
-        "alice",
-        "pw",
-    );
-    std::fs::create_dir_all(account.state_db_path().parent().unwrap()).unwrap();
-    let state = StateDb::open(&account.state_db_path()).unwrap();
-    let mut provider = Provider::new(dav, state, &account).unwrap();
     // Plug in a recording OS-integration backend (the swappable Desktop seam).
     let recorder = Arc::new(Recorder::default());
-    provider.set_desktop(recorder.clone());
+    // Before the substrate starts: its workers take a copy of this seam.
+    let mut engine = common::Engine::start_with(&addr, Some(recorder.clone()));
 
-    let node = provider.resolve("note.txt").unwrap().expect("note.txt");
-    provider.truncate(node.inode, 0).unwrap();
-    provider.write(node.inode, 0, b"LOCAL-EDIT").unwrap();
+    let node = engine
+        .provider()
+        .resolve("note.txt")
+        .unwrap()
+        .expect("note.txt");
+    engine.truncate(node.inode, 0).unwrap();
+    engine.write(node.inode, 0, b"LOCAL-EDIT").unwrap();
 
     // The server changes under us before we flush.
     std::fs::write(&backing, b"SERVER-CHANGED").unwrap();
 
-    provider.flush(node.inode).unwrap();
+    engine.flush(node.inode).unwrap();
+    engine.wait_for_uploads();
 
     // The server version stays at the original path.
     assert_eq!(std::fs::read(&backing).unwrap(), b"SERVER-CHANGED");

@@ -8,9 +8,6 @@
 mod common;
 
 use wusel_core::config::Account;
-use wusel_core::provider::Provider;
-use wusel_core::state::StateDb;
-use wusel_core::webdav::WebDavClient;
 
 #[test]
 fn disjoint_edits_are_merged_when_enabled() {
@@ -31,24 +28,21 @@ fn disjoint_edits_are_merged_when_enabled() {
     let mock = common::Mock::serve(&fixture);
     let addr = mock.addr.clone();
 
-    let dav = WebDavClient::new(
-        reqwest::Client::new(),
-        &format!("http://{addr}"),
-        "alice",
-        "pw",
-    );
-    std::fs::create_dir_all(account.state_db_path().parent().unwrap()).unwrap();
-    let state = StateDb::open(&account.state_db_path()).unwrap();
-    let mut provider = Provider::new(dav, state, &account).unwrap();
+    let mut engine = common::Engine::start(&addr);
 
-    let node = provider.resolve("doc.txt").unwrap().expect("doc.txt");
+    let node = engine
+        .provider()
+        .resolve("doc.txt")
+        .unwrap()
+        .expect("doc.txt");
     // Local edit: change line 1 (keeps the base cached for the merge).
-    provider.write(node.inode, 0, b"LINE1").unwrap();
+    engine.write(node.inode, 0, b"LINE1").unwrap();
 
     // Server edit under us: change line 3.
     std::fs::write(&backing, b"line1\nline2\nLINE3\n").unwrap();
 
-    provider.flush(node.inode).unwrap();
+    engine.flush(node.inode).unwrap();
+    engine.wait_for_uploads();
 
     // Both disjoint edits survive; no conflicted copy is made.
     assert_eq!(std::fs::read(&backing).unwrap(), b"LINE1\nline2\nLINE3\n");

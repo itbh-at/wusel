@@ -13,6 +13,12 @@ use std::time::Duration;
 
 /// A live mount plus the fixture directory behind it. Unmounts and cleans up
 /// on drop, so a failing assertion cannot leave a dangling mount behind.
+///
+/// `dead_code` is allowed because a shared test module is compiled *into each*
+/// test binary separately, so anything one binary does not touch looks unused
+/// to it. Splitting the harness per test would be the alternative, and a worse
+/// one.
+#[allow(dead_code)]
 pub struct MountFixture {
     base: PathBuf,
     /// The server-side tree the mock serves — write here to simulate the server.
@@ -32,6 +38,11 @@ impl MountFixture {
         std::fs::create_dir_all(fixture.join("Sub Folder")).unwrap();
         std::fs::write(fixture.join("Notes.txt"), b"hello").unwrap();
         std::fs::write(fixture.join("Sub Folder/deep.txt"), b"nested").unwrap();
+        // A freedesktop wastebasket left on the server by another client. The
+        // mount must keep it hidden — never list it, never resolve it — so every
+        // test implicitly exercises that, and `trash_e2e` asserts it explicitly.
+        std::fs::create_dir_all(fixture.join(".Trash-1000/files")).unwrap();
+        std::fs::write(fixture.join(".Trash-1000/files/old.txt"), b"gone").unwrap();
 
         // Start the mock server in-process; report its port back over a channel.
         let (tx, rx) = std::sync::mpsc::channel();
@@ -54,6 +65,24 @@ impl MountFixture {
         std::env::set_var("XDG_CONFIG_HOME", xdg.join("config"));
         std::env::set_var("XDG_STATE_HOME", xdg.join("state"));
         std::env::set_var("XDG_CACHE_HOME", xdg.join("cache"));
+        // Run the mount multi-threaded so these end-to-end tests exercise the
+        // concurrent dispatch path (Etappe 6): several FUSE callbacks in flight at
+        // once, which is what would expose an unguarded bit of frontend state
+        // (a directory-stream snapshot, a flush's per-inode entry). A race there
+        // shows up as a flaky rewinddir/dir_streams run.
+        let cfg_dir = xdg.join("config").join("wusel");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        // A test that wants a short revalidation interval sets it before
+        // starting; the default keeps the production value out of the way.
+        let sync = std::env::var("WUSEL_TEST_REVALIDATE_SECS")
+            .map(|v| format!("\n[sync]\nrevalidate_secs = {v}\n"))
+            .unwrap_or_default();
+        let threads = std::env::var("WUSEL_TEST_DISPATCH_THREADS").unwrap_or_else(|_| "4".into());
+        std::fs::write(
+            cfg_dir.join("config.toml"),
+            format!("[mount]\ndispatch_threads = {threads}\n{sync}"),
+        )
+        .unwrap();
         let account = wusel_core::config::Account::new("default");
         let dav = wusel_core::webdav::WebDavClient::new(
             reqwest::Client::new(),
@@ -94,6 +123,22 @@ impl Drop for MountFixture {
             let _ = t.join();
         }
         std::fs::remove_dir_all(&self.base).ok();
+    }
+}
+
+/// Poll until `cond` holds, or fail after ~10 s. Uploads are asynchronous now —
+/// a file's bytes reach the server shortly after the kernel write returns — so a
+/// test that inspects the *server* must wait for the effect to land. (Directory
+/// creates, renames and unlinks stay synchronous and need no wait.)
+#[allow(dead_code)]
+pub fn eventually(what: &str, mut cond: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !cond() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the server-side effect never landed: {what}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 

@@ -15,7 +15,7 @@ Use either private channel:
   <https://github.com/itbh-at/wusel>, go to *Security* → *Report a
   vulnerability*. This is the preferred route; it keeps the report, the
   discussion and the fix in one private thread.
-- **Email** — <christoph.hermann@itbh.at>. Put "wusel security" in the subject.
+- **Email** — <support@itbh.at>. Put "Wusel Security" in the subject.
 
 A useful report contains: the affected version or commit, your OS and desktop,
 what an attacker gains, and the smallest set of steps that reproduces it. A proof

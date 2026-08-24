@@ -8,9 +8,6 @@
 mod common;
 
 use wusel_core::config::Account;
-use wusel_core::provider::Provider;
-use wusel_core::state::StateDb;
-use wusel_core::webdav::WebDavClient;
 
 fn count_ext(dir: &std::path::Path, ext: Option<&str>) -> usize {
     std::fs::read_dir(dir)
@@ -39,18 +36,10 @@ fn pin_root_hydrates_the_whole_tree() {
     let addr = mock.addr.clone();
 
     let account = Account::new("default");
-    let dav = WebDavClient::new(
-        reqwest::Client::new(),
-        &format!("http://{addr}"),
-        "alice",
-        "pw",
-    );
-    std::fs::create_dir_all(account.state_db_path().parent().unwrap()).unwrap();
-    let state = StateDb::open(&account.state_db_path()).unwrap();
-    let mut provider = Provider::new(dav, state, &account).unwrap();
+    let mut engine = common::Engine::start(&addr);
 
     // Pin the root → the legacy "download everything".
-    let hydrated = provider.pin("").expect("pin root");
+    let hydrated = engine.pin("").expect("pin root");
     assert_eq!(hydrated, 3, "three files across root and the subfolder");
 
     let blobs = account.blob_cache_dir();
@@ -61,7 +50,7 @@ fn pin_root_hydrates_the_whole_tree() {
         "each blob has a .pin marker"
     );
 
-    assert!(provider
+    assert!(engine
         .pins()
         .unwrap()
         .iter()

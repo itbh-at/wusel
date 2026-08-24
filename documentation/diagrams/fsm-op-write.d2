@@ -1,0 +1,161 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 IT Beratung Hermann GmbH
+#
+# The write and setattr scripts, and the ensure_scratch step they share
+# (see pages/fsm-scripts.adoc).
+#
+# Render to a committed SVG with:  mise run docs-diagrams
+#
+# Nothing here reaches the server. The one network step is inbound: fetching
+# the base a later merge will need. That is also why a write may not abort a
+# running hydration — it would destroy the very thing it depends on.
+
+...@_steps
+
+vars: {
+  d2-config: {
+    layout-engine: elk
+  }
+}
+
+direction: down
+
+write: "Write — into the buffer, never to the server\n(FUSE: write)" {
+  class: decide
+
+  off: "offset >= 0?" {
+    class: decide
+  }
+  bad: "Fail EINVAL" {
+    class: fail
+  }
+  row: "DbRead  node_by_inode" {
+    class: db
+  }
+  denied: "Fail — a directory, or not writable\nthe mode we reported already said so" {
+    class: fail
+  }
+  scratch: "ensure_scratch\n→ see below" {
+    class: decide
+  }
+  put: "FileIo  seek(offset), write_all, read back the length" {
+    class: io
+  }
+  dirty: "mark the buffer dirty\nin-memory flag" {
+    class: state
+  }
+  grew: "length changed?" {
+    class: decide
+  }
+  size: "DbWrite  set_size\nso the next getattr reflects the growth" {
+    class: db
+  }
+  ok: "Answer: bytes written" {
+    class: edge
+  }
+
+  off -> bad: "no"
+  off -> row: "yes"
+  row -> denied
+  row -> scratch: "writable file"
+  scratch -> put
+  put -> dirty
+  dirty -> grew
+  grew -> size: "yes"
+  grew -> ok: "no"
+  size -> ok
+}
+
+setattr: "SetAttr — resize, set the mtime, or both\nOne intent, because the kernel sends them in one\ncallback and splitting them would mean chaining two\nflows to answer it. Other attributes are no-ops\n(FUSE: setattr)" {
+  class: decide
+
+  size_q: "size given?" {
+    class: decide
+  }
+  zero: "truncate to zero, with no buffer open?" {
+    class: decide
+  }
+  empty: "FileIo  start from an empty buffer\nNo hydration: the base is about to be discarded,\nso downloading it first would spend a full transfer\non bytes we throw away. This is the common overwrite\npath — cp onto an existing file, every O_TRUNC editor.\nThe price: a later text merge has no base and falls\nback to a conflicted copy" {
+    class: io
+  }
+  scratch: "ensure_scratch\n→ see below" {
+    class: decide
+  }
+  setlen: "FileIo  set_len(size)" {
+    class: io
+  }
+  dbsize: "DbWrite  set_size" {
+    class: db
+  }
+  mtime_q: "mtime given?" {
+    class: decide
+  }
+  pending: "remember it for the next upload\nsent as X-OC-Mtime, so cp -p preserves timestamps.\nSigned: a pre-epoch timestamp stays negative" {
+    class: state
+  }
+  dbmtime: "DbWrite  set_mtime" {
+    class: db
+  }
+  row: "DbRead  node_by_inode" {
+    class: db
+  }
+  ok: "Answer: the updated attrs" {
+    class: edge
+  }
+
+  size_q -> zero: "yes"
+  size_q -> mtime_q: "no"
+  zero -> empty: "yes"
+  zero -> scratch: "no"
+  empty -> setlen
+  scratch -> setlen
+  setlen -> dbsize
+  dbsize -> mtime_q
+  mtime_q -> pending: "yes"
+  mtime_q -> row: "no"
+  pending -> dbmtime
+  dbmtime -> row
+  row -> ok
+}
+
+ensure: "ensure_scratch — make a writable buffer exist" {
+  class: decide
+
+  open_q: "already open?" {
+    class: decide
+  }
+  done: "done — back to the calling script" {
+    class: decide
+  }
+  size_q: "does the file have content?" {
+    class: decide
+  }
+  fresh: "FileIo  create an empty buffer" {
+    class: io
+  }
+  hydrate: "Net  stream the full base into the buffer\nNever capped, never held in RAM: editing a file\nof any size must preserve all of it" {
+    class: io
+  }
+  seed: "FileIo  seed the blob cache with that base\nonly with text merging on. Reads no longer populate\nthe cache, so without this a later 3-way merge finds\nno base and degrades to a conflicted copy" {
+    class: io
+  }
+  reg: "register the buffer: clean, remembering the ETag\nit was based on — the precondition a later\nupload will assert" {
+    class: state
+  }
+  wait: "A write arriving during this hydration waits;\nit must not abort it. The base is what a later\n3-way merge is made of — and an editor autosaving\nevery two seconds would otherwise restart the\ndownload forever, so it never finishes" {
+    class: decide
+  }
+
+  open_q -> done: "yes"
+  open_q -> size_q: "no"
+  size_q -> hydrate: "yes"
+  size_q -> fresh: "empty file"
+  hydrate -> seed
+  hydrate -> wait
+  seed -> reg
+  fresh -> reg
+  reg -> done
+}
+
+write.scratch -> ensure: "" {style.stroke-dash: 3}
+setattr.scratch -> ensure: "" {style.stroke-dash: 3}

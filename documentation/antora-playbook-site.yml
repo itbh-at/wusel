@@ -1,0 +1,43 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 IT Beratung Hermann GmbH
+
+# Antora playbook for the PUBLISHED site (GitHub Pages). Unlike
+# antora-playbook.yml, which previews the working tree for local editing, this
+# one builds every version: the default branch as "latest", plus each release
+# tag as its number, so the site carries a version selector.
+#
+# Run via `documentation/build.sh site` (the Pages workflow does exactly that);
+# it needs the repo's full history and tags, which the workflow fetches.
+site:
+  title: Wusel
+  start_page: wusel::index.adoc
+
+content:
+  sources:
+    - url: ..
+      start_path: documentation
+      # `main` is "latest"; a release tag vX.Y.Z becomes the version X.Y.Z.
+      branches: [main]
+      # Release tags join the selector, with one exception. The retagging onto
+      # commits whose antora.yml omits the `version` key happened in the
+      # internal repository; the tag published as v0.1.0 still points at the
+      # original commit and carries `version: ~`. That makes the ref
+      # *unversioned*, which collides with any other unversioned ref and takes
+      # the site root — visitors would land on one release's documentation
+      # instead of the current one. Excluded until it is ever republished.
+      tags: ['v*', '!v0.1.0']
+      version:
+        'v(?<version>+({0..9}).+({0..9}).+({0..9}))': $<version>
+        main: latest
+
+runtime:
+  log:
+    format: json
+
+ui:
+  bundle:
+    url: ui-bundle
+
+asciidoc:
+  attributes:
+    attribute-missing: warn@

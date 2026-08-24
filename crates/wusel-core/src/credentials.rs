@@ -103,9 +103,25 @@ fn read_file(path: &Path) -> Result<Stored> {
 /// file. Any hitch — no service, locked, value did not round-trip — falls back to
 /// the `0600` file with a warning. Storing therefore never fails on the keyring.
 pub fn store(path: &Path, key: &str, creds: &Credentials, use_keyring: bool) -> Result<Storage> {
-    if use_keyring && keyring::available() {
-        let verified = keyring::store(key, &creds.app_password).is_ok()
-            && matches!(keyring::retrieve(key), Ok(Some(v)) if v == creds.app_password);
+    store_with(path, key, creds, use_keyring, &keyring::Os)
+}
+
+/// [`store`], with the keyring supplied instead of taken from the OS.
+///
+/// The product always passes [`keyring::Os`]; the tests pass a keyring that is
+/// absent, locked, or forgetful, because those are the cases the fallback exists
+/// for and none of them can be arranged on a real machine (see
+/// [`crate::keyring`]).
+pub fn store_with(
+    path: &Path,
+    key: &str,
+    creds: &Credentials,
+    use_keyring: bool,
+    secrets: &dyn keyring::Secrets,
+) -> Result<Storage> {
+    if use_keyring && secrets.available() {
+        let verified = secrets.store(key, &creds.app_password).is_ok()
+            && matches!(secrets.retrieve(key), Ok(Some(v)) if v == creds.app_password);
         if verified {
             write_file(
                 path,
@@ -118,7 +134,7 @@ pub fn store(path: &Path, key: &str, creds: &Credentials, use_keyring: bool) -> 
             )?;
             return Ok(Storage::Keyring);
         }
-        keyring::delete(key); // drop a half-written / unverifiable entry
+        secrets.delete(key); // drop a half-written / unverifiable entry
         tracing::warn!(
             "the OS keyring is unavailable or did not verify — keeping the app \
              password in the 0600 file instead (fully functional, just not in the keyring)"
@@ -140,6 +156,12 @@ pub fn store(path: &Path, key: &str, creds: &Credentials, use_keyring: bool) -> 
 /// the keyring, fetches it — with a clear, actionable error if that fails, never a
 /// raw keyring/D-Bus error.
 pub fn load(path: &Path, key: &str) -> Result<Credentials> {
+    load_with(path, key, &keyring::Os)
+}
+
+/// [`load`], with the keyring supplied instead of taken from the OS — see
+/// [`store_with`].
+pub fn load_with(path: &Path, key: &str, secrets: &dyn keyring::Secrets) -> Result<Credentials> {
     let s = read_file(path)?;
     if !s.in_keyring {
         return Ok(Credentials {
@@ -148,25 +170,44 @@ pub fn load(path: &Path, key: &str) -> Result<Credentials> {
             app_password: s.app_password,
         });
     }
-    match keyring::retrieve(key) {
+    let acct = if key == crate::config::DEFAULT_ACCOUNT {
+        String::new()
+    } else {
+        format!(" --account {key}")
+    };
+    // The two failures are not the same failure, and saying so is the whole
+    // point of [`keyring::Secrets::retrieve`] distinguishing them. Collapsing
+    // both into "the keyring could not be read" sent people to unlock a keyring
+    // that was working perfectly and simply had nothing in it — a wrong lead
+    // that costs an afternoon, because everything the message suggests is
+    // already true.
+    match secrets.retrieve(key) {
         Ok(Some(pw)) => Ok(Credentials {
             server: s.server,
             login_name: s.login_name,
             app_password: pw,
         }),
-        _ => {
-            let acct = if key == crate::config::DEFAULT_ACCOUNT {
-                String::new()
-            } else {
-                format!(" --account {key}")
-            };
-            Err(Error::Other(format!(
-                "the app password for account '{key}' is kept in your OS keyring, but it could \
-                 not be read (the keyring may be locked, or its service is not running). Unlock \
-                 your keyring and try again, or run `wusel login{acct} <server-url>` to re-store \
-                 it. To skip the keyring entirely, set `[auth] keyring = false` in config.toml."
-            )))
-        }
+        // The keyring answered, and the answer is "there is no such entry". The
+        // file says the password was put there, so it has since been removed —
+        // by a keyring reset, another tool, or a wiped login keyring. Nothing is
+        // broken and nothing needs unlocking; the secret just has to be stored
+        // again.
+        Ok(None) => Err(Error::Other(format!(
+            "the app password for account '{key}' is not in your OS keyring. The credentials \
+             file says it was stored there, so the entry has since been removed — the keyring \
+             itself is working. Run `wusel login{acct} <server-url>` to store it again. To keep \
+             the password in the 0600 file instead, set `[auth] keyring = false` in config.toml."
+        ))),
+        // The keyring could not be consulted at all. Here the advice about
+        // unlocking is the right advice — and the cause travels with it, because
+        // "locked" and "no service" want different answers and guessing between
+        // them is what the raw error already knows.
+        Err(e) => Err(Error::Other(format!(
+            "the app password for account '{key}' is kept in your OS keyring, but the keyring \
+             could not be read ({e}). It may be locked, or its service may not be running. \
+             Unlock it and try again, or run `wusel login{acct} <server-url>` to re-store the \
+             password. To skip the keyring entirely, set `[auth] keyring = false` in config.toml."
+        ))),
     }
 }
 
@@ -180,6 +221,8 @@ pub fn load_metadata(path: &Path) -> Result<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::keyring::fake::{Fake, Mode};
+    use crate::keyring::Secrets;
 
     fn creds() -> Credentials {
         Credentials {
@@ -195,13 +238,23 @@ mod tests {
             .join("credentials.json")
     }
 
+    /// Every test names its own keyring; nothing here ever reaches the machine's.
+    const KEY: &str = "default";
+
     #[test]
     fn file_store_roundtrips_and_is_0600() {
         let path = tmp("file");
-        let s = store(&path, "default", &creds(), false).unwrap();
+        let kr = Fake::new(Mode::Works);
+        // `use_keyring = false`: a working keyring sits right there and must not
+        // be touched, because the user asked for the file.
+        let s = store_with(&path, KEY, &creds(), false, &kr).unwrap();
         assert_eq!(s, Storage::File);
+        assert!(
+            kr.retrieve(KEY).unwrap().is_none(),
+            "nothing was offered to the keyring"
+        );
 
-        let loaded = load(&path, "default").unwrap();
+        let loaded = load_with(&path, KEY, &kr).unwrap();
         assert_eq!(loaded.server, creds().server);
         assert_eq!(loaded.login_name, creds().login_name);
         assert_eq!(loaded.app_password, creds().app_password);
@@ -220,21 +273,138 @@ mod tests {
     }
 
     #[test]
-    fn keyring_requested_but_unusable_falls_back_to_the_file() {
-        // On this test host the keyring is either the non-Linux stub or a Linux
-        // session with no Secret Service — either way it cannot verify, so storing
+    fn a_working_keyring_takes_the_secret_out_of_the_file() {
+        let path = tmp("keyring");
+        let kr = Fake::new(Mode::Works);
+        let s = store_with(&path, KEY, &creds(), true, &kr).unwrap();
+        assert_eq!(s, Storage::Keyring);
+
+        // The file keeps the metadata and *not* the password — that is the whole
+        // benefit of the keyring, so it is worth asserting on the bytes.
+        let stored = read_file(&path).unwrap();
+        assert!(stored.in_keyring);
+        assert!(stored.app_password.is_empty(), "no secret left in the file");
+        assert_eq!(stored.login_name, "alice");
+        assert_eq!(kr.retrieve(KEY).unwrap().as_deref(), Some("secret-token"));
+
+        assert_eq!(
+            load_with(&path, KEY, &kr).unwrap().app_password,
+            "secret-token",
+            "and it comes back out again"
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn without_a_keyring_the_password_stays_in_the_file() {
+        // The platform stub, or a Linux session with no Secret Service: storing
         // must transparently keep the password in the file and stay fully usable.
-        let path = tmp("fallback");
-        let s = store(&path, "default", &creds(), true).unwrap();
-        assert_eq!(s, Storage::File, "no working keyring → file fallback");
-        assert_eq!(load(&path, "default").unwrap().app_password, "secret-token");
+        let path = tmp("absent");
+        let kr = Fake::new(Mode::Absent);
+        let s = store_with(&path, KEY, &creds(), true, &kr).unwrap();
+        assert_eq!(s, Storage::File, "no keyring at all → file fallback");
+        assert_eq!(
+            load_with(&path, KEY, &kr).unwrap().app_password,
+            "secret-token"
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn a_locked_keyring_falls_back_to_the_file() {
+        // A keyring that is *there* but refuses to serve — the common case on a
+        // headless login, and the one that used to make `wusel login` useless.
+        let path = tmp("locked-store");
+        let kr = Fake::new(Mode::Locked);
+        let s = store_with(&path, KEY, &creds(), true, &kr).unwrap();
+        assert_eq!(s, Storage::File, "a locked keyring is not a failed login");
+        assert_eq!(
+            load_with(&path, KEY, &kr).unwrap().app_password,
+            "secret-token"
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn a_missing_entry_is_reported_as_missing_not_as_a_broken_keyring() {
+        // The message that cost an afternoon: the entry had been deleted, the
+        // keyring was fine, and the daemon said "the keyring may be locked, or
+        // its service is not running". Everything it suggested was already true,
+        // so the advice led away from the one thing that would have helped.
+        let path = tmp("gone");
+        let kr = Fake::new(Mode::Works);
+        store_with(&path, KEY, &creds(), true, &kr).unwrap();
+        assert!(
+            read_file(&path).unwrap().in_keyring,
+            "the file points there"
+        );
+
+        kr.delete(KEY); // a keyring reset, another tool, a wiped login keyring
+
+        let err = load_with(&path, KEY, &kr)
+            .expect_err("no password to load")
+            .to_string();
+        assert!(
+            err.contains("is not in your OS keyring"),
+            "says the entry is gone: {err}"
+        );
+        assert!(
+            err.contains("wusel login"),
+            "and names the one thing that fixes it: {err}"
+        );
+        assert!(
+            !err.contains("locked"),
+            "and does not send the user to unlock a working keyring: {err}"
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn a_keyring_that_cannot_be_consulted_says_so_and_carries_the_cause() {
+        // The other half: here "unlock it" *is* the right advice, and the
+        // underlying error travels with it — locked and no-service want
+        // different answers, and the raw error already knows which it is.
+        let path = tmp("unreadable");
+        // Stored while the keyring worked, so the file points at it …
+        let working = Fake::new(Mode::Works);
+        store_with(&path, KEY, &creds(), true, &working).unwrap();
+
+        // … and read back in a session where it cannot be consulted.
+        let err = load_with(&path, KEY, &Fake::new(Mode::Locked))
+            .expect_err("the keyring cannot be read")
+            .to_string();
+        assert!(err.contains("could not be read"), "{err}");
+        assert!(err.contains("locked"), "the advice still fits: {err}");
+        assert!(
+            !err.contains("is not in your OS keyring"),
+            "and it does not claim the entry is gone, which it cannot know: {err}"
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn a_keyring_that_loses_the_secret_falls_back_and_leaves_nothing_behind() {
+        // The reason `store` reads back before it trusts the keyring: a write
+        // that reports success and keeps nothing would otherwise produce a file
+        // pointing at a secret that does not exist — a login that breaks at the
+        // next mount, not at login time.
+        let path = tmp("amnesiac");
+        let kr = Fake::new(Mode::Amnesiac);
+        let s = store_with(&path, KEY, &creds(), true, &kr).unwrap();
+        assert_eq!(s, Storage::File, "unverifiable is as good as unusable");
+        assert!(!read_file(&path).unwrap().in_keyring);
+        assert_eq!(kr.deleted(), vec![KEY], "the half-written entry is dropped");
+        assert_eq!(
+            load_with(&path, KEY, &kr).unwrap().app_password,
+            "secret-token"
+        );
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     #[test]
     fn keyring_backed_file_without_a_readable_keyring_errors_helpfully() {
-        // Simulate a file whose secret "lives in the keyring" while no keyring can
-        // serve it: load must fail with an actionable message, not a raw error.
+        // A file whose secret "lives in the keyring" while no keyring can serve
+        // it: load must fail with an actionable message, not a raw error.
         let path = tmp("locked");
         write_file(
             &path,
@@ -247,10 +417,20 @@ mod tests {
         )
         .unwrap();
 
-        let err = load(&path, "default").unwrap_err().to_string();
+        let err = load_with(&path, KEY, &Fake::new(Mode::Locked))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("keyring"), "mentions the keyring: {err}");
         assert!(err.contains("wusel login"), "tells the user how to recover");
         assert!(err.contains("keyring = false"), "offers the escape hatch");
+
+        // The same message for a keyring that answers but has no such entry —
+        // somebody wiped it, or logged in on another machine. "Not there" is as
+        // unrecoverable for us as "cannot look", and just as fixable by the user.
+        let err = load_with(&path, KEY, &Fake::new(Mode::Works))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("wusel login"), "same advice: {err}");
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
@@ -265,7 +445,8 @@ mod tests {
             br#"{"server":"https://x","loginName":"bob","appPassword":"pw"}"#,
         )
         .unwrap();
-        let loaded = load(&path, "default").unwrap();
+        // A locked keyring proves the point: a plain file never consults one.
+        let loaded = load_with(&path, KEY, &Fake::new(Mode::Locked)).unwrap();
         assert_eq!(loaded.login_name, "bob");
         assert_eq!(loaded.app_password, "pw");
         std::fs::remove_dir_all(path.parent().unwrap()).ok();

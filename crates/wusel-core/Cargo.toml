@@ -20,6 +20,9 @@ publish.workspace = true
 # sync engine and state — builds and tests natively on macOS.
 
 [dependencies]
+# The decision core. This direction only: the machine never depends on the
+# engine, which is what keeps it portable and free of I/O by construction.
+wusel-fsm = { path = "../wusel-fsm" }
 tokio.workspace = true
 reqwest.workspace = true
 serde.workspace = true
@@ -48,6 +51,11 @@ keyring = { version = "3", default-features = false, features = [
 ] }
 
 [dev-dependencies]
+# The database-concurrency gate holds `BEGIN IMMEDIATE` on a connection of its
+# own, to inject a deterministic write-lock stall. Same version as the
+# dependency above, so this costs no extra build — and it keeps a test-only
+# escape hatch out of StateDb's public API.
+rusqlite = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 # No HTTP mocking crate here on purpose: the tests that need a WebDAV server use

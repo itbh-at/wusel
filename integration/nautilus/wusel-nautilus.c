@@ -64,9 +64,27 @@ static const char *emblem_for_state(const char *state)
     {
         return "wusel-emblem-pinned"; // kept offline on purpose, always available
     }
+    if (strcmp(state, "pinned-stale") == 0)
+    {
+        // Kept offline, but the copy is older than the server's. Still
+        // available — that promise holds — just not the newest.
+        return "wusel-emblem-pinned-stale";
+    }
     if (strcmp(state, "modified") == 0)
     {
-        return "wusel-emblem-modified"; // local edit pending upload
+        return "wusel-emblem-modified"; // being edited locally, not yet flushed
+    }
+    if (strcmp(state, "uploading") == 0)
+    {
+        // Committed and on its way to the server (the async write-back). Reuse
+        // the synchronising emblem so the user sees it is in flight.
+        return "wusel-emblem-uploading";
+    }
+    if (strcmp(state, "sync-error") == 0)
+    {
+        // Committed, but the upload failed for good — the bytes are safe locally
+        // and need the user's attention.
+        return "wusel-emblem-sync-error";
     }
     return NULL;
 }
@@ -84,6 +102,23 @@ static const char *emblem_for_state(const char *state)
 static GHashTable *tracked;     // path (owned) -> GWeakRef* (owned)
 static GDBusConnection *bus;    // session bus, for the signal subscription
 static guint file_changed_sub;  // subscription id, so shutdown can unsubscribe
+
+// Coalescing the FileChanged storm.
+//
+// The daemon emits FileChanged whenever a file's cache state changes — and it
+// can change a great many times in a short burst (a folder full of images being
+// thumbnailed, a background re-list reconciling a busy share). Acting on each
+// signal *synchronously* means one `invalidate_extension_info` per signal on
+// Nautilus's main thread, and a large enough burst wedges the UI hard — reported
+// as a full freeze when navigating back into a directory full of media.
+//
+// So a signal does not act; it records the path and arms a short timer. When the
+// timer fires, each distinct path is refreshed exactly once, no matter how many
+// signals named it. One coalesced pass per window instead of a storm.
+#define FILECHANGED_DEBOUNCE_MS 150
+static GHashTable *pending;     // path (owned) -> unused; the set of paths to refresh
+static guint flush_source;      // the armed timer, 0 when none
+static gboolean flush_pending(gpointer user_data);
 
 // Keeping `tracked` bounded.
 //
@@ -171,26 +206,57 @@ static void on_file_changed(GDBusConnection *conn, const char *sender,
     {
         return;
     }
-    GWeakRef *wr = g_hash_table_lookup(tracked, path);
-    if (!wr)
+    // Only paths Nautilus is actually showing are worth refreshing; an untracked
+    // one would just be recorded and swept later for nothing.
+    if (!g_hash_table_contains(tracked, path))
     {
         return;
     }
-    NautilusFileInfo *file = g_weak_ref_get(wr);
-    if (file)
+    // Record it and arm the timer if it is not already armed. Coalescing happens
+    // for free: `pending` is a set, so repeated signals for one path collapse.
+    g_hash_table_add(pending, g_strdup(path));
+    if (flush_source == 0)
     {
-        nautilus_file_info_invalidate_extension_info(file);
-        g_object_unref(file);
+        flush_source = g_timeout_add(FILECHANGED_DEBOUNCE_MS, flush_pending, NULL);
     }
-    else
+}
+
+// Refresh each pending path once, then disarm. Runs on the main thread, like
+// everything here, so it needs no locking.
+static gboolean flush_pending(gpointer user_data)
+{
+    (void)user_data;
+    GHashTableIter it;
+    gpointer key;
+    g_hash_table_iter_init(&it, pending);
+    while (g_hash_table_iter_next(&it, &key, NULL))
     {
-        g_hash_table_remove(tracked, path); // file gone — drop the stale entry
+        const char *path = key;
+        GWeakRef *wr = tracked ? g_hash_table_lookup(tracked, path) : NULL;
+        if (!wr)
+        {
+            continue;
+        }
+        NautilusFileInfo *file = g_weak_ref_get(wr);
+        if (file)
+        {
+            nautilus_file_info_invalidate_extension_info(file);
+            g_object_unref(file);
+        }
+        else
+        {
+            g_hash_table_remove(tracked, path); // file gone — drop the stale entry
+        }
     }
+    g_hash_table_remove_all(pending);
+    flush_source = 0;
+    return G_SOURCE_REMOVE;
 }
 
 static void live_refresh_init(void)
 {
     tracked = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, free_weakref);
+    pending = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
     tracked_since_prune = 0;
     GError *err = NULL;
     bus = g_bus_get_sync(G_BUS_TYPE_SESSION, NULL, &err);
@@ -261,6 +327,15 @@ wusel_ext_info_provider_iface_init(NautilusInfoProviderInterface *iface)
 }
 
 // --- NautilusMenuProvider: pin / unpin from the context menu ----------------
+//
+// Every label carries the "Wusel - " prefix. A context menu is a crowded place
+// and these three entries sit among a dozen the file manager and other
+// extensions contribute; without the prefix nobody can tell whose commands they
+// are, which was the first thing a real user said about them.
+//
+// "Stop Keeping Offline" rather than "Free Up Space": the latter borrows a
+// phrase from another product and describes a side effect, while what the entry
+// actually does is withdraw the promise. The space follows.
 
 // Read one file's state xattr into `out` (NUL-terminated). FALSE if the file is
 // not a local file, or not on our mount (no xattr).
@@ -406,6 +481,15 @@ static void on_unpin_activate(NautilusMenuItem *item, gpointer user_data)
     run_action(item, "unpin");
 }
 
+static void on_update_activate(NautilusMenuItem *item, gpointer user_data)
+{
+    (void)user_data;
+    // Deliberately its own verb, not unpin+pin: that would drop the eviction
+    // marker first, so a failed re-download would leave the file outdated *and*
+    // unprotected.
+    run_action(item, "update");
+}
+
 // Two-letter UI language from the environment (extend the table as needed).
 static const char *nc_lang(void)
 {
@@ -448,6 +532,7 @@ wusel_ext_get_file_items(NautilusMenuProvider *provider, GList *files)
     // Offer "make offline" if anything selected can be pinned, and "free space"
     // if anything selected is pinned; ignore a selection that is not ours.
     gboolean any_ours = FALSE, any_pinnable = FALSE, any_unpinnable = FALSE;
+    gboolean any_stale = FALSE;
     for (GList *l = files; l != NULL; l = l->next)
     {
         char state[32];
@@ -460,6 +545,13 @@ wusel_ext_get_file_items(NautilusMenuProvider *provider, GList *files)
         {
             any_unpinnable = TRUE;
         }
+        else if (strcmp(state, "pinned-stale") == 0)
+        {
+            // Still pinned, so freeing space is still on offer — and now there
+            // is something to bring up to date.
+            any_unpinnable = TRUE;
+            any_stale = TRUE;
+        }
         else if (strcmp(state, "online-only") == 0 || strcmp(state, "cached") == 0)
         {
             any_pinnable = TRUE;
@@ -471,11 +563,24 @@ wusel_ext_get_file_items(NautilusMenuProvider *provider, GList *files)
     }
 
     GList *items = NULL;
+    if (any_stale)
+    {
+        // First in the list: it is the only entry that answers a problem the
+        // emblem is already showing.
+        items = g_list_append(
+            items, make_item("Wusel::update",
+                             tr("Wusel - Update Now", "Wusel - Jetzt aktualisieren"),
+                             tr("Fetch the current version; the offline copy is out of date",
+                                "Aktuelle Fassung holen; die Offline-Kopie ist veraltet"),
+                             "wusel-emblem-pinned-stale", G_CALLBACK(on_update_activate),
+                             files));
+    }
     if (any_pinnable)
     {
         items = g_list_append(
             items, make_item("Wusel::pin",
-                             tr("Make Available Offline", "Offline verfügbar machen"),
+                             tr("Wusel - Make Available Offline",
+                                "Wusel - Offline verfügbar machen"),
                              tr("Download and keep this available offline",
                                 "Herunterladen und offline verfügbar halten"),
                              "wusel-emblem-pinned", G_CALLBACK(on_pin_activate), files));
@@ -484,7 +589,8 @@ wusel_ext_get_file_items(NautilusMenuProvider *provider, GList *files)
     {
         items = g_list_append(
             items, make_item("Wusel::unpin",
-                             tr("Free Up Space", "Speicherplatz freigeben"),
+                             tr("Wusel - Stop Keeping Offline",
+                                "Wusel - Offline-Verfügbarkeit aufheben"),
                              tr("Remove the local copy; keep it online-only",
                                 "Lokale Kopie entfernen; nur online behalten"),
                              "wusel-emblem-cloud", G_CALLBACK(on_unpin_activate), files));
@@ -539,6 +645,14 @@ void nautilus_module_shutdown(void)
         g_source_remove(GPOINTER_TO_UINT(l->data));
     }
     g_clear_pointer(&child_watches, g_slist_free);
+    // The debounce timer holds a callback into this soon-to-be-unmapped module,
+    // so it has to go the same way as the signal subscription above.
+    if (flush_source != 0)
+    {
+        g_source_remove(flush_source);
+        flush_source = 0;
+    }
+    g_clear_pointer(&pending, g_hash_table_destroy);
     g_clear_pointer(&tracked, g_hash_table_destroy);
     tracked_since_prune = 0;
     g_clear_object(&bus);

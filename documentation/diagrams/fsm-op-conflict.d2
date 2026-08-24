@@ -1,0 +1,125 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 IT Beratung Hermann GmbH
+#
+# Conflict resolution — the sub-script the flush script branches into on a 412
+# (see pages/fsm-scripts.adoc).
+#
+# Render to a committed SVG with:  mise run docs-diagrams
+#
+# Drawn on its own because it is a script in its own right, and because it is
+# the one place where the user's bytes could be lost. They never are: every
+# path here either merges them, parks them under a second name, or keeps the
+# buffer for a retry.
+
+...@_steps
+
+vars: {
+  d2-config: {
+    layout-engine: elk
+  }
+}
+
+direction: down
+
+entry: "412 from the flush script\nthe precondition failed: the file changed\non the server since we based our edit on it" {
+  class: edge
+}
+
+merge_on: "text merging enabled?" {
+  class: decide
+}
+
+base: "FileIo  the cached base version\nthe copy the edit started from" {
+  class: io
+}
+
+theirs: "Net  GET the server's current version, with its ETag" {
+  class: io
+}
+
+merge: "3-way merge — pure, no I/O\nbase, ours, theirs" {
+  class: decide
+}
+
+put_merged: "Net  PUT the merge — conditional on exactly the\nversion it was merged from.\nUnconditional here would silently discard a third\nchange that landed between our GET and this PUT:\nthe very lost update this machinery exists to prevent" {
+  class: io
+}
+
+merged_db: "DbWrite  the new ETag and size" {
+  class: db
+}
+merged_store: "FileIo  store the merged bytes in the cache" {
+  class: io
+}
+merged_ok: "resolved — auto-merged, and the user\nnever had to know" {
+  class: decide
+}
+
+raced: "412 again — the server moved on while we were\nmerging, so the merge is stale" {
+  class: decide
+}
+
+copy: "Net  PUT a conflicted copy\nunder a timestamped name, with If-None-Match: *\nThe name has one-second resolution, so a second\nconflict in the same second must not overwrite the\nfirst copy — asserting the name is free is what\nprevents that" {
+  class: io
+}
+
+retry_name: "a de-duplicated name — at most four attempts" {
+  class: decide
+}
+
+exhausted: "Fail — every candidate name taken\nVanishingly unlikely, and safe: the buffer is kept,\nso the content is retried rather than dropped" {
+  class: fail
+}
+
+notify: "tell the user where their edit went\nTheir bytes are safe, but under a name they would\nnot otherwise find. The original keeps the server's\nversion" {
+  class: state
+}
+
+epoch: "invalidate listings taken before the copy landed" {
+  class: decide
+}
+
+copy_reload: "Net  PROPFIND the parent\nso the copy appears beside the original" {
+  class: io
+}
+
+copy_db: "DbWrite  reconcile_children" {
+  class: db
+}
+
+copy_ok: "resolved — the copy path" {
+  class: decide
+}
+
+exit: "back to the flush script\ndrop the buffer, desktop indicator → Idle, Answer OK" {
+  class: edge
+}
+
+deferred: "This also covers a deferred create that lost the race\nagainst a same-named file created on the server: its\nIf-None-Match: * failed, and there is no merge base,\nso the copy path runs. The local content survives\nunder the copy name and the reload brings in theirs" {
+  class: decide
+}
+
+entry -> merge_on
+merge_on -> base: "yes"
+merge_on -> copy: "no"
+base -> theirs: "a clean base exists"
+base -> copy: "none — nothing to merge against"
+theirs -> merge
+merge -> put_merged: "merged cleanly"
+merge -> copy: "binary, or a real conflict"
+put_merged -> merged_db: "uploaded"
+merged_db -> merged_store
+merged_store -> merged_ok
+put_merged -> raced: "412"
+raced -> copy
+copy -> retry_name: "412 — the name is taken"
+retry_name -> copy
+retry_name -> exhausted: "four times"
+copy -> notify: "uploaded"
+notify -> epoch
+epoch -> copy_reload
+copy_reload -> copy_db
+copy_db -> copy_ok
+merged_ok -> exit
+copy_ok -> exit
+entry -> deferred: "" {style.stroke-dash: 3}

@@ -70,8 +70,8 @@ async fn self_signed_trust_modes() {
 
     // 2) insecure: verification off → accept.
     let insecure = wusel_core::tls::client(&TlsSettings {
-        ca_cert: None,
         insecure: true,
+        ..Default::default()
     })
     .unwrap();
     let resp = insecure.get(&url).send().await;
@@ -85,7 +85,7 @@ async fn self_signed_trust_modes() {
     std::fs::write(&ca_path, ca_pem).unwrap();
     let trusting = wusel_core::tls::client(&TlsSettings {
         ca_cert: Some(ca_path.clone()),
-        insecure: false,
+        ..Default::default()
     })
     .unwrap();
     let resp = trusting.get(&url).send().await;

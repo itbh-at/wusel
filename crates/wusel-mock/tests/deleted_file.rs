@@ -8,13 +8,12 @@
 
 mod common;
 
+use wusel_fsm::{Failure, Outcome};
+
 use std::time::Duration;
 
 use wusel_core::config::Account;
-use wusel_core::provider::Provider;
-use wusel_core::state::{StateDb, ROOT_INODE};
-use wusel_core::webdav::WebDavClient;
-use wusel_core::Error;
+use wusel_core::state::ROOT_INODE;
 
 #[test]
 fn a_server_side_delete_prunes_the_stale_node_on_read() {
@@ -31,20 +30,16 @@ fn a_server_side_delete_prunes_the_stale_node_on_read() {
     let addr = mock.addr.clone();
 
     let account = Account::new("default");
-    let dav = WebDavClient::new(
-        reqwest::Client::new(),
-        &format!("http://{addr}"),
-        "alice",
-        "pw",
-    );
-    std::fs::create_dir_all(account.state_db_path().parent().unwrap()).unwrap();
-    let state = StateDb::open(&account.state_db_path()).unwrap();
-    let mut provider = Provider::new(dav, state, &account).unwrap();
+    let mut engine = common::Engine::start(&addr);
 
-    let node = provider.resolve("doc.pdf").unwrap().expect("doc.pdf");
+    let node = engine
+        .provider()
+        .resolve("doc.pdf")
+        .unwrap()
+        .expect("doc.pdf");
     // A normal read works — and hydrates the file into the cache in the
     // background (opening a file caches it).
-    assert_eq!(provider.read(node.inode, 0, 4).unwrap(), b"xxxx");
+    assert_eq!(engine.read(node.inode, 0, 4).unwrap(), b"xxxx");
 
     // Wait for that hydration to finish, so the cache is in a known state. Then
     // simulate the server-side delete *and* drop the cached copy — a read of a
@@ -67,14 +62,15 @@ fn a_server_side_delete_prunes_the_stale_node_on_read() {
 
     // The uncached read now goes live, returns NotFound (not a generic error)
     // and prunes the node.
-    match provider.read(node.inode, 0, 4096) {
-        Err(Error::NotFound) => {}
-        other => panic!("expected NotFound, got {other:?}"),
+    // A stale handle is what the caller should see: the object is gone, so
+    // retrying into the same 404 helps nobody.
+    match engine.read(node.inode, 0, 4096) {
+        Err(Outcome::Failed(Failure::Stale)) => {}
+        other => panic!("expected a stale handle, got {other:?}"),
     }
     // The stale entry is gone from the directory listing.
-    let names: Vec<String> = provider
+    let names: Vec<String> = engine
         .list_dir(ROOT_INODE)
-        .unwrap()
         .into_iter()
         .map(|n| n.name)
         .collect();

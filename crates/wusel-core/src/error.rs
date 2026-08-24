@@ -16,6 +16,14 @@ pub enum Error {
     #[error("HTTP error: {0}")]
     Http(String),
 
+    /// An HTTP response with a status code — kept structurally (not only in the
+    /// message) so a failed upload can tell a *permanent* refusal (wrong
+    /// permissions, a conflict, no quota — retrying will not help) from a
+    /// transient one (a 5xx or a timeout — retrying will). See
+    /// [`Error::is_permanent`].
+    #[error("HTTP {status}: {message}")]
+    HttpStatus { status: u16, message: String },
+
     #[error("Authentication failed: {0}")]
     Auth(String),
 
@@ -59,6 +67,9 @@ impl From<reqwest::Error> for Error {
     /// line pins the failure without a debugger.
     fn from(e: reqwest::Error) -> Self {
         use std::error::Error as _;
+        // Captured before the error is folded into a message, so the permanence
+        // of an upload failure can be judged structurally later.
+        let status = e.status().map(|s| s.as_u16());
         let kind = if e.is_timeout() {
             "[timeout] "
         } else if e.is_connect() {
@@ -79,6 +90,97 @@ impl From<reqwest::Error> for Error {
             msg.push_str(&s.to_string());
             src = s.source();
         }
-        Error::Http(msg)
+        match status {
+            Some(status) => Error::HttpStatus {
+                status,
+                message: msg,
+            },
+            None => Error::Http(msg),
+        }
+    }
+}
+
+impl Error {
+    /// Whether this is a **transport** failure — the server never answered at
+    /// all (DNS, connect, TLS, a timeout, a dropped connection), as opposed to a
+    /// server that answered, even badly.
+    ///
+    /// The distinction is structural, not textual: `From<reqwest::Error>` keeps
+    /// a status code as [`Error::HttpStatus`] and everything without one as
+    /// [`Error::Http`], and "no status" is precisely "nobody answered". It is
+    /// what [`crate::health`] watches: an unreachable server is a user-facing
+    /// event ("your folder cannot be reached"), a 500 is not.
+    #[must_use]
+    pub fn is_transport(&self) -> bool {
+        matches!(self, Error::Http(_))
+    }
+
+    /// Whether retrying this failure is pointless. Used by the asynchronous
+    /// uploader: a permanent failure is parked and the user is told; a transient
+    /// one is retried until it lands.
+    ///
+    /// Permanent: a client refusal (4xx — wrong permissions, a name conflict, a
+    /// malformed request) that will not fix itself, plus `507 Insufficient
+    /// Storage` (no quota). Not permanent: `408`/`429` (slow down / try again),
+    /// every other 5xx, and every transport error (timeout, connection reset).
+    #[must_use]
+    pub fn is_permanent(&self) -> bool {
+        match self {
+            Error::Denied => true,
+            Error::HttpStatus { status, .. } => {
+                *status == 507 || ((400..500).contains(status) && *status != 408 && *status != 429)
+            }
+            _ => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Error;
+
+    fn http(status: u16) -> Error {
+        Error::HttpStatus {
+            status,
+            message: "test".into(),
+        }
+    }
+
+    #[test]
+    fn permanent_failures_are_not_retried() {
+        // Client refusals and a full quota will not fix themselves.
+        assert!(http(403).is_permanent(), "forbidden");
+        assert!(http(409).is_permanent(), "conflict");
+        assert!(http(400).is_permanent(), "bad request");
+        assert!(http(507).is_permanent(), "insufficient storage");
+        assert!(Error::Denied.is_permanent());
+    }
+
+    #[test]
+    fn transient_failures_are_retried() {
+        // Server hiccups and "slow down" are worth another try.
+        assert!(!http(500).is_permanent(), "internal server error");
+        assert!(!http(503).is_permanent(), "service unavailable");
+        assert!(!http(408).is_permanent(), "request timeout");
+        assert!(!http(429).is_permanent(), "too many requests");
+        assert!(
+            !Error::Http("connection reset".into()).is_permanent(),
+            "a transport error is transient"
+        );
+        assert!(!Error::NotFound.is_permanent());
+    }
+
+    #[test]
+    fn only_a_missing_answer_counts_as_unreachable() {
+        // No status code — nobody answered.
+        assert!(Error::Http("[connect] dns error".into()).is_transport());
+        assert!(Error::Http("[timeout] operation timed out".into()).is_transport());
+        // A status code is an answer, however unwelcome; so is everything that
+        // never left this machine.
+        assert!(!http(500).is_transport(), "the server answered");
+        assert!(!http(401).is_transport(), "the server refused us");
+        assert!(!Error::NotFound.is_transport());
+        assert!(!Error::Auth("revoked".into()).is_transport());
+        assert!(!Error::Other("no write context".into()).is_transport());
     }
 }

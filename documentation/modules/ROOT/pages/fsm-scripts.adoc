@@ -1,0 +1,223 @@
+////
+  // SPDX-License-Identifier: Apache-2.0
+  // Copyright 2026 IT Beratung Hermann GmbH
+////
+
+= The operation scripts
+
+NOTE: These scripts are **built and running**, released in 0.2.0. Wusel 0.1.0
+ran every callback as a straight blocking function on one dispatch thread. This
+page belongs to xref:concurrency.adoc[Concurrency], which argues for the shape;
+here it is, step by step.
+
+The scripts are `crates/wusel-fsm/src/script.rs`, and the diagrams are drawn from
+it. Reading one next to the other should produce no surprises; if it does, the
+diagram is wrong.
+
+**They are spelled in intents, not callbacks.** `flush`, `fsync` and `release`
+are one script because they are one operation; `unlink` and `rmdir` likewise. A
+frontend maps its platform's callbacks onto the intent, and the machine never
+learns their names — which is what makes a second frontend a port rather than a
+rewrite (xref:frontends.adoc[Frontends and portability]).
+
+== How to read them
+
+// Rendered from documentation/diagrams/fsm-op-frame.d2 (mise run docs-diagrams).
+image::fsm-op-frame.svg[The frame every operation script runs in,900]
+
+Every script runs inside this frame, so the individual diagrams leave it out and
+show only their own middle part.
+
+The frame says *object* where the scripts say *inode*, and that difference is
+deliberate. The frame is the machine — a mechanism that must not know what one
+kernel interface calls an identity. The scripts below are FUSE, because FUSE is
+what we ship. Where that line runs, and why it is worth holding, is
+xref:frontends.adoc[Frontends and portability].
+
+Two more things are worth holding on to while reading the rest:
+
+**The colour says which thread runs the step.** That is the whole point of the
+coding, because the design rests on one rule — the FSM thread performs no I/O.
+
+[cols="1,3"]
+|===
+|Colour |What it means
+
+|Green |The FSM thread. A decision: no disk, no database, no network, no clock.
+|Amber |A DB reader or writer thread (`DbRead`, `DbWrite`).
+|Purple |An I/O worker (`Net`, `FileIo`, streamed hydration). Here it may block.
+|Blue |The kernel boundary — a request arriving, or a reply being written.
+|Grey |In-memory FSM state: the buffer map, the ignored set, the per-inode clipboard. Free to consult.
+|Pink |`Fail(errno)`.
+|Dashed |Designed but **not implemented**, or a note attached to a step rather than a step itself.
+|===
+
+**Green boxes are the only ones the deciding thread executes.** A script that
+looks green-heavy is cheap; one with purple in the middle is where a business
+laptop with a virus scanner or an NFS home will stall — and where a lock-based
+design would have stalled everyone else with it.
+
+== Which callback becomes which intent
+
+All twenty implemented FUSE callbacks appear below. Four of them never reach the
+machine at all, which is not an omission: they have no work to do.
+
+[cols="2,2,2"]
+|===
+|FUSE callback |Intent |Diagram
+
+|`getattr` |`Stat` |<<metadata>>
+|`lookup` |`Lookup` |<<directories>>
+|`getxattr`, `listxattr` |`State` |<<metadata>>
+|`readdir` |`Enumerate` |<<directories>>
+|`read` |`Fetch` |<<reading>>
+|`write` |`Write` |<<writing>>
+|`setattr` |`SetAttr` |<<writing>>
+|`flush`, `fsync`, `release` |`Publish` |<<flushing>>
+|`create`, `mkdir` |`Materialise` |<<namespace>>
+|`unlink`, `rmdir` |`Remove` |<<namespace>>
+|`rename` |`Move` |<<renaming>>
+|`open`, `opendir`, `releasedir`, `statfs` |— |never reach the machine
+|===
+
+Three intents have no callback at all. `Refresh` and `Relist` come from the
+syncer or from the machine itself — a listing served past its revalidation
+interval schedules its own refresh — and the `412` sub-script (<<conflict>>) is
+reached only from inside a publish.
+
+[#metadata]
+== Metadata: getattr, open, getxattr, listxattr
+
+// Rendered from documentation/diagrams/fsm-op-metadata.d2.
+image::fsm-op-metadata.svg[Metadata scripts,900]
+
+These are the callbacks a file manager fires in storms — one `getxattr` per
+visible entry while drawing a folder. None of them may touch the network, and
+none does.
+
+The one step that can block is the cache probe in `file_state`: it stats the
+blob on disk. Microseconds on a healthy machine, and unbounded on a machine
+where something is holding the file. That is exactly the kind of step this
+design refuses to run on the deciding thread — not because it is slow, but
+because nothing can promise it is fast.
+
+`statfs` has no inode, so it never gets a clipboard; `opendir` and `releasedir`
+only touch the frontend's own map of directory streams.
+
+[#directories]
+== Directories: lookup and readdir
+
+// Rendered from documentation/diagrams/fsm-op-dir.d2.
+image::fsm-op-dir.svg[Directory scripts,900]
+
+Both callbacks are thin; `ensure_loaded` underneath them is where the
+responsiveness argument is won. Exactly one of its branches makes the caller
+wait — the first listing of a directory, where there is genuinely nothing to
+serve. A directory that has been listed before is served from the state at once
+and refreshed in the background, so a slow `PROPFIND` never blocks somebody
+else's tab completion.
+
+`readdir` refreshing at offset 0 is what POSIX demands of `rewinddir`, and it is
+what keeps a long-lived directory handle — a file manager sitting in a folder,
+an indexer — from going blind to everything that arrives later.
+
+[#reading]
+== Reading
+
+// Rendered from documentation/diagrams/fsm-op-read.d2.
+image::fsm-op-read.svg[The read script,900]
+
+Four steps, one decision, three sources. This is the operation the whole design
+is measured against: it is the one that can run for minutes, and the one a
+killed reader walks away from.
+
+The cancellation note on the diagram is measured, not assumed
+(`crates/wusel-fuse/tests/interrupt_probe.rs`): the kernel reports a dead reader
+through `flush` immediately, and holds `release` back until every outstanding
+read has been answered. A design that hooked `release` could not cancel anything.
+
+[#writing]
+== Writing: write and setattr
+
+// Rendered from documentation/diagrams/fsm-op-write.d2.
+image::fsm-op-write.svg[The write and setattr scripts,900]
+
+Nothing here reaches the server; that is what `flush` is for. The one network
+step is inbound — fetching the base that a later three-way merge will need — and
+it is the reason a write may not abort a running hydration: it would destroy the
+very thing it depends on.
+
+`setattr`'s truncate-to-zero shortcut deserves its box. It is the common
+overwrite path (`cp` onto an existing file, every `O_TRUNC` editor), and
+hydrating a base that is about to be discarded would spend a full download on
+bytes we throw away.
+
+[#flushing]
+== Flushing: flush, fsync and release
+
+// Rendered from documentation/diagrams/fsm-op-flush.d2.
+image::fsm-op-flush.svg[The flush script,900]
+
+The longest script, and the reason the shape pays off: today this is seven
+nested blocking calls inside one callback, any of which can stand for minutes.
+
+One rule governs every exit — **the buffer is dropped only on success**. A
+failed upload keeps it, so the next `flush` retries instead of silently losing
+the edit. `vi` demonstrates why: it writes a swap file whose upload the server
+may reject, then unlinks it, and that must not take the real file's buffered
+content down with it.
+
+[#conflict]
+== Conflict resolution
+
+// Rendered from documentation/diagrams/fsm-op-conflict.d2.
+image::fsm-op-conflict.svg[The conflict sub-script,900]
+
+Drawn separately because it is a script in its own right, and because it is the
+one place where the user's bytes could be lost. They never are: every path
+either merges them, parks them under a second name, or keeps the buffer for a
+retry.
+
+The conditional PUT of a merge result is the subtle part. Uploading it
+unconditionally would silently discard a third change that landed between our
+`GET` and our `PUT` — the exact lost update the whole `412` machinery exists to
+prevent.
+
+[#namespace]
+== Namespace: create, mkdir, unlink and rmdir
+
+// Rendered from documentation/diagrams/fsm-op-namespace.d2.
+image::fsm-op-namespace.svg[Namespace scripts,900]
+
+The asymmetry between `create` and `mkdir` is deliberate. A directory has to
+exist on the server before anything can be put into it; a file does not, so
+`create` only makes a local node and an empty buffer. An editor's probe file,
+created and deleted before any flush, then never reaches the server at all.
+
+[#renaming]
+== Renaming
+
+// Rendered from documentation/diagrams/fsm-op-rename.d2.
+image::fsm-op-rename.svg[The rename script,900]
+
+Two branches that share almost nothing. The left one is the office-suite atomic
+save — write an ignored temporary file, then rename it onto the real document —
+and everything unusual about it is there because that sequence has to come out
+right, including the rule that a failed upload must not fail the rename.
+
+== What these diagrams do not show
+
+* **Timing.** A step is a step whether it takes 40 µs or four minutes. That is
+  the point of the shape, not an omission — but it means the pictures say
+  nothing about which operations are actually slow.
+* **The collision table in full.** It lives in
+  xref:concurrency.adoc#_the_collision_policy[Concurrency]; only the rows that
+  matter for a given script appear beside it here.
+* **The syncer.** Server-side changes arrive as invalidations and start the same
+  scripts from a different trigger.
+* **That the scripts are spelled in FUSE.** They are, and deliberately so — this
+  is the platform we ship. What that costs a second frontend, and which two
+  changes keep it from becoming a rewrite, is
+  xref:frontends.adoc[Frontends and portability].
+* **Failure of the machine itself** — a worker dying, a channel closing. That
+  belongs to the implementation stages, not to the scripts.

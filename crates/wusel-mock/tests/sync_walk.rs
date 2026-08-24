@@ -10,18 +10,10 @@ mod common;
 
 use std::time::Duration;
 
-use wusel_core::config::Account;
-use wusel_core::provider::{Invalidation, Provider};
-use wusel_core::state::StateDb;
-use wusel_core::webdav::WebDavClient;
+use wusel_core::provider::Invalidation;
 
-fn dir_names(provider: &mut Provider, inode: u64) -> Vec<String> {
-    let mut v: Vec<String> = provider
-        .list_dir(inode)
-        .unwrap()
-        .into_iter()
-        .map(|n| n.name)
-        .collect();
+fn dir_names(engine: &common::Engine, inode: u64) -> Vec<String> {
+    let mut v: Vec<String> = engine.list_dir(inode).into_iter().map(|n| n.name).collect();
     v.sort();
     v
 }
@@ -41,36 +33,27 @@ fn the_syncer_finds_a_deeply_nested_delete_via_etag_walk() {
     let mock = common::Mock::serve(&fixture);
     let addr = mock.addr.clone();
 
-    let account = Account::new("default");
-    let dav = WebDavClient::new(
-        reqwest::Client::new(),
-        &format!("http://{addr}"),
-        "alice",
-        "pw",
-    );
-    std::fs::create_dir_all(account.state_db_path().parent().unwrap()).unwrap();
-    let state = StateDb::open(&account.state_db_path()).unwrap();
-    let mut provider = Provider::new(dav, state, &account).unwrap();
+    let mut engine = common::Engine::start(&addr);
 
     // List root → A → B so the whole path is cached (the walk only descends into
     // already-listed directories).
-    let b = provider.resolve("A/B").unwrap().expect("A/B");
-    assert_eq!(
-        dir_names(&mut provider, b.inode),
-        vec!["gone.txt", "keep.txt"]
-    );
+    let b = engine.resolve("A/B").unwrap().expect("A/B");
+    assert_eq!(dir_names(&engine, b.inode), vec!["gone.txt", "keep.txt"]);
 
-    let invalidations = provider.take_invalidations().expect("invalidation stream");
+    let invalidations = engine
+        .provider()
+        .take_invalidations()
+        .expect("invalidation stream");
 
     // Delete deep in the tree, then fire the (path-less) push trigger.
     std::fs::remove_file(deep.join("gone.txt")).unwrap();
-    provider.sync_trigger().send(()).unwrap();
+    engine.provider().sync_trigger().send(()).unwrap();
 
     // The syncer walks root→A→B by changed ETags and reconciles B.
     let mut pruned = false;
     for _ in 0..60 {
         std::thread::sleep(Duration::from_millis(50));
-        if !dir_names(&mut provider, b.inode).contains(&"gone.txt".to_string()) {
+        if !dir_names(&engine, b.inode).contains(&"gone.txt".to_string()) {
             pruned = true;
             break;
         }
@@ -80,7 +63,7 @@ fn the_syncer_finds_a_deeply_nested_delete_via_etag_walk() {
         "the syncer must prune the deleted file from B's listing"
     );
     assert!(
-        dir_names(&mut provider, b.inode).contains(&"keep.txt".to_string()),
+        dir_names(&engine, b.inode).contains(&"keep.txt".to_string()),
         "the sibling that stayed must remain"
     );
 

@@ -58,6 +58,28 @@ A `trait` describes behavior (like an interface).
   knows only `dyn ContentSource` and notices nothing of the cache. See
   xref:architecture.adoc[Architecture].
 
+== Traits as a test seam (and `#[cfg(test)]` modules)
+
+The same `trait` mechanism is also how you get a dependency out of the way of a
+test — Rust has no mocking framework, and needs none.
+
+* `trait Secrets` in `keyring.rs` is everything `credentials.rs` needs from the
+  OS keyring: four methods. The product passes the one real implementation
+  (`keyring::Os`); the tests pass a `HashMap` that can be told to be absent,
+  locked, or forgetful. Note what that changes: the interesting behaviour —
+  falling back to the file — is no longer a property of the machine running the
+  test.
+* `&dyn Secrets` is *dynamic dispatch*: one compiled function, the implementation
+  chosen at runtime through a vtable. The alternative, a generic
+  `fn store<S: Secrets>(…)`, dispatches statically and compiles a copy per type.
+  Here the call happens once per login, so the simpler signature wins.
+* A `#[cfg(test)] pub(crate) mod fake` lets the double live next to the real
+  backend and still vanish from release builds. Test code can be shared across
+  modules of the same crate this way — `credentials.rs` uses `keyring`'s fake.
+* The risk of every double is that it drifts from the real thing. The answer is a
+  *contract test*: one function taking `&dyn Secrets`, run against the fake and
+  against `Os`. Written once, it holds both to the same promises.
+
 == Conditional compilation: `#[cfg(...)]`
 
 Code can be included or excluded per platform.
@@ -83,6 +105,27 @@ Network I/O runs async via `tokio` (`async fn`, `.await`).
 * Tension: FUSE callbacks are synchronous/blocking. The adapter has to bridge the
   async world to the sync world — see the _FUSE ↔ async bridge_ in
   xref:architecture.adoc[the architecture].
+
+== Shared mutable state: `Arc`, `Mutex`, and an atomic in front of the lock
+
+Rust has no `synchronized`: to share something mutable between threads you wrap
+it — `Arc` for shared *ownership*, `Mutex` for exclusive *access*.
+
+* `health.rs` (`Reachability`) is a compact example of all three moving parts.
+  Several threads — the FUSE dispatchers, the syncer, the hydrator, the push
+  listener — report every request outcome to one instance held as
+  `Arc<Reachability>`.
+* An `AtomicBool` sits *in front of* the `Mutex`: the healthy path (a successful
+  request, thousands per minute) is one relaxed atomic load and returns without
+  ever taking the lock. The mutex is the truth; the atomic is only a hint that
+  says "nothing is wrong, do not bother".
+* The lock is deliberately *not* held while notifying: the guard is dropped —
+  by ending the block it lives in — before the D-Bus call, so a slow desktop
+  cannot make requests queue behind it. Deciding inside the lock and *acting*
+  outside it is the pattern to copy.
+* `unwrap_or_else(|e| e.into_inner())` on `lock()` is poison tolerance: a thread
+  that panicked while holding the lock must not take the whole mount down with
+  it.
 
 == Tests
 

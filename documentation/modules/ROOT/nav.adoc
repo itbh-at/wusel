@@ -5,7 +5,11 @@
 
 * xref:index.adoc[Overview]
 * xref:architecture.adoc[Architecture]
+* xref:concurrency.adoc[Concurrency (design)]
+** xref:fsm-scripts.adoc[The operation scripts]
+** xref:frontends.adoc[Frontends & portability (design)]
 * xref:roadmap.adoc[Roadmap]
+* xref:changelog.adoc[Changelog]
 * xref:distribution.adoc[Project, licence & distribution]
 * xref:contributing.adoc[Contributing]
 * xref:development.adoc[Development]
@@ -13,4 +17,5 @@
 * xref:trying-it-out.adoc[Trying it out]
 * xref:file-manager.adoc[File-manager integration]
 * xref:troubleshooting.adoc[Troubleshooting]
+* xref:known-limitations.adoc[Known limitations]
 * xref:rust-learning-path.adoc[Rust Learning Path]

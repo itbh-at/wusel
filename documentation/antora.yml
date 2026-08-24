@@ -6,11 +6,13 @@
 # (ui-bundle/) live in this directory, checked into this repo.
 name: wusel
 title: Wusel
-# Deliberately unversioned: the site is built from `main` on every push and
-# always describes the current code, so a version selector would only offer one
-# entry. Release tags (v0.1.0, …) ship RPMs, not doc snapshots. Introduce a
-# version here only if we ever need to keep an old release's docs alive.
-version: ~
+# No `version` key on purpose. The version is supplied by the *playbook's*
+# content source (antora-playbook-site.yml maps `main` → "latest" and a release
+# tag `vX.Y.Z` → "X.Y.Z"), and a value set here would take precedence over that
+# mapping — which is what made the original release commits collide (they carry
+# `version: ~`). The v0.1.0/v0.2.0 tags were moved onto commits that omit the
+# key, so every ref now gets its version from one place. The local `build.sh`
+# preview supplies `version: latest` in its own playbook instead.
 start_page: ROOT:index.adoc
 nav:
   - modules/ROOT/nav.adoc

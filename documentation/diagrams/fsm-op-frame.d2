@@ -1,0 +1,106 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 IT Beratung Hermann GmbH
+#
+# How to read the per-operation scripts (see pages/fsm-scripts.adoc).
+#
+# Render to a committed SVG with:  mise run docs-diagrams
+#
+# Every operation diagram shares this frame; only the middle — the script —
+# differs. Drawing it once is what keeps the others down to their actual
+# content.
+
+...@_steps
+
+vars: {
+  d2-config: {
+    layout-engine: elk
+  }
+}
+
+direction: down
+
+arrive: "A request arrives\ndispatch thread turns the callback into a Job\nand hands over the reply object" {
+  class: edge
+}
+
+occupancy: "The clipboard for this object\nnot in the map = idle" {
+  class: decide
+}
+
+start: "start(req)\nbegin the script" {
+  class: decide
+}
+
+collision: "collision(running, arriving)\nthe policy table — one test per row" {
+  class: decide
+}
+
+queue: "Queue\nFIFO — where write → flush ordering\ncomes from, without a lock" {
+  class: state
+}
+
+join: "Join\nride along on the running flow:\none transfer, two answers" {
+  class: decide
+}
+
+abort: "Abort\nonly when the arrival makes the running\nflow pointless — never to overtake it" {
+  class: decide
+}
+
+wait: "Wait / Skip\nlet it finish — or drop the arrival,\nas a refresh meeting a dirty scratch does" {
+  class: decide
+}
+
+script: "The script\na straight sequence of steps, not a graph" {
+  class: decide
+}
+
+advance: "advance(flow, completion) → Next\npure: no I/O, no clock, no randomness" {
+  class: decide
+}
+
+db: "DbRead · DbWrite\nDB reader / writer thread" {
+  class: db
+}
+
+io: "Net · FileIo · streamed hydration\nI/O worker — here it may block" {
+  class: io
+}
+
+answer: "Answer(Reply)\nsent by whoever finished the step,\nnever by the FSM thread" {
+  class: edge
+}
+
+schedule: "Schedule(intent)\nfollow-up work nobody waits for —\na stale listing owes the next caller a fresher one" {
+  class: decide
+}
+
+fail: "Fail(errno)" {
+  class: fail
+}
+
+release: "The object is idle again" {
+  class: decide
+}
+
+arrive -> occupancy
+occupancy -> start: "idle"
+occupancy -> collision: "busy"
+collision -> queue
+collision -> join
+collision -> abort
+collision -> wait
+join -> script
+abort -> script: "mark the running\nflow, then start"
+start -> script
+script -> advance
+advance -> db: "Do(Job)"
+advance -> io: "Do(Job)"
+db -> advance: "Completion"
+io -> advance: "Completion"
+advance -> answer
+advance -> fail
+advance -> schedule: "" {style.stroke-dash: 3}
+answer -> release
+fail -> release
+release -> queue: "dequeue the next one"

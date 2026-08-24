@@ -61,10 +61,11 @@ fn rewinddir_sees_an_entry_added_after_opendir() {
     // *open handle* — it must not keep serving its `opendir`-time snapshot,
     // whichever side the change came from.
     std::fs::write(m.mnt.join("added.txt"), b"new").unwrap();
-    assert!(
-        m.fixture.join("added.txt").exists(),
-        "the new entry reached the server"
-    );
+    // The entry is in the engine's state at once (that is what `rewinddir` below
+    // tests); its bytes reach the server asynchronously, so wait for that.
+    common::eventually("added.txt reached the server", || {
+        m.fixture.join("added.txt").exists()
+    });
 
     unsafe { libc::rewinddir(dirp) };
     let second = unsafe { read_all(dirp) };

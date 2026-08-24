@@ -1,0 +1,200 @@
+////
+  // SPDX-License-Identifier: Apache-2.0
+  // Copyright 2026 IT Beratung Hermann GmbH
+////
+
+= Changelog
+
+User-facing changes, newest first. This page and the RPM's `%changelog`
+(`packaging/rpm/wusel.spec`) describe the same releases and must stay in step —
+the RPM is terse because a package changelog is, this page has room to say why.
+
+The format follows https://keepachangelog.com/en/1.1.0/[Keep a Changelog]; the
+project uses https://semver.org/[Semantic Versioning].
+
+== 0.2.0 — 2026-08-19
+
+The release that made wusel concurrent and then made it quiet. FUSE callbacks
+run in parallel instead of one after another on a single thread, so a slow
+operation no longer blocks the others; saving a file no longer waits for the
+upload; and the desktop now says when the server cannot be reached. It also
+fixes the defects that first showed up when the 0.1.0 line met a real
+Fedora/GNOME desktop.
+
+=== Added
+
+* **`wusel status` — what the mount is doing right now, by file name.** The
+  question `doctor` deliberately cannot answer: its report is built to be
+  attached to a ticket, so it is name-free and speaks in inode numbers. `status`
+  is for the person whose files these are. It names the uploads still owed to the
+  server — including any **parked** after a permanent failure, the case where a
+  file reads as saved and is not on the server and nothing retries it — the files
+  coming down (both background caching and reads being served live), and the rest
+  of the work in flight. The owed uploads come from the state database, so they
+  are reported even with no daemon running; the live half comes from the mount's
+  diagnostics socket, and the numbers become names *locally*, in your own
+  process — nothing about the wire format changed. `--watch` redraws once a
+  second, since individual reads are far too short to catch in a single print.
+
+* **The desktop says when the server cannot be reached — and when it is back.**
+  A network outage used to be the failure that looked like a bug: the file
+  manager stopped drawing the folder, an application stopped opening its
+  document, and the only explanation was a `WARN` line in the journal. Now every
+  request the engine makes reports to one shared reachability state, and a
+  *transport* failure that is still failing ten seconds later produces exactly
+  one localized notification ("wusel cannot reach _server_"), plus a
+  sync-error status in the file manager. The recovery is announced once too. A
+  server that *answers* — even with an error — is not an outage and says nothing,
+  and a single dropped connection is a blip, not a notification.
+
+* **`wusel doctor` — a support-diagnostics command.** One run collects what a
+  support case needs — system, the daemon and its per-thread kernel
+  wait-channels, the mount table, the FUSE connection's `waiting` count, a timed
+  responsiveness check, the effective configuration, connectivity — and asks the
+  running daemon for its own view of what each object is doing, served on a
+  per-user socket. A `PASS`/`WARN`/`FAIL` summary leads; the headline check
+  looks **twice**, two seconds apart, because no single instant can tell a
+  wedged mount from a busy one — a request in flight has a reply parked for it
+  from the moment it arrives, so the counts alone always agree. What separates
+  them is whether the work moves: the *same* job still handed out after the
+  pause, or a reply still parked with nothing running behind it, is a mount that
+  has stopped answering; anything else is load. Redacted by default and safe to attach to a
+  ticket: the engine view is name-free, no directory is listed, no secret is
+  read, and the home path and username are masked. Prints to stdout; `-o PREFIX`
+  also writes `PREFIX.txt` and `PREFIX.json`. See
+  xref:troubleshooting.adoc[Troubleshooting].
+
+* **Concurrency.** Every FUSE callback is now an intent handed to a state
+  machine that decides and performs no I/O, with database readers, a single
+  writer, and network and file pools underneath. 0.1.0 served one request at a
+  time; a slow operation no longer blocks unrelated ones. Configurable with
+  `[mount] dispatch_threads`. See xref:concurrency.adoc[Concurrency].
+* **Choose what a stale pinned file does.** `[sync] refresh_pinned =
+  manual | ask | auto` controls whether an out-of-date offline file is fetched
+  *unasked*, where `auto` fetches only on an unmetered connection (NetworkManager
+  reports it). `[sync] open_pinned = newest | newest-unmetered | offline`
+  controls what *opening* one serves. An outdated offline copy served under these
+  settings is read-only, so an edit cannot silently replace the newer version.
+* **Pinned staleness is visible.** A fifth per-file state, `pinned-stale`, an
+  "Update now" action (`wusel update <path>` and a Nautilus menu entry), and one
+  aggregated notification per sync walk rather than one per file.
+
+=== Changed
+
+* **Uploads are asynchronous.** Saving a file — `flush`/`close` — used to wait
+  for the upload to finish, so copying several files into the mount could stall
+  the file manager and a slow or offline server blocked every save. Now `close`
+  returns as soon as the change is durable on local disk, and the upload runs in
+  the background. The change is never at risk: it is written to the local buffer
+  and recorded in the state database *before* `close` returns, so it survives a
+  crash, and a failed upload keeps the bytes. A **transient** failure (a 5xx, a
+  timeout, a dropped connection) is retried automatically, on an interval that
+  backs off while a server keeps refusing; a **permanent** one (wrong
+  permissions, a conflict, no quota) is parked and the user is told once. An
+  upload owed when the daemon stops is **resumed at the next start**. The file
+  manager shows where each change is: an *uploading* emblem while it is on its
+  way, a *sync-error* emblem if it was parked. For anyone who wants the old
+  behaviour — a save meaning "on the server" before it returns — `[sync] upload
+  = sync` waits for the upload and reports its real result.
+
+* **Pins live in `<config>/pins.json`, not the state database.** They are user
+  intent, not a cache, so they now survive `cache clear`, a rebuilt database, and
+  a roaming home directory.
+* **The state database is kept off NFS/CIFS.** On a network home it is relocated
+  to local storage with a loud message, because SQLite cannot lock reliably
+  there. Overridable with `[state] db_path`; never done silently.
+* **Whole-file hydration is a single streamed GET** instead of one range request
+  per chunk.
+* **Nautilus menu entries are prefixed "Wusel - …"**, so it is clear whose
+  commands they are.
+* **`clippy` checks every crate the host OS can build, tests included** — the
+  FUSE frontend was previously never linted.
+
+=== Fixed
+
+* **Stopping the mount takes seconds, not a systemd timeout.** Shutdown waited
+  for every worker to finish, and a worker only notices that it should stop
+  between jobs — so a single request to a server that had gone quiet held the
+  whole daemon for as long as the HTTP read timeout, and a queued backlog held it
+  longer. systemd gave up after 45 seconds and killed the daemon with `SIGABRT`,
+  leaving a core dump behind on an ordinary `restart`. The pools now stop taking
+  new work at once, queued work is dropped rather than worked off, and the wait
+  has a deadline: anything still running is left behind instead of holding up the
+  exit. Nothing is lost by that — an unfinished upload is durable and resumes at
+  the next start.
+
+* **Opening a file no longer hangs for good.** A reader that arrived while a
+  transfer was being given up — the previous reader had just closed its handle —
+  was attached to that transfer, and the transfer then ended without answering
+  it. The application waited for ever on a page the kernel keeps locked until the
+  reply arrives, and nothing in the mount looked busy, because the work behind it
+  had finished. Such a reader now gets a transfer of its own, and a transfer that
+  is given up answers anyone still waiting on it rather than falling silent.
+
+* **A missing keyring entry no longer reads as a broken keyring.** When the app
+  password was kept in the OS keyring and the entry had since been removed, the
+  mount failed with "the keyring may be locked, or its service is not running" —
+  advice that is useless when the keyring is working perfectly and simply has
+  nothing in it, and which sends you looking in the wrong place. The two cases
+  are now told apart: a *missing entry* says so and points at `wusel login`,
+  while a keyring that genuinely cannot be consulted still suggests unlocking it
+  and now names the underlying cause instead of guessing at it. The summary line
+  no longer claims the credentials file is missing when it is there and only its
+  keyring reference failed.
+
+* **A background refresh can no longer make you wait.** Directory revalidation
+  was dispatched as ordinary network work, into the same queue as the reads a
+  user is blocked on. On a large account that made the mount unusable after every
+  start: with the listings all past their revalidation interval at once,
+  thousands of revalidations queued up, and a click on a folder went to the back
+  of that queue. Measured on a real account, a directory took over half an hour
+  to appear, with 1552 revalidations in flight. The network pool now serves
+  interactive work first and reaches for background work only when nothing else
+  wants the capacity, and the refresh backlog is capped — a revalidation nobody
+  waits for is dropped rather than queued behind hundreds of its own kind. No
+  configuration change is needed, and none should ever have been: the defaults
+  now hold on a large account.
+
+* **A small file is cached once, not on every read.** Sequential reads are
+  tracked per file, and only eight files were tracked at a time — the same number
+  as the default dispatch threads, so ordinary concurrent browsing evicted a
+  tracker while its file was still being read. An evicted tracker discards the
+  partial copy it was assembling, so the file was never cached and the next read
+  fetched it from the server again, however often it was opened. Many more files
+  are tracked now, with the memory that actually costs something (the readahead
+  buffer) capped separately, so the count could be raised without paying for it.
+
+* **A network hiccup at start-up no longer costs live updates for the whole
+  session.** The notify_push endpoint was discovered once; a daemon that came up
+  before the network (or before DNS) spent that single attempt on a dead network,
+  logged one warning, and then ran on TTL revalidation alone until somebody
+  restarted the service. Discovery now retries while the server is unreachable —
+  which doubles as the mount's heartbeat, so even an idle daemon notices that the
+  connection came back and tells the user.
+
+* **Atomic saves work.** Saving in GNOME Text Editor (and anything else built on
+  `g_file_replace`) returned an I/O error: the rename over the existing file hit
+  a uniqueness constraint, and the follow-up upload produced a conflicted copy. A
+  rename now replaces its destination and inherits its server identity, so the
+  save is an ordinary overwrite.
+* **A background listing refresh no longer makes the next caller wait for it.**
+  A second `ls`, or a file manager's per-entry lookups, used to queue behind the
+  PROPFIND the first listing triggered.
+* **The file-manager emblem changes on every route** — a file arriving in the
+  cache is announced whether it came from a read, a background hydration, or a
+  write, and a file *leaving* the cache (eviction, unpin) is announced too.
+* **The kernel is told when a file's content changed on the server**, so
+  reopening or reloading it shows the current version instead of a cached one
+  until a TTL expires.
+* **A failed operation says what failed** in the log, instead of surfacing only
+  an errno to the kernel.
+* **A pinned file stays readable when the server is unreachable**, even if the
+  local copy is out of date — an outdated copy beats an error, and serving it is
+  announced.
+
+== 0.1.0 — 2026-07-28
+
+First public release: a VFS-first Nextcloud mount (online-only, on-demand
+hydration, caching, pinning, write-back) with the GNOME desktop integration
+(Nautilus sidebar, emblems, pin/unpin menu, Shell search) and keyring
+credentials by default.

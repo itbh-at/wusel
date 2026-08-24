@@ -7,10 +7,7 @@
 
 mod common;
 
-use wusel_core::config::Account;
-use wusel_core::provider::Provider;
-use wusel_core::state::{StateDb, ROOT_INODE};
-use wusel_core::webdav::WebDavClient;
+use wusel_core::state::ROOT_INODE;
 
 #[test]
 fn large_file_uploads_in_chunks_and_reassembles() {
@@ -24,23 +21,17 @@ fn large_file_uploads_in_chunks_and_reassembles() {
     let mock = common::Mock::serve(&fixture);
     let addr = mock.addr.clone();
 
-    let account = Account::new("default");
-    let dav = WebDavClient::new(
-        reqwest::Client::new(),
-        &format!("http://{addr}"),
-        "alice",
-        "pw",
-    );
-    std::fs::create_dir_all(account.state_db_path().parent().unwrap()).unwrap();
-    let state = StateDb::open(&account.state_db_path()).unwrap();
-    let mut provider = Provider::new(dav, state, &account).unwrap();
+    let engine = common::Engine::start(&addr);
 
     // ~9 MiB — larger than one 4 MiB chunk, so the upload is chunked.
     let data: Vec<u8> = (0..9 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
 
-    let node = provider.create(ROOT_INODE, "big.bin").expect("create");
-    provider.write(node.inode, 0, &data).expect("write");
-    provider.flush(node.inode).expect("flush");
+    let node = engine.create(ROOT_INODE, "big.bin").expect("create");
+    engine.write(node.inode, 0, &data).expect("write");
+    engine.flush(node.inode).expect("flush");
+    // The upload is asynchronous: flush returns once the change is durable
+    // locally, and the transfer runs on behind it. Wait for it to land.
+    engine.wait_for_uploads();
 
     // The server reassembled the file byte-for-byte.
     assert_eq!(std::fs::read(fixture.join("big.bin")).unwrap(), data);

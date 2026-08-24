@@ -1,0 +1,434 @@
+////
+  // SPDX-License-Identifier: Apache-2.0
+  // Copyright 2026 IT Beratung Hermann GmbH
+////
+
+= Frontends and portability
+
+NOTE: This page records an **intention**, not shipped behaviour. Only the Linux
+FUSE frontend exists — but the groundwork it argues for is now built, and the
+sections below say which parts. It belongs next to xref:architecture.adoc[Architecture],
+which names the three frontends, and xref:concurrency.adoc[Concurrency], which
+designs the state machine they would share.
+
+== Why this page exists at all
+
+Projects of this kind rarely die of a missing feature. They die when the second
+platform turns out to cost a rewrite of the first, nobody can justify the money,
+and the port is quietly abandoned — leaving a codebase shaped around assumptions
+nobody dares to touch any more.
+
+The defence is not to build all three now. It is to decide, **while the state
+machine is still on paper**, which knowledge is allowed to live where — and to
+write that decision down so a later contributor can tell a port from a
+violation. This is the last cheap moment: after the FSM is implemented, every
+one of these cuts costs a refactor of working code.
+
+The goal is deliberately modest and testable:
+
+* FUSE is carried **completely** — no compromise for the sake of hypothetical
+  platforms, no abstraction that exists only for a frontend nobody has written.
+* A second frontend is paid for **in that frontend**. It may add translation. It
+  may not require the engine or the machine to be rewritten.
+
+== What a port actually is here
+
+The three platforms do solve the same problem, but they place us on opposite
+sides of the filesystem:
+
+* **FUSE — we _are_ the filesystem.** The kernel asks us for everything,
+  `getattr` and `lookup` included, and we own the write buffer.
+* **Windows Cloud Files API and macOS File Provider — we sit _behind_ the
+  filesystem.** NTFS and APFS own the bytes and the metadata. The system answers
+  attribute and directory queries from its own store and calls us for two
+  things: fetch content, and "the user changed something".
+
+Two consequences follow, and they are the whole reason this page is not just a
+list of API names:
+
+**About a third of our callbacks do not port — they disappear.** `getattr`,
+`open`, `getxattr`, `listxattr`, `statfs`, `opendir`, `releasedir` have no
+counterpart where the OS answers them itself.
+
+**The write direction inverts.** Today the frontend calls `flush` and we upload.
+There, the platform tells us afterwards that a file changed. The *upload script*
+is unaffected — preconditions, `412`, conflict resolution, chunking are all
+server semantics — but its trigger moves, and with it the question of who owns
+the local copy.
+
+== The layering, and the cut that defines it
+
+The tempting question is whether a shared core should hold the *union* of what
+the three platforms need or their *intersection*. Both answers are wrong,
+because they treat the core as a feature set.
+
+The intersection of three platform APIs is nearly empty: conflict resolution,
+chunked upload and precondition logic appear in none of them, so they would be
+pushed out into three frontends and written three times — precisely the
+duplication a shared core exists to prevent. The union collects every platform's
+peculiarity until the core's behaviour depends on who is calling it, which
+cannot be tested.
+
+The cut runs the other way. For any piece of code:
+
+[IMPORTANT]
+====
+Does it depend on the semantics of the **server** — ETags, preconditions,
+chunking, conflicts, shares, quota — or on the semantics of the **platform** —
+identifiers, callback timing, who owns the dirty bytes?
+====
+
+Server semantics belong to the engine. Platform semantics belong to a frontend.
+The state machine belongs to neither: it is a mechanism.
+
+[cols="1,2,2"]
+|===
+|Layer |Knows |Must never know
+
+|`wusel-core` — the engine
+|Nextcloud: WebDAV, ETags, preconditions, conflict resolution, chunking, the
+state database, pins, the cache
+|That a frontend exists at all; inodes; errno; who triggered the work
+
+|`wusel-fsm` — the machine
+|Objects have an identity, an operation is a script of steps, two operations on
+one object can collide, a step may be abandoned
+|What an inode is; whether writes are buffered by us or by the OS; how a reply
+reaches the caller
+
+|`wusel-fuse`, `wusel-cfapi`, `wusel-fileprovider`
+|Its own platform: callbacks, identifiers, completion objects, error codes, and
+whatever local-file ownership the platform imposes
+|Anything about Nextcloud. A frontend that needs an ETag is a layering bug
+
+|`wusel` — the product
+|Configuration, service lifecycle, CLI
+|—
+|===
+
+The last row of the middle column is the one to hold on to: **a frontend that
+has to reach for server knowledge is not a special case, it is a defect in the
+layering.** That makes the rule reviewable rather than aspirational.
+
+=== Why the machine gets its own crate
+
+`wusel-fsm` could be a module inside the engine. It should not be, for one
+reason: a module boundary is a convention, and a crate boundary is enforced by
+the compiler. Inside the engine, the machine would inevitably reach for
+`NodeRow`, the state database and the WebDAV types, because they are within
+arm's reach and nothing objects. As a crate it may depend on the engine — its
+alphabet is engine intents, which are the same on all three platforms — but it
+cannot depend on a frontend, and no frontend can quietly grow into it.
+
+This is a small decision now and an expensive one later, which is the whole
+argument of this page in miniature.
+
+== The alphabet: intents, not callbacks
+
+Today the scripts in xref:fsm-scripts.adoc[The operation scripts] *are* the FUSE
+callbacks. That is the coupling to break, and it is the single change with the
+most leverage: the machine's vocabulary should be what the **engine** does, not
+what one kernel interface happens to call it.
+
+[cols="1,1,1,1"]
+|===
+|Intent |FUSE |Windows Cloud Files |macOS File Provider
+
+|Enumerate |`readdir`, `lookup` → `ensure_loaded` |`FETCH_PLACEHOLDERS`
+|`enumerator` with sync anchors
+|Fetch content |`read` (range) |`FETCH_DATA` (range) |`fetchContents` (whole file)
+|Materialise |`create` + first `flush` |change notification |`createItem`
+|Publish |`flush`, `fsync`, `release` |`NOTIFY_*`, USN journal |`modifyItem(contents:)`
+|Remove |`unlink`, `rmdir` |`NOTIFY_DELETE` |`deleteItem`
+|Move |`rename` |`NOTIFY_RENAME` |`modifyItem` (parent/name)
+|Refresh |syncer invalidation |same |same
+|Abandon |`flush` with reads outstanding |`CANCEL_FETCH_DATA` |progress cancellation
+|Attributes |`getattr`, `getxattr`, … |— the OS answers |partly `item(for:)`
+|===
+
+Two things this table settles. **Cancellation is easier everywhere else** — both
+other platforms have an explicit cancel callback, so our "abort is a request,
+checked between steps" design fits them directly and the `flush` trick stays a
+FUSE peculiarity. And **content transfer needs no invention**:
+`ContentSource::read(node, offset, len)` is already the shape Windows asks for,
+and `hydrate_to(node, dest_path)` is already the shape macOS asks for. Both
+exist today.
+
+== The other seam: desktop notifications and status
+
+The engine reaches the desktop through a second trait,
+`wusel_core::desktop::Desktop`, and it is as platform-agnostic as the intent
+alphabet: the engine emits a structured `Notice` and a coarse `Status` and knows
+nothing about how either is shown. `Notice::localize` stays **the one place we
+speak the user's language**; a backend only chooses the delivery mechanism.
+
+[source,rust]
+----
+pub trait Desktop {
+    fn notify(&self, notice: &Notice);      // discrete alerts: a conflict copy, a parked upload
+    fn set_status(&self, status: Status);   // idle / syncing / error — coarse, frequent
+    fn file_changed(&self, abs_path: &str); // one file's per-item state changed
+}
+----
+
+The three methods do not port the same way, and that split is the point.
+
+**Per-file status is native, and does not travel this trait at all on macOS.**
+On Linux `set_status`/`file_changed` drive libcloudproviders so Nautilus paints
+an emblem. On macOS the File Provider *is* the store: an item's
+downloaded/uploading/error state is a first-class property the extension already
+reports (the `Publish`/`Fetch` intents above), and Finder renders it. So the
+macOS backend leaves `file_changed` a no-op and `set_status` all but empty — the
+aggregate progress Finder shows for the domain is the system's, not ours. This
+is precisely where the reference client goes wrong by re-inventing a tray icon;
+the native path is the whole reason to sit *behind* the File Provider.
+
+**Discrete notices are the one thing the backend must actively do** — a
+"conflicted copy saved", a "permanently parked upload", a "connection lost".
+Linux posts them on the freedesktop notification bus; macOS posts them to
+Notification Center through the `UserNotifications` framework.
+
+There the platform imposes one structural fact, and it decides how the daemon is
+packaged: **only an application may post to Notification Center.**
+`UNUserNotificationCenter` needs a bundle identifier and a one-time
+authorization; a bare `launchd` binary has neither, and its notifications are
+dropped in silence. So the daemon runs as a **background agent app** — an `.app`
+bundle with `LSUIElement = true` (no Dock icon, no menu bar), launched by
+launchd, signed with the notification entitlement. With an app identity it asks
+for authorization once and posts directly — and the notices come from the
+**daemon**, never from the File Provider extension, which macOS suspends and
+kills at will and which therefore must own no state.
+
+=== The Rust sketch
+
+A new `#[cfg(target_os = "macos")]` arm of `wusel_desktop::backend`, the twin of
+the Linux one behind the same trait: fail-soft, off the caller's thread, and
+touching nothing in the engine. In keeping with this project's
+minimal-dependency habit, the native call is a small Objective-C shim compiled
+by a build script and reached over a C ABI, rather than a framework-binding
+crate (the `objc2` route is the alternative).
+
+[source,rust]
+----
+// crates/wusel-desktop/src/lib.rs — one more arm, mirroring the Linux one.
+#[cfg(target_os = "macos")]
+pub fn backend(account: &str, _mount_path: &Path) -> Arc<dyn Desktop> {
+    macos::backend(account)
+}
+
+#[cfg(target_os = "macos")]
+mod macos {
+    use std::os::raw::c_char;
+    use std::sync::{mpsc, Arc};
+    use wusel_core::desktop::{Desktop, Notice, Status};
+
+    // The only genuinely new native code — a ~30-line ObjC shim (below),
+    // compiled by build.rs (`cc`, `-framework UserNotifications`). No new crate.
+    extern "C" {
+        fn wusel_request_notification_authorization();
+        fn wusel_post_notification(title: *const c_char, body: *const c_char);
+    }
+
+    pub(super) fn backend(_account: &str) -> Arc<dyn Desktop> {
+        let (tx, rx) = mpsc::channel::<Notice>();
+        let locale = std::env::var("LANG").unwrap_or_default(); // read once
+        // One worker: the engine calls `notify` on its hot path, so the trait
+        // only enqueues — exactly as the Linux backend hands work to a zbus
+        // worker. It also confines the app-runloop calls to a single thread.
+        std::thread::Builder::new()
+            .name("wusel-usernotifications".into())
+            .spawn(move || {
+                unsafe { wusel_request_notification_authorization() }; // once, first run
+                for notice in rx {                                     // ends when the sender drops
+                    let m = notice.localize(&locale); // the one place we speak the user's language
+                    if let (Ok(t), Ok(b)) = (cstr(&m.title), cstr(&m.body)) {
+                        unsafe { wusel_post_notification(t.as_ptr(), b.as_ptr()) };
+                    }
+                }
+            })
+            .ok();
+        Arc::new(MacDesktop { tx })
+    }
+
+    struct MacDesktop {
+        tx: mpsc::Sender<Notice>,
+    }
+
+    impl Desktop for MacDesktop {
+        fn notify(&self, notice: &Notice) {
+            let _ = self.tx.send(notice.clone()); // fail-soft: notifier gone ⇒ drop it
+        }
+        // Aggregate status is shown natively by the File Provider domain, and
+        // per-file state is a File Provider item property the extension reports,
+        // so neither travels this backend on macOS.
+        fn set_status(&self, _status: Status) {}
+        fn file_changed(&self, _abs_path: &str) {}
+        // `is_metered` would read NWPathMonitor later; None ("not cheap") until then.
+    }
+
+    fn cstr(s: &str) -> Result<std::ffi::CString, std::ffi::NulError> {
+        std::ffi::CString::new(s)
+    }
+}
+----
+
+[source,objc]
+----
+// crates/wusel-desktop/macos/wusel_notify.m — compiled by build.rs on macOS.
+#import <UserNotifications/UserNotifications.h>
+
+void wusel_request_notification_authorization(void) {
+    [UNUserNotificationCenter.currentNotificationCenter
+        requestAuthorizationWithOptions:UNAuthorizationOptionAlert
+                      completionHandler:^(BOOL granted, NSError *err) {}];
+}
+
+void wusel_post_notification(const char *title, const char *body) {
+    UNMutableNotificationContent *c = [UNMutableNotificationContent new];
+    c.title = [NSString stringWithUTF8String:title];
+    c.body  = [NSString stringWithUTF8String:body];
+    UNNotificationRequest *r =
+        [UNNotificationRequest requestWithIdentifier:NSUUID.UUID.UUIDString
+                                             content:c trigger:nil];
+    [UNUserNotificationCenter.currentNotificationCenter
+        addNotificationRequest:r withCompletionHandler:nil];
+}
+----
+
+Two properties carry over from the Linux backend, and they are the ones that
+matter: it **never blocks or fails the caller** (`notify` only enqueues), and it
+adds **no `cfg(target_os)` to `wusel-core`** — the gate the second checkpoint
+below watches. Everything macOS-specific stays in this crate, behind the cfg.
+
+This is a sketch, deliberately: like the completion and error-mapping traits, the
+exact shape is only worth fixing once the macOS frontend is a real second caller
+(see _What we do now, and what we deliberately defer_). What is settled now is
+*where* it goes — behind the existing `Desktop` trait, in a macOS arm of
+`wusel-desktop` — and that the daemon must be an agent app for it to work at all.
+
+== Who owns the local copy
+
+This is the rule most likely to be violated by accident, because on Linux the
+answer is so obvious that it never has to be said:
+
+[IMPORTANT]
+====
+The engine may **offer** a write buffer. It must never be the **authority** on
+whether an object is dirty.
+====
+
+Under FUSE the machine holds that authority: the buffer registry — open, dirty,
+base version, pending mtime — lives in `wusel-fsm`, and the engine no longer has
+a copy. Under
+Windows and macOS the operating system holds it, and we are informed after the
+fact. If both keep the flag, there are two truths about one state — and the
+symptom appears late and looks like data loss: an upload that overwrites a
+change the OS had already accounted for.
+
+Stated as a boundary: the buffer is a *service* the engine offers a frontend,
+not a fact the engine knows about the world.
+
+== What the `Provider` facade has to lose
+
+The facade this page was written against — `list_dir(inode)`,
+`lookup(parent, name)`, `stat(inode)`, `read(inode, offset, len)` — was honest
+about the intent and wrong in its shape: it was FUSE spelled out.
+`lookup(parent, name)` and `stat` have no caller on Windows, and macOS addresses
+objects by opaque identifiers that are neither numbers nor paths.
+
+Two changes followed, and both are done:
+
+. **`inode: u64` becomes an opaque object identity.** It appears sixteen times
+  in `provider.rs` alone. Windows uses file identifiers, macOS uses
+  `NSFileProviderItemIdentifier` strings. The identity must also be stable
+  across a rename — which we already guarantee, because `move_subtree` keeps the
+  row alive so open handles and a pending buffer survive.
+. **The facade speaks intents.** `read`/`hydrate_to` stay as they are; the
+  name-and-parent resolution becomes an enumeration concern rather than a
+  per-callback one.
+
+Both were *removals of coupling*. Neither commits us to Windows or macOS, and
+both are right even if no second frontend is ever written — which is the test a
+speculative abstraction has to pass and usually fails.
+
+The engine's own contract tests now drive the machine rather than a second set of
+entry points, which is what keeps the two from drifting apart while both look
+green — and porting them turned up seven real defects that no unit test would
+have found.
+
+== What we do now, and what we deliberately defer
+
+**Done**, and as cheap while the machine was on paper as predicted:
+
+* the machine is keyed by an opaque `ObjectId`, never an inode;
+* its alphabet is engine intents — `Fetch`, `Write`, `Stat`, `Lookup`,
+  `Enumerate`, `Materialise`, `Publish`, `Remove`, `Move`, `SetAttr`, `State`,
+  `Refresh`, `Relist` — so a frontend maps its callbacks onto them and the
+  machine never learns their names;
+* `wusel-fsm` depends on nothing, so no platform type can reach it by accident.
+
+Adding four of those intents late made the argument better than the argument
+did: with no catch-all arm anywhere, the compiler named all eleven places that
+had to decide what they meant.
+
+**Still deferred**, on purpose, until a second frontend actually exists:
+
+* the concrete trait shapes for completions and error mapping. A trait with
+  exactly one implementor is a guess, not a design. We know *where* the seam
+  goes; we do not yet know its exact form, and pretending otherwise produces the
+  wrong abstraction with more confidence than a missing one.
+
+That distinction is the difference between planning ahead and over-engineering:
+we remove coupling now, and we invent interfaces only when we have two callers
+to hold them to.
+
+== Two gates that make this checkable
+
+In the spirit of the staged gates in xref:concurrency.adoc[Concurrency], the
+layering has to be mechanically verifiable, or it will erode:
+
+. **`wusel-fsm` builds and its tests pass with no frontend present**, and the
+  collision-policy tests read identically no matter which platform is imagined.
+  It holds: 42 tests, none of which needs a mount, a server, a database or a
+  thread, and `cargo tree -p wusel-fsm` is one line.
+. **`wusel-core` gains no further `cfg(target_os)`** beyond the handful in
+  `keyring.rs` and `credentials.rs` — the only places where secret storage is
+  genuinely an OS matter.
+
+Both fail loudly the moment platform knowledge is pushed into a shared layer.
+
+== The order, and which platform comes second
+
+FUSE is finished first, completely, on its own merits. It is the platform we
+can test end to end today, and a half-finished frontend proves nothing about
+portability.
+
+For the second, **Windows is the easier candidate**, on structure rather than
+taste:
+
+* it is **range-based** (`FETCH_DATA`), which is the shape our content path
+  already has;
+* it is an ordinary process — no application extension, no sandbox, no bridge
+  into another language, `windows-rs` and plain Win32;
+* its callback set maps almost one-to-one onto the intents above.
+
+macOS asks for more that is structural rather than incidental: a File Provider
+extension must be an **app extension inside a signed, notarized application
+bundle**, sandboxed, with the Rust engine bridged into Swift or Objective-C. Its
+replicated model wants stable opaque identifiers and enumeration with sync
+anchors, and content transfer is whole-file — partial fetching exists only in
+recent releases and under conditions that would need checking before anything is
+built on it. None of that is prohibitive; all of it is packaging and lifecycle
+work that Windows simply does not ask for.
+
+The honest counterweight: development happens on macOS, so macOS is the platform
+we can *try* most easily and Windows the one we can *implement* most easily.
+That tension is worth naming rather than resolving in advance — the decision
+belongs to whoever picks the work up, with this trade-off visible.
+
+== What this page does not commit us to
+
+* **Building either frontend.** It commits us to not making them impossible.
+* **A FUSE-compatible shim elsewhere.** If Wusel ships on another platform, it
+  rides the native framework; that decision stands unchanged.
+* **A timeline.** This sits behind everything in xref:roadmap.adoc[Roadmap].

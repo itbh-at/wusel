@@ -449,9 +449,29 @@ max_age  = "30d"        # drop blobs unused this long; "0" = never
 revalidate_secs = 30    # re-list a directory older than this (no-push fallback)
 push_floor_secs = 5     # min seconds between push-triggered re-lists of one directory
 text_merge      = false # true = try a 3-way text merge on conflict before a conflicted copy
+# What happens when a PINNED file goes out of date on the server:
+#   manual = emblem only        ask = notify when more files go stale (default)
+#   auto   = fetch it, but only over an unmetered connection; anything less
+#            certain than "not metered" falls back to ask
+refresh_pinned  = "ask"
+# What an OUTDATED offline file serves when you OPEN it — a different question
+# from the one above, which is about fetching unasked in the background:
+#   newest            = always the current version (default)
+#   newest-unmetered  = the current one, unless the connection is metered
+#   offline           = the copy that is here; you refresh when you mean to
+# While an outdated copy is what gets served, the file is READ-ONLY — see the
+# concurrency page for why editing it would lose the newer version silently.
+open_pinned     = "newest"
 # ephemeral editor/OS files kept purely local (never uploaded). Setting this
 # REPLACES the built-in default; omit it to keep the default set.
 ignore_patterns = [".*.sw?", "4913", "*~", ".~lock.*#", "~$*", ".#*", "*.tmp", ".goutputstream-*", ".DS_Store", "Thumbs.db"]
+
+[state]
+# Where the metadata database goes. Normally derived from XDG_STATE_HOME; set it
+# only to override, including to overrule the automatic move off a network
+# filesystem (NFS/CIFS), where SQLite cannot lock reliably. A path you name here
+# is always used — and warned about if it is on such a filesystem.
+db_path = "/var/tmp/wusel/state.sqlite"
 
 [tls]
 ca_cert  = "/etc/wusel/my-ca.pem"   # trust a private / self-signed CA
@@ -576,6 +596,12 @@ cargo run -p wusel -- unpin Documents      # release (blobs become evictable)
 
 Directory pins cover their whole subtree; oversized files are cached too (a pin
 overrides the size budget). Add `--account NAME` for a named profile.
+
+Pins are kept in `~/.config/wusel/pins.json`, next to the configuration and
+*not* in the state database — they are what you said, not something we fetched.
+So `cache clear` leaves them alone, they survive a rebuilt or relocated
+database, and they travel with a roaming home directory. Their files download
+again on first use after a clear.
 
 === Multiple accounts
 

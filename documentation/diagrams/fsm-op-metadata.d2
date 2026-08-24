@@ -1,0 +1,138 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 IT Beratung Hermann GmbH
+#
+# Metadata scripts: getattr, open, getxattr, listxattr — and the operations
+# that never reach the machine at all (see pages/fsm-scripts.adoc).
+#
+# Render to a committed SVG with:  mise run docs-diagrams
+#
+# The point of drawing these four together: they are the highest-frequency
+# callbacks a file manager makes, and not one of them may touch the network.
+# The only step that can block is the cache probe in file_state — which is
+# exactly why it belongs on a worker rather than on the deciding thread.
+
+...@_steps
+
+vars: {
+  d2-config: {
+    layout-engine: elk
+  }
+}
+
+direction: down
+
+getattr: "getattr — attributes of one inode" {
+  class: decide
+
+  marker: "synthetic marker inode?\n(indexer-exclusion files, root only)" {
+    class: decide
+  }
+  m_yes: "Answer: fabricated attrs\nno inode state involved" {
+    class: edge
+  }
+  row: "DbRead  node_by_inode" {
+    class: db
+  }
+  ok: "Answer: attrs from the row\nsize, mtime, and the mode the server\nactually permits (read-only share → 0444)" {
+    class: edge
+  }
+  gone: "Fail ENOENT" {
+    class: fail
+  }
+
+  marker -> m_yes: "yes"
+  marker -> row: "no"
+  row -> ok: "Some(node)"
+  row -> gone: "None"
+}
+
+open: "open — no per-open state" {
+  class: decide
+
+  row: "DbRead  node_by_inode" {
+    class: db
+  }
+  note: "only to name the file in the log:\ncache-served reads never hit the network\nand would otherwise leave no trace" {
+    class: state
+  }
+  ok: "Answer: opened(fh = 0)" {
+    class: edge
+  }
+
+  row -> note
+  note -> ok
+}
+
+xattr: "getxattr / listxattr — the emblem state\nissued for every visible entry, so: never the network" {
+  class: decide
+
+  name: "name == user.wusel.state?\n(getxattr only)" {
+    class: decide
+  }
+  other: "Fail ENODATA" {
+    class: fail
+  }
+  row: "DbRead  node_by_inode" {
+    class: db
+  }
+  scratch: "scratch buffer open?\nin-memory map — free to consult" {
+    class: state
+  }
+  modified: "Modified\ncovers a deferred create too" {
+    class: decide
+  }
+  pinned_q: "DbRead  is_pinned\nthe file, an ancestor, or the root" {
+    class: db
+  }
+  pinned: "Pinned" {
+    class: decide
+  }
+  dir: "a plain directory?" {
+    class: decide
+  }
+  nostate: "Answer: no state\n(no emblem on an unpinned directory)" {
+    class: edge
+  }
+  cached_q: "FileIo  is_cached\nstats the blob — the one step here\nthat can stall on a busy disk" {
+    class: io
+  }
+  cached: "Cached  /  OnlineOnly" {
+    class: decide
+  }
+  stale: "planned: a fifth state for a stale\npinned copy, plus an Update now action" {
+    class: planned
+  }
+  ok: "Answer: the state string\n(listxattr: the name, or an empty list)" {
+    class: edge
+  }
+
+  name -> other: "no"
+  name -> row: "yes"
+  row -> scratch
+  scratch -> modified: "yes"
+  scratch -> pinned_q: "no"
+  pinned_q -> pinned: "yes"
+  pinned_q -> dir: "no"
+  dir -> nostate: "yes"
+  dir -> cached_q: "no"
+  cached_q -> cached
+  pinned -> stale
+  modified -> ok
+  pinned -> ok
+  cached -> ok
+  stale -> ok
+}
+
+bypass: "Never reach the machine" {
+  class: state
+
+  statfs: "statfs\nconstants — no inode, so no clipboard.\nWe advertise a large free capacity, or\napps refuse to save (the real quota is later work)" {
+    class: decide
+  }
+  opendir: "opendir\nhand out a file handle and register the\nstream — a frontend map, not FSM state" {
+    class: state
+  }
+  releasedir: "releasedir\ndrop that snapshot" {
+    class: state
+  }
+}

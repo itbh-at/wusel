@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
+  <!-- uploading: a committed change on its way to the server. A white up-arrow
+       over a baseline (the classic "upload" glyph) on blue, so it reads as
+       in-flight and is distinct from the amber "modified" (being edited). -->
+  <circle cx="8" cy="8" r="7" fill="#3584e4"/>
+  <path d="M8 10.2V4.9M5.6 7.1 8 4.7 10.4 7.1" fill="none" stroke="#ffffff"
+        stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M5.2 11.7H10.8" fill="none" stroke="#ffffff" stroke-width="1.6"
+        stroke-linecap="round"/>
+</svg>

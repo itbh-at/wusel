@@ -55,4 +55,5 @@ offers a good home for something, Wusel lives there instead of building its own.
 
 Next: xref:installation.adoc[Installation] · xref:file-manager.adoc[File-manager
 integration] · xref:architecture.adoc[Architecture] ·
-xref:roadmap.adoc[Roadmap] · xref:development.adoc[Development & Testing].
+xref:roadmap.adoc[Roadmap] · xref:known-limitations.adoc[Known limitations] ·
+xref:development.adoc[Development & Testing].

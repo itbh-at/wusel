@@ -1,0 +1,162 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 IT Beratung Hermann GmbH
+#
+# Directory scripts: lookup and readdir, both built on ensure_loaded
+# (see pages/fsm-scripts.adoc).
+#
+# Render to a committed SVG with:  mise run docs-diagrams
+#
+# ensure_loaded is where the responsiveness argument of the whole design is
+# won or lost: exactly one branch is allowed to block the caller, and it is
+# the one where we have nothing to serve.
+
+...@_steps
+
+vars: {
+  d2-config: {
+    layout-engine: elk
+  }
+}
+
+direction: down
+
+lookup: "Lookup — resolve one name in a directory\n(FUSE: lookup)" {
+  class: decide
+
+  utf8: "name valid UTF-8?" {
+    class: decide
+  }
+  bad: "Fail EINVAL" {
+    class: fail
+  }
+  marker: "a root marker name?" {
+    class: decide
+  }
+  m_ok: "Answer: synthetic entry" {
+    class: edge
+  }
+  parent: "DbRead  node_by_inode(parent)" {
+    class: db
+  }
+  load: "ensure_loaded(parent)\n→ see below" {
+    class: decide
+  }
+  child: "DbRead  child_by_name" {
+    class: db
+  }
+  ok: "Answer: entry + attrs" {
+    class: edge
+  }
+  miss: "Fail ENOENT\na negative answer the kernel caches" {
+    class: fail
+  }
+
+  utf8 -> bad: "no"
+  utf8 -> marker: "yes"
+  marker -> m_ok: "yes"
+  marker -> parent: "no"
+  parent -> load
+  load -> child
+  child -> ok: "Some"
+  child -> miss: "None"
+}
+
+readdir: "Enumerate — a directory's children\n(FUSE: readdir, one chunk at a time)" {
+  class: decide
+
+  off: "offset >= 0?" {
+    class: decide
+  }
+  bad: "Fail EINVAL\nnever silently treated as 0" {
+    class: fail
+  }
+  known: "a registered stream handle?" {
+    class: decide
+  }
+  start0: "offset == 0?" {
+    class: decide
+  }
+  snap: "Answer from the snapshot\ntaken when the stream started — a background\nrevalidation between two chunks must not shift\noffsets and thereby skip or duplicate entries" {
+    class: edge
+  }
+  build: "build the listing\n(offset 0 is also where rewinddir lands,\nso a long-lived dirfd stops going blind)" {
+    class: decide
+  }
+  throwaway: "build a throwaway listing\nfh 0, or past the stream cap: storing one\nwould leak, since no releasedir follows" {
+    class: decide
+  }
+  row: "DbRead  node_by_inode" {
+    class: db
+  }
+  notdir: "Fail ENOTDIR" {
+    class: fail
+  }
+  load: "ensure_loaded(dir)\n→ see below" {
+    class: decide
+  }
+  kids: "DbRead  children_of" {
+    class: db
+  }
+  assemble: "assemble . , .. , children\nplus the synthetic root markers" {
+    class: decide
+  }
+  ok: "Answer: entries until the buffer is full" {
+    class: edge
+  }
+
+  off -> bad: "no"
+  off -> known: "yes"
+  known -> start0: "yes"
+  known -> throwaway: "no"
+  start0 -> build: "yes"
+  start0 -> snap: "no"
+  build -> row
+  throwaway -> row
+  row -> notdir: "not a directory"
+  row -> load: "Some(dir)"
+  load -> kids
+  kids -> assemble
+  assemble -> ok
+}
+
+ensure: "ensure_loaded — the shared core" {
+  class: decide
+
+  drain: "apply what the background revalidator finished\npure: results are handed over, not fetched" {
+    class: decide
+  }
+  loaded: "has this directory ever been listed?" {
+    class: decide
+  }
+  propfind: "Net  PROPFIND\nthe only listing that makes the caller wait —\nwe have nothing to serve, so there is no choice" {
+    class: io
+  }
+  reconcile: "DbWrite  reconcile_children" {
+    class: db
+  }
+  stale: "stale? (revalidate interval, push floor,\nor a write of ours invalidated it)" {
+    class: decide
+  }
+  schedule: "the machine schedules a re-listing nobody waits for\n(Intent::Relist). A second listing someone *is*\nwaiting for joins this one; a second refresh is\ndropped, so autosave cannot queue one per keystroke" {
+    class: decide
+  }
+  serve: "serve the cached listing now\na slow PROPFIND must never block\nsomeone else's tab-completion" {
+    class: decide
+  }
+  done: "done — back to the calling script" {
+    class: decide
+  }
+
+  drain -> loaded
+  loaded -> propfind: "never"
+  propfind -> reconcile
+  reconcile -> done
+  loaded -> stale: "yes"
+  stale -> schedule: "yes"
+  stale -> serve: "no"
+  schedule -> serve
+  serve -> done
+}
+
+lookup.load -> ensure: "" {style.stroke-dash: 3}
+readdir.load -> ensure: "" {style.stroke-dash: 3}

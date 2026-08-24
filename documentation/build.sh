@@ -14,9 +14,17 @@ cd "$(dirname "$0")"
 
 # Diagrams are pre-rendered committed SVGs (see diagrams/ and `mise run
 # docs-diagrams`), so this build needs nothing beyond antora — no server.
+#
+# That independence is worth keeping, but it means the build would happily embed
+# an SVG that no longer matches its source. check-diagrams.sh closes that hole
+# using hashes alone, so it costs the build nothing and needs no d2.
 
 case "${1:-build}" in
   watch)
+    # A stale diagram only warns here: live editing must not be blocked by a
+    # picture the author may be in the middle of changing.
+    ./check-diagrams.sh || echo "build.sh: continuing anyway (watch mode)" >&2
+
     # Live preview: initial build, then serve over HTTP with the default browser
     # opened and auto-reload, while rebuilding on source change (event-driven).
     antora antora-playbook.yml
@@ -34,10 +42,20 @@ case "${1:-build}" in
       --exts adoc,yml,hbs,css,js,svg -- antora antora-playbook.yml
     ;;
   build)
+    # An official build refuses to ship pictures that no longer match their
+    # source. This is also what makes the Pages workflow catch it.
+    ./check-diagrams.sh
     antora antora-playbook.yml
     ;;
+  site)
+    # The published, multi-version site: the default branch as "latest" plus each
+    # release tag as its number (antora-playbook-site.yml). Needs the repo's full
+    # history and tags — the Pages workflow fetches them. Same diagram guard.
+    ./check-diagrams.sh
+    antora antora-playbook-site.yml
+    ;;
   *)
-    echo "Usage: $0 [build|watch]" >&2
+    echo "Usage: $0 [build|watch|site]" >&2
     exit 1
     ;;
 esac

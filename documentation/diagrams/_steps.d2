@@ -1,0 +1,47 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 IT Beratung Hermann GmbH
+#
+# Shared step vocabulary for the per-operation FSM diagrams (fsm-op-*.d2).
+#
+# Not a diagram: the leading underscore keeps `mise run docs-diagrams` from
+# rendering it. The other files pull it in with `...@_steps`.
+#
+# One colour per *executing thread*, matching arch-overview.d2 and
+# fsm-dispatch.d2. That is the whole point of the coding: a reader can see at a
+# glance which steps the FSM thread runs (green — decisions only) and which ones
+# it hands away (amber, purple — where blocking is allowed).
+
+classes: {
+  # Blue — the kernel and the dispatch threads: where a request enters and
+  # where the reply is written. Never the FSM thread.
+  edge: {
+    style: {fill: "#EAF1FB"; stroke: "#B7BECC"}
+  }
+  # Green — the FSM thread itself. A pure decision: no disk, no database, no
+  # network, no clock.
+  decide: {
+    style: {fill: "#E9F6EE"; stroke: "#B7CBBE"}
+  }
+  # Amber — DB reader/writer threads (DbRead / DbWrite jobs).
+  db: {
+    style: {fill: "#FBF3E3"; stroke: "#D8CBA9"}
+  }
+  # Purple — I/O workers (Net / FileIo jobs). Here it may block.
+  io: {
+    style: {fill: "#F0EBFA"; stroke: "#C4B9D8"}
+  }
+  # Neutral — in-memory FSM state (the scratch map, the ignored set, the
+  # per-inode clipboard). Touching it is free; it is not I/O.
+  state: {
+    style: {fill: "#F4F5F9"; stroke: "#C6CBD6"}
+  }
+  # Pink — the error exit, Fail(errno).
+  fail: {
+    style: {fill: "#FBEAF0"; stroke: "#D8B6C4"}
+  }
+  # Dashed — designed but not implemented, so nobody mistakes the picture for
+  # shipped behaviour.
+  planned: {
+    style: {fill: "#FBFBFD"; stroke: "#C6CBD6"; stroke-dash: 4}
+  }
+}

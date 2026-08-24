@@ -49,6 +49,63 @@ pub async fn fetch(
     Ok(parse_server_info(&text))
 }
 
+/// The authenticated account's canonical **user id**, via OCS
+/// `/cloud/user`.
+///
+/// This is *not* the same as the `loginName` the login flow returns: that is
+/// whatever credential the user signed in with in the browser (an email, at
+/// providers that log in by email), while the user id is the account's own
+/// identifier. The distinction matters because Nextcloud's chunked-upload
+/// endpoint `/remote.php/dav/uploads/<user>/` requires the exact user id and
+/// rejects a login alias with 403 — unlike `/dav/files/<user>/`, which resolves
+/// the alias. So the DAV path segment must be built from this, not from the
+/// login name (see [`crate::webdav::WebDavClient::with_dav_user`]).
+pub async fn whoami(
+    client: &reqwest::Client,
+    server_url: &str,
+    login: &str,
+    password: &str,
+) -> Result<String> {
+    let url = format!(
+        "{}/ocs/v2.php/cloud/user?format=json",
+        server_url.trim_end_matches('/')
+    );
+    let text = client
+        .get(&url)
+        .basic_auth(login, Some(password))
+        .header("OCS-APIRequest", "true")
+        .header("Accept", "application/json")
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+    parse_user_id(&text)
+        .ok_or_else(|| crate::Error::Other("the OCS user response carried no id".into()))
+}
+
+/// Pull `ocs.data.id` out of a `/cloud/user` payload, if present and non-empty.
+fn parse_user_id(json: &str) -> Option<String> {
+    #[derive(Deserialize)]
+    struct Root {
+        ocs: Ocs,
+    }
+    #[derive(Deserialize)]
+    struct Ocs {
+        data: Data,
+    }
+    #[derive(Deserialize)]
+    struct Data {
+        id: Option<String>,
+    }
+    serde_json::from_str::<Root>(json)
+        .ok()?
+        .ocs
+        .data
+        .id
+        .filter(|s| !s.is_empty())
+}
+
 /// Extract version + notify_push endpoint from a capabilities JSON payload.
 fn parse_server_info(json: &str) -> ServerInfo {
     match serde_json::from_str::<Root>(json) {
@@ -129,5 +186,21 @@ mod tests {
     fn garbage_yields_empty() {
         let info = parse_server_info("not json");
         assert!(info.version.is_none() && info.push_websocket.is_none());
+    }
+
+    #[test]
+    fn extracts_the_user_id() {
+        // The id differs from the email the account may log in with — which is
+        // exactly the case the DAV path must use the id for.
+        let json = r#"{"ocs":{"meta":{"status":"ok"},"data":{
+          "id":"apawle","email":"alexander.pawle@itbh.at","displayname":"A. Pawle"}}}"#;
+        assert_eq!(parse_user_id(json).as_deref(), Some("apawle"));
+    }
+
+    #[test]
+    fn missing_or_empty_id_is_none() {
+        assert!(parse_user_id(r#"{"ocs":{"data":{"email":"x@y.z"}}}"#).is_none());
+        assert!(parse_user_id(r#"{"ocs":{"data":{"id":""}}}"#).is_none());
+        assert!(parse_user_id("not json").is_none());
     }
 }
