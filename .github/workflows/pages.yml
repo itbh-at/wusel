@@ -9,10 +9,18 @@ name: Docs
 on:
   push:
     branches: [main]
-    # A release tag adds a version to the site, and the site is only rebuilt by
-    # the events listed here — without this, a release's documentation is
-    # missing from the version selector until the next push to main.
-    tags: ["v*"]
+  # A release adds a version to the site, and the site is only rebuilt by the
+  # events listed here — without this, a release's documentation is missing from
+  # the version selector until the next push to main. Triggering on the tag
+  # itself does not work: the build succeeds, but the `github-pages` environment
+  # only accepts branches as a deployment source and rejects a tag ref. A
+  # `workflow_run` event runs against the default branch, which it accepts, and
+  # the site is built from every ref in the repository regardless of which one
+  # is checked out — so building from main after the release picks up the new
+  # tag just the same.
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
   pull_request:
   workflow_dispatch:
 
@@ -44,6 +52,9 @@ jobs:
     name: build (Antora)
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # A release that failed has nothing to publish documentation for. Every other
+    # trigger runs unconditionally.
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     steps:
       # Pinned to a commit SHA — see the note in ci.yml.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
