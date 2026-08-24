@@ -2,7 +2,7 @@
 Type=Application
 Name=Wusel (Nextcloud)
 Comment=Nextcloud files via Wusel
-Icon=folder-remote
+Icon=at.itbh.Wusel
 # Launching (grid icon or the search header) opens the DEFAULT mount point
 # (~/Wusel). A .desktop Exec cannot read config.toml, so with a custom
 # `[mount] point` there, adjust the path below to match.
