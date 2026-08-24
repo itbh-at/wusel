@@ -74,10 +74,20 @@ NET_IF="${NET_IF:-eth0}"
 # machine's kernel, probe once: add a qdisc and take it away again.
 SHAPING=1
 probe_shaping() {
+    # Both halves, because they fail for different reasons and only one of them
+    # is obvious. The root qdisc usually goes on fine; the *ingress* one is the
+    # one that collides — a machine already running containers tends to carry a
+    # `clsact` qdisc there, and ingress and clsact are mutually exclusive, which
+    # the kernel reports as "Exclusivity flag on, cannot modify". Probing only
+    # the root qdisc says yes and then the run dies at the second step.
     if ! $PRIV tc qdisc add dev "$NET_IF" root netem delay 1ms >/dev/null 2>&1; then
         SHAPING=0
         return
     fi
+    if ! $PRIV tc qdisc add dev "$NET_IF" handle ffff: ingress >/dev/null 2>&1; then
+        SHAPING=0
+    fi
+    $PRIV tc qdisc del dev "$NET_IF" ingress >/dev/null 2>&1 || true
     $PRIV tc qdisc del dev "$NET_IF" root >/dev/null 2>&1 || true
 }
 
