@@ -82,6 +82,12 @@ covered without a keyring at all.
   `mise run e2e-local` (podman); in CI it is the *E2E* workflow, see below. The
   local run uses one server — override it with
   `NC_IMAGE=nextcloud:33-apache mise run e2e-local` to reproduce a matrix leg.
++
+The responsiveness checks throttle the link with `tc`, which needs NET_ADMIN and
+an interface whose root qdisc can be displaced. The dev container has both; a CI
+runner has neither, so there those steps are *skipped* — announced as loudly as a
+failure would be, and counted in the closing line. They are a local tier by
+design, not a gap that crept in.
   Anything the script still cannot cover — live `notify_push`, the desktop
   integration in a real session — stays a manual check against our own instance
   (see xref:trying-it-out.adoc[Trying it out]).
