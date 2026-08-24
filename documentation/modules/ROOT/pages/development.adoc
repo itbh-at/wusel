@@ -79,7 +79,9 @@ covered without a keyring at all.
   write/upload, pin, and the opt-in 3-way merge on a genuine 412 conflict. This
   is the tier a mock cannot stand in for (ETag propagation, chunked-upload NG,
   the server's own conditional-request behaviour). Run it locally with
-  `mise run e2e-local` (podman); in CI it is the *E2E* workflow, see below.
+  `mise run e2e-local` (podman); in CI it is the *E2E* workflow, see below. The
+  local run uses one server — override it with
+  `NC_IMAGE=nextcloud:33-apache mise run e2e-local` to reproduce a matrix leg.
   Anything the script still cannot cover — live `notify_push`, the desktop
   integration in a real session — stays a manual check against our own instance
   (see xref:trying-it-out.adoc[Trying it out]).
@@ -102,8 +104,14 @@ checkout — there is no separate CI script to keep in sync.
 
 | *E2E* (`e2e.yml`)
 | nightly, plus manual dispatch
-| The real-Nextcloud end-to-end run above. It is gated on the *code* having
-  changed since the last successful run, so a docs-only day costs nothing.
+| The real-Nextcloud end-to-end run above, across the *three newest maintained
+  Nextcloud majors*. Which those are is discovered from Docker Hub at run time,
+  not written into the workflow, so a new Nextcloud release joins the matrix on
+  its own. Only the newest is binding: the older two are run and reported, but
+  a failure there does not turn the workflow red — a red build has to mean
+  "we are broken", not "an old server is". Gated on the *code* or one of the
+  *image digests* having changed since the last successful run, so a docs-only
+  day costs nothing while a Nextcloud patch release re-arms the run.
 
 | *Docs* (`pages.yml`)
 | every push to `main` and every pull request

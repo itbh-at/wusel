@@ -7,6 +7,7 @@
 **Nextcloud, woven into your desktop.**
 
 [![CI](https://github.com/itbh-at/wusel/actions/workflows/ci.yml/badge.svg)](https://github.com/itbh-at/wusel/actions/workflows/ci.yml)
+[![E2E](https://github.com/itbh-at/wusel/actions/workflows/e2e.yml/badge.svg)](https://github.com/itbh-at/wusel/actions/workflows/e2e.yml)
 
 A virtual filesystem for Nextcloud, written in Rust — **VFS-first**: files are
 "online only" by default and are only fetched on access (on-demand hydration),
@@ -50,6 +51,23 @@ Full walkthrough:
 [Installation](documentation/modules/ROOT/pages/installation.adoc). To build from
 source instead, see [Trying it
 out](documentation/modules/ROOT/pages/trying-it-out.adoc).
+
+### Which Nextcloud versions
+
+Every night, `wusel` is tested against a **real Nextcloud server** — a full run
+of mount, read, write, upload and 3-way merge, not a mocked API. The versions are
+not written down anywhere: the workflow asks Docker Hub which majors are current
+and tests the newest three, so a new Nextcloud release enters the matrix by
+itself.
+
+| Nextcloud | |
+|---|---|
+| newest maintained major (currently **34**) | binding — the E2E badge above turns red if it breaks |
+| the two before it (currently **33**, **32**) | tested and reported, but never fail the build |
+
+Older majors are outside Nextcloud's own maintenance and are not tested. Which
+majors ran, and how each fared, is in the summary of the latest
+[E2E run](https://github.com/itbh-at/wusel/actions/workflows/e2e.yml).
 
 ## Crates
 

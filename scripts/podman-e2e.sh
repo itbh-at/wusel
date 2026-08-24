@@ -20,12 +20,16 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 IMAGE="wusel-dev"
 NET="wusel-e2e-net"
 NC="wusel-e2e-nc" # also the Host header -> must be a trusted domain (below)
-# Pinned to a major tag, not `latest`: an unpinned upstream image turns "green
-# yesterday, red today" into a mystery with no code change behind it. A major tag
-# still picks up Nextcloud's patch releases — which is what a server E2E should
-# track — while a surprise major upgrade never lands unannounced. Keep in sync
-# with the `nextcloud` service in .github/workflows/e2e.yml.
-NC_IMAGE="nextcloud:34-apache"
+# A major tag, not `latest`: an unpinned upstream image turns "green yesterday,
+# red today" into a mystery with no code change behind it. A major tag still
+# picks up Nextcloud's patch releases — which is what a server E2E should track —
+# while a surprise major upgrade never lands unannounced.
+#
+# CI discovers the maintained majors from Docker Hub and runs all of them; this
+# is the single-server local counterpart, so it names one and lets you point at
+# another without editing the file:
+#   NC_IMAGE=nextcloud:33-apache mise run e2e-local
+NC_IMAGE="${NC_IMAGE:-nextcloud:34-apache}"
 
 # Locate the repo as the VM sees it (direct share, or an rsync mirror as the
 # fallback) — sets WORK and MIRRORED. Shared logic: scripts/podman-lib.sh.
