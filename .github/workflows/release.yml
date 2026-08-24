@@ -4,6 +4,7 @@
 # Build the Fedora RPM for x86_64 and aarch64 and attach both to a GitHub
 # Release. Triggered by a version tag:
 #   git tag v0.1.0 && git push github v0.1.0
+# Or run from the Actions tab to build the packages without releasing them.
 # The RPM version comes from the workspace manifest, the release page's name from
 # the tag. Those are two independent sources, so the rpm job asserts they agree
 # (EXPECT_VERSION -> build-rpm.sh) before anything is built or published;
@@ -15,6 +16,12 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # The packaging path is the most expensive and least exercised code in the
+  # project: it only ever ran on a tag, so a change to the spec file, the build
+  # script or an action it depends on was first tried during a release. Running
+  # it by hand builds the RPMs and leaves them as run artifacts without creating
+  # a release, so packaging can be verified before it matters.
+  workflow_dispatch:
 
 # Read-only by default. Only `release` creates the release and uploads the
 # assets. The rpm job runs as root in a container, dnf-installs, compiles the
@@ -52,8 +59,10 @@ jobs:
     timeout-minutes: 60
     env:
       # The tag/manifest guard: build-rpm.sh refuses to build anything if the
-      # packaged version does not match the tag that triggered this run.
-      EXPECT_VERSION: ${{ github.ref_name }}
+      # packaged version does not match the tag that triggered this run. A manual
+      # run has no tag to agree with, so it passes nothing and the guard stands
+      # down — build-rpm.sh skips the comparison when this is empty.
+      EXPECT_VERSION: ${{ github.event_name == 'push' && github.ref_name || '' }}
     steps:
       # Native Fedora build deps (git for checkout; the rest for build-rpm.sh).
       - name: Install build dependencies
@@ -99,6 +108,9 @@ jobs:
 
   release:
     name: publish release
+    # Only a tag publishes. A manual run stops after the RPMs are built and
+    # attached to the run, which is the whole point of being able to try it.
+    if: github.event_name == 'push'
     needs: rpm
     runs-on: ubuntu-latest
     timeout-minutes: 15
