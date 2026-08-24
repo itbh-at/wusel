@@ -19,8 +19,7 @@ fn synchronous_upload_reaches_the_server_before_flush_returns() {
     common::xdg_sandbox(&base);
     // Configure this account for synchronous write-back before the engine reads
     // its settings.
-    let cfg_dir =
-        std::path::PathBuf::from(std::env::var("XDG_CONFIG_HOME").unwrap()).join("wusel");
+    let cfg_dir = std::path::PathBuf::from(std::env::var("XDG_CONFIG_HOME").unwrap()).join("wusel");
     std::fs::create_dir_all(&cfg_dir).unwrap();
     std::fs::write(cfg_dir.join("config.toml"), "[sync]\nupload = \"sync\"\n").unwrap();
 

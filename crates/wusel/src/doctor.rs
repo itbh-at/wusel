@@ -124,6 +124,7 @@ struct Report {
     daemon: Daemon,
     mount: Mount,
     engine: Engine,
+    recheck: Recheck,
     config: ConfigInfo,
     connectivity: Connectivity,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -165,6 +166,10 @@ struct System {
 struct Daemon {
     /// Every `wusel` process, so a stray one next to the mount daemon shows up.
     processes: Vec<Process>,
+    /// The unit actually asked about. Recorded rather than assumed: the service
+    /// is a *template*, and asking about the wrong name is how this section came
+    /// to report a running mount as dead (see [`unit_for`]).
+    unit: Option<String>,
     systemd: Option<String>,
 }
 
@@ -221,6 +226,35 @@ struct Engine {
     report: Option<DiagReport>,
 }
 
+/// The second look at the mount, taken [`RECHECK_AFTER`] later.
+///
+/// The wedge check needs it. Its first version compared two counters from a
+/// single instant — the kernel's `waiting` against the daemon's parked replies —
+/// and those two are equal for every request that is merely *in flight*: the
+/// frontend parks a reply handle the moment a request arrives, long before
+/// anything can go wrong with it. So the check fired on any busy mount, and the
+/// branch that was meant to say "ordinary load" could only be reached in the
+/// narrow race where the daemon had not parked the reply yet.
+///
+/// What separates a wedge from load is time, not arithmetic. Work that moves
+/// between two samples is load; the *same* job still handed out to a worker
+/// after a pause, or a parked reply with nothing running behind it, is a wedge.
+#[derive(Serialize, Default)]
+struct Recheck {
+    /// False when the first pass found nothing in flight and nothing waiting, so
+    /// no second sample was needed — an idle mount stays instant.
+    taken: bool,
+    /// How long after the first pass this was sampled.
+    after_ms: u64,
+    /// Whether the daemon answered the second time, so a daemon that died
+    /// between the samples is not read as "the work finished".
+    engine_answered: bool,
+    waiting: Option<u64>,
+    replies_pending: Option<usize>,
+    /// One entry per job still handed out to a worker; see [`outstanding_keys`].
+    outstanding: Vec<String>,
+}
+
 #[derive(Serialize, Default)]
 struct ConfigInfo {
     server: Option<String>,
@@ -251,19 +285,21 @@ impl Report {
             .clone()
             .unwrap_or_else(|| account.default_mountpoint());
 
+        let unit = unit_for(&opts.account);
         let system = probe_system();
-        let daemon = probe_daemon();
+        let daemon = probe_daemon(unit.as_deref());
         let mount = probe_mount(&mountpoint, &red);
         let engine = probe_engine(&mountpoint);
+        let recheck = probe_recheck(&mountpoint, &mount, &engine);
         let config = probe_config(&account, &settings, &mountpoint, &red);
         let connectivity = probe_connectivity(&config);
         let logs = if opts.no_logs {
             None
         } else {
-            Some(probe_logs(&red))
+            Some(probe_logs(unit.as_deref(), &red))
         };
 
-        let findings = derive_findings(&daemon, &mount, &engine, &config);
+        let findings = derive_findings(&daemon, &mount, &engine, &recheck, &config);
 
         Report {
             tool: Tool {
@@ -277,6 +313,7 @@ impl Report {
             daemon,
             mount,
             engine,
+            recheck,
             config,
             connectivity,
             logs,
@@ -316,7 +353,7 @@ fn probe_system() -> System {
     }
 }
 
-fn probe_daemon() -> Daemon {
+fn probe_daemon(unit: Option<&str>) -> Daemon {
     let mut processes = Vec::new();
     for pid in wusel_pids() {
         let cmdline = read_trim(format!("/proc/{pid}/cmdline"))
@@ -344,22 +381,53 @@ fn probe_daemon() -> Daemon {
             thread_waits,
         });
     }
-    // Best-effort systemd view; the unit is "wusel" for the default account.
-    let systemd = run_cmd(
-        "systemctl",
-        &["--user", "show", "-p", "ActiveState,SubState,NRestarts", "wusel"],
-    )
-    .map(|s| s.replace('\n', ", "));
+    // Best-effort systemd view, for the account's *instance*. Asking about
+    // "wusel" instead reports the bare template — which is never active — so a
+    // running mount looked stopped. See [`unit_for`].
+    let systemd = unit.and_then(|unit| {
+        run_cmd(
+            "systemctl",
+            &[
+                "--user",
+                "show",
+                "-p",
+                "ActiveState,SubState,NRestarts",
+                unit,
+            ],
+        )
+        .map(|s| s.replace('\n', ", "))
+    });
     Daemon {
         processes,
+        unit: unit.map(str::to_string),
         systemd,
     }
+}
+
+/// The systemd unit for an account, or `None` when the account cannot name one.
+///
+/// The service is a template — `wusel@<account>.service` — and every probe here
+/// used the bare template name `wusel`. systemd answers about that quite
+/// happily: `ActiveState=inactive, SubState=dead`, for a mount that is running.
+/// The journal probe had the same bug and was worse, because it failed
+/// *silently*: `journalctl --user -u wusel` matches nothing, so every support
+/// bundle carried "-- No entries --" and the most useful part of the report was
+/// missing without saying so.
+///
+/// The naming rule lives in one place ([`crate::instance_name`]) and is reused
+/// rather than repeated, so an account systemd cannot name is rejected here the
+/// same way `wusel service enable` rejects it.
+fn unit_for(account: &str) -> Option<String> {
+    crate::instance_name(account).ok()
 }
 
 /// Every `wusel` process id. `pidof` first; a `/proc` scan as the fallback.
 fn wusel_pids() -> Vec<i32> {
     if let Some(out) = run_cmd("pidof", &["wusel"]) {
-        let pids: Vec<i32> = out.split_whitespace().filter_map(|s| s.parse().ok()).collect();
+        let pids: Vec<i32> = out
+            .split_whitespace()
+            .filter_map(|s| s.parse().ok())
+            .collect();
         if !pids.is_empty() {
             return pids;
         }
@@ -423,7 +491,10 @@ fn probe_mount(mountpoint: &Path, red: &Redactor) -> Mount {
             if !is_wusel {
                 continue;
             }
-            let connection = devno.split_once(':').and_then(|(_, m)| m.parse().ok()).unwrap_or(0);
+            let connection = devno
+                .split_once(':')
+                .and_then(|(_, m)| m.parse().ok())
+                .unwrap_or(0);
             entries.push(MountEntry {
                 mountpoint: red.s(mp),
                 fstype: (*fstype).to_string(),
@@ -505,6 +576,58 @@ fn probe_engine(mountpoint: &Path) -> Engine {
     }
 }
 
+/// How long to wait before the second sample. Long enough that ordinary work has
+/// moved on — a range GET or a PROPFIND against a healthy server is far shorter —
+/// and short enough that `doctor` stays a command you run without thinking about
+/// it. It is only ever paid when the first pass found something in flight.
+const RECHECK_AFTER: Duration = Duration::from_secs(2);
+
+/// The identity of a job handed out to a worker: which object, which intent,
+/// which step. Two samples sharing one of these are looking at the *same* job,
+/// and that — not any count — is what tells a wedge from a busy mount.
+///
+/// Name-free, like the snapshot it reads: an inode number and two work kinds.
+fn outstanding_keys(report: Option<&DiagReport>) -> Vec<String> {
+    let Some(report) = report else {
+        return Vec::new();
+    };
+    report
+        .machine
+        .objects
+        .iter()
+        .filter(|o| o.outstanding)
+        .map(|o| format!("inode {} {}/{}", o.object, o.intent, o.step))
+        .collect()
+}
+
+/// Sample the mount a second time, so the wedge check has a before and an after.
+/// See [`Recheck`] for why one sample cannot answer the question.
+fn probe_recheck(mountpoint: &Path, mount: &Mount, engine: &Engine) -> Recheck {
+    let waiting: u64 = mount.connections.iter().filter_map(|c| c.waiting).sum();
+    let busy = !outstanding_keys(engine.report.as_ref()).is_empty();
+    // Nothing waiting and nothing running: there is no wedge to rule out, so a
+    // healthy mount is not made two seconds slower to prove it.
+    if waiting == 0 && !busy {
+        return Recheck::default();
+    }
+    std::thread::sleep(RECHECK_AFTER);
+    let again = probe_engine(mountpoint);
+    let waiting_now = mount
+        .connections
+        .iter()
+        .filter_map(|c| read_trim(format!("/sys/fs/fuse/connections/{}/waiting", c.id)))
+        .filter_map(|s| s.parse::<u64>().ok())
+        .sum();
+    Recheck {
+        taken: true,
+        after_ms: u64::try_from(RECHECK_AFTER.as_millis()).unwrap_or(u64::MAX),
+        engine_answered: again.report.is_some(),
+        waiting: Some(waiting_now),
+        replies_pending: again.report.as_ref().and_then(|r| r.replies_pending),
+        outstanding: outstanding_keys(again.report.as_ref()),
+    }
+}
+
 fn read_socket(path: &Path) -> std::io::Result<String> {
     let mut stream = UnixStream::connect(path)?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
@@ -554,7 +677,10 @@ fn probe_connectivity(config: &ConfigInfo) -> Connectivity {
     let is_http = server.starts_with("http://");
     let authority = rest.split('/').next().unwrap_or(rest);
     let (host, port) = match authority.rsplit_once(':') {
-        Some((h, p)) => (h.to_string(), p.parse().unwrap_or(if is_http { 80 } else { 443 })),
+        Some((h, p)) => (
+            h.to_string(),
+            p.parse().unwrap_or(if is_http { 80 } else { 443 }),
+        ),
         None => (authority.to_string(), if is_http { 80 } else { 443 }),
     };
     let mut conn = Connectivity {
@@ -572,25 +698,62 @@ fn probe_connectivity(config: &ConfigInfo) -> Connectivity {
         .unwrap_or(false);
     conn.tcp_reachable = Some(reachable);
     conn.detail = Some(if reachable {
-        format!("TCP connect to {host}:{port} ok ({} ms)", started.elapsed().as_millis())
+        format!(
+            "TCP connect to {host}:{port} ok ({} ms)",
+            started.elapsed().as_millis()
+        )
     } else {
         format!("TCP connect to {host}:{port} failed")
     });
     conn
 }
 
-fn probe_logs(red: &Redactor) -> Vec<String> {
-    run_cmd(
+fn probe_logs(unit: Option<&str>, red: &Redactor) -> Vec<String> {
+    let Some(unit) = unit else {
+        return vec!["(this account cannot name a systemd unit — no journal to read)".into()];
+    };
+    let lines: Vec<String> = run_cmd(
         "journalctl",
-        &["--user", "-u", "wusel", "-n", "200", "--no-pager", "-o", "short-iso"],
+        &[
+            "--user",
+            "-u",
+            unit,
+            "-n",
+            "200",
+            "--no-pager",
+            "-o",
+            "short-iso",
+        ],
     )
     .map(|s| s.lines().map(|l| red.s(l)).collect())
-    .unwrap_or_else(|| vec!["(journalctl unavailable or no user journal for the unit)".into()])
+    .unwrap_or_default();
+    // `journalctl` answers a unit it has never heard of with a literal
+    // "-- No entries --" and exit 0 — indistinguishable, to a naive check, from
+    // a daemon that has simply been quiet. That is precisely how the wrong unit
+    // name stayed invisible, so the sentinel is treated as nothing.
+    let meaningful = lines
+        .iter()
+        .any(|l| !matches!(l.trim(), "" | "-- No entries --"));
+    if !meaningful {
+        // Say which unit came up empty. The previous version asked about a name
+        // that can never match and reported the result as though the daemon had
+        // simply been quiet.
+        return vec![format!(
+            "(no journal entries for {unit} — the unit may never have been started, or the daemon runs outside systemd)"
+        )];
+    }
+    lines
 }
 
 // --- Findings: the PASS/WARN/FAIL layer -------------------------------------
 
-fn derive_findings(daemon: &Daemon, mount: &Mount, engine: &Engine, config: &ConfigInfo) -> Vec<Finding> {
+fn derive_findings(
+    daemon: &Daemon,
+    mount: &Mount,
+    engine: &Engine,
+    recheck: &Recheck,
+    config: &ConfigInfo,
+) -> Vec<Finding> {
     let mut f = Vec::new();
     macro_rules! add {
         ($level:expr, $section:expr, $message:expr $(,)?) => {
@@ -605,7 +768,11 @@ fn derive_findings(daemon: &Daemon, mount: &Mount, engine: &Engine, config: &Con
         .filter(|p| p.cmdline.contains(" mount"))
         .count();
     match mount_daemons {
-        0 => add!("FAIL", "daemon", "no `wusel mount` process is running".into()),
+        0 => add!(
+            "FAIL",
+            "daemon",
+            "no `wusel mount` process is running".into()
+        ),
         1 => add!("PASS", "daemon", "the mount daemon is running".into()),
         n => add!(
             "WARN",
@@ -626,35 +793,93 @@ fn derive_findings(daemon: &Daemon, mount: &Mount, engine: &Engine, config: &Con
         );
     }
 
-    // The headline check: unanswered FUSE requests.
+    // The headline check: unanswered FUSE requests — and whether they are
+    // unanswered because the mount is wedged or because it is working. Only the
+    // two samples can tell those apart; see [`Recheck`].
     let waiting: u64 = mount.connections.iter().filter_map(|c| c.waiting).sum();
-    if waiting > 0 {
-        let parked = engine.report.as_ref().and_then(|r| r.replies_pending);
-        match parked {
-            Some(p) if p >= waiting as usize && waiting > 0 => add!(
+    let before = outstanding_keys(engine.report.as_ref());
+    let parked_before = engine
+        .report
+        .as_ref()
+        .and_then(|r| r.replies_pending)
+        .unwrap_or(0);
+    let secs = recheck.after_ms as f64 / 1000.0;
+    if waiting == 0 {
+        add!("PASS", "mount", "no FUSE requests are stuck waiting".into());
+    } else if !recheck.taken || !recheck.engine_answered {
+        // Either the first pass ruled a second sample out (it cannot, with
+        // `waiting > 0`) or the daemon stopped answering between the two. Both
+        // leave the question open, and saying so beats guessing either way.
+        add!(
+            "WARN",
+            "mount",
+            format!(
+                "{waiting} FUSE request(s) waiting, and no second sample of the daemon's state to compare against — load and a stall cannot be told apart"
+            ),
+        );
+    } else if recheck.waiting == Some(0) {
+        add!(
+            "PASS",
+            "mount",
+            format!("{waiting} FUSE request(s) were waiting and none {secs:.0} s later — the mount is working through them"),
+        );
+    } else {
+        let stuck: Vec<&str> = recheck
+            .outstanding
+            .iter()
+            .filter(|k| before.contains(k))
+            .map(String::as_str)
+            .collect();
+        let parked_after = recheck.replies_pending.unwrap_or(0);
+        if !stuck.is_empty() {
+            add!(
                 "FAIL",
                 "mount",
                 format!(
-                    "{waiting} FUSE request(s) waiting and {p} repl(y/ies) parked — the mount looks wedged (a reply never sent). This is the class of failure doctor exists to catch."
+                    "the same job is still outstanding {secs:.0} s later ({}) while {waiting} FUSE request(s) wait — the mount is wedged. This is the class of failure doctor exists to catch.",
+                    stuck.join(", ")
                 ),
-            ),
-            _ => add!(
-                "WARN",
+            );
+        } else if before.is_empty()
+            && recheck.outstanding.is_empty()
+            && parked_before > 0
+            && parked_after > 0
+        {
+            // The other shape of the same bug: the flow is long gone, yet a reply
+            // is still parked and the kernel is still waiting for it. That is a
+            // reply that was never sent, and the locked page behind it will not
+            // come back on its own.
+            add!(
+                "FAIL",
                 "mount",
-                format!("{waiting} FUSE request(s) waiting for the daemon — may be ordinary load, or a stall"),
-            ),
+                format!(
+                    "{waiting} FUSE request(s) waiting and {parked_after} repl(y/ies) still parked {secs:.0} s later, with no job running behind them — a reply was never sent. This is the class of failure doctor exists to catch."
+                ),
+            );
+        } else {
+            add!(
+                "PASS",
+                "mount",
+                format!("{waiting} FUSE request(s) waiting, but the work moved on within {secs:.0} s — ordinary load, not a stall"),
+            );
         }
-    } else {
-        add!("PASS", "mount", "no FUSE requests are stuck waiting".into());
     }
 
     // Responsiveness. A TIMEOUT is the wedged signature and a real FAIL; a plain
     // read error usually just means the mount is not up, which the daemon check
     // already reports — so it is only informational here.
     match mount.responsive.as_deref() {
-        Some(s) if s.starts_with("ok") => add!("PASS", "mount", format!("mountpoint responds ({s})")),
-        Some(s) if s.contains("TIMEOUT") => add!("FAIL", "mount", format!("mountpoint wedged: {s}")),
-        Some(s) => add!("INFO", "mount", format!("mountpoint not readable — likely not mounted: {s}")),
+        Some(s) if s.starts_with("ok") => {
+            add!("PASS", "mount", format!("mountpoint responds ({s})"))
+        }
+        Some(s) if s.contains("TIMEOUT") => {
+            add!("FAIL", "mount", format!("mountpoint wedged: {s}"))
+        }
+        Some(s) => add!(
+            "INFO",
+            "mount",
+            format!("mountpoint not readable — likely not mounted: {s}")
+        ),
         None => {}
     }
 
@@ -672,12 +897,17 @@ fn derive_findings(daemon: &Daemon, mount: &Mount, engine: &Engine, config: &Con
                 format!("{stuck} object(s) with a job in flight — see the engine section"),
             );
         }
-        add!("PASS", "engine", "the daemon served its internal state".into());
+        add!(
+            "PASS",
+            "engine",
+            "the daemon served its internal state".into()
+        );
     } else {
         add!(
             "WARN",
             "engine",
-            "the daemon's diagnostics socket was unavailable — internal state could not be read".into(),
+            "the daemon's diagnostics socket was unavailable — internal state could not be read"
+                .into(),
         );
     }
 
@@ -686,7 +916,8 @@ fn derive_findings(daemon: &Daemon, mount: &Mount, engine: &Engine, config: &Con
         add!(
             "WARN",
             "config",
-            "the state database is on a network filesystem — SQLite cannot lock reliably there".into(),
+            "the state database is on a network filesystem — SQLite cannot lock reliably there"
+                .into(),
         );
     }
 
@@ -699,7 +930,10 @@ impl Report {
     fn to_text(&self) -> String {
         let mut o = String::new();
         let line = "=".repeat(72);
-        o.push_str(&format!("{line}\n{} {}\n{line}\n", self.tool.name, self.tool.version));
+        o.push_str(&format!(
+            "{line}\n{} {}\n{line}\n",
+            self.tool.name, self.tool.version
+        ));
         o.push_str(&format!("account: {}\n", self.tool.account));
         if self.tool.redacted {
             o.push_str(
@@ -724,7 +958,10 @@ impl Report {
         }
         o.push_str(&format!("  {fail} FAIL   {warn} WARN   {pass} PASS\n"));
         for x in &self.findings {
-            o.push_str(&format!("  [{:>4}] {}: {}\n", x.level, x.section, x.message));
+            o.push_str(&format!(
+                "  [{:>4}] {}: {}\n",
+                x.level, x.section, x.message
+            ));
         }
 
         o.push_str(&section("SYSTEM"));
@@ -734,6 +971,7 @@ impl Report {
         push_kv(&mut o, "session", self.system.session_type.as_deref());
 
         o.push_str(&section("DAEMON"));
+        push_kv(&mut o, "unit", self.daemon.unit.as_deref());
         push_kv(&mut o, "systemd", self.daemon.systemd.as_deref());
         for p in &self.daemon.processes {
             o.push_str(&format!(
@@ -741,8 +979,12 @@ impl Report {
                 p.pid,
                 short_cmd(&p.cmdline),
                 p.state.as_deref().unwrap_or("?"),
-                p.threads.map(|n| n.to_string()).unwrap_or_else(|| "?".into()),
-                p.rss_kb.map(|k| format!("{k} kB")).unwrap_or_else(|| "?".into()),
+                p.threads
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "?".into()),
+                p.rss_kb
+                    .map(|k| format!("{k} kB"))
+                    .unwrap_or_else(|| "?".into()),
                 p.cmdline,
             ));
             if !p.thread_waits.is_empty() {
@@ -784,6 +1026,20 @@ impl Report {
             if let Some(p) = r.replies_pending {
                 o.push_str(&format!("  replies_pending={p}\n"));
             }
+            if !r.hydrating.is_empty() {
+                // Background whole-file downloads. They never become flows, so
+                // they are absent from the object list below — without this line
+                // the engine reads as idle while it is pulling megabytes.
+                o.push_str(&format!(
+                    "  hydrating {} file(s) in the background: file ids {}\n",
+                    r.hydrating.len(),
+                    r.hydrating
+                        .iter()
+                        .map(u64::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ));
+            }
             if r.machine.objects.is_empty() {
                 o.push_str("  no objects with work in flight\n");
             }
@@ -796,6 +1052,20 @@ impl Report {
         } else if let Some(note) = &self.engine.note {
             o.push_str(&format!("  unavailable: {note}\n"));
         }
+        if self.recheck.taken {
+            o.push_str(&format!(
+                "  second sample {} ms later: waiting={} replies_pending={}\n",
+                self.recheck.after_ms,
+                opt(self.recheck.waiting),
+                opt(self.recheck.replies_pending),
+            ));
+            if self.recheck.outstanding.is_empty() {
+                o.push_str("    still outstanding: (nothing)\n");
+            }
+            for k in &self.recheck.outstanding {
+                o.push_str(&format!("    still outstanding: {k}\n"));
+            }
+        }
 
         o.push_str(&section("CONFIG"));
         push_kv(&mut o, "server", self.config.server.as_deref());
@@ -804,9 +1074,16 @@ impl Report {
         push_kv(
             &mut o,
             "dispatch_threads",
-            self.config.dispatch_threads.map(|n| n.to_string()).as_deref(),
+            self.config
+                .dispatch_threads
+                .map(|n| n.to_string())
+                .as_deref(),
         );
-        push_kv(&mut o, "refresh_pinned", self.config.refresh_pinned.as_deref());
+        push_kv(
+            &mut o,
+            "refresh_pinned",
+            self.config.refresh_pinned.as_deref(),
+        );
         push_kv(&mut o, "open_pinned", self.config.open_pinned.as_deref());
         push_kv(&mut o, "db_path", self.config.db_path.as_deref());
         push_kv(
@@ -814,14 +1091,25 @@ impl Report {
             "db_on_network",
             self.config.db_on_network.map(|b| b.to_string()).as_deref(),
         );
-        push_kv(&mut o, "pins", self.config.pins.map(|n| n.to_string()).as_deref());
+        push_kv(
+            &mut o,
+            "pins",
+            self.config.pins.map(|n| n.to_string()).as_deref(),
+        );
 
         o.push_str(&section("CONNECTIVITY"));
-        push_kv(&mut o, "server_host", self.connectivity.server_host.as_deref());
+        push_kv(
+            &mut o,
+            "server_host",
+            self.connectivity.server_host.as_deref(),
+        );
         push_kv(&mut o, "detail", self.connectivity.detail.as_deref());
 
         if let Some(logs) = &self.logs {
-            o.push_str(&section("LOGS (journalctl --user -u wusel, last 200)"));
+            o.push_str(&section(&format!(
+                "LOGS (journalctl --user -u {}, last 200)",
+                self.daemon.unit.as_deref().unwrap_or("<no unit>")
+            )));
             for l in logs {
                 o.push_str("  ");
                 o.push_str(l);
@@ -868,7 +1156,10 @@ mod tests {
             enabled: true,
         };
         let masked = red.s("error at /home/alice/Wusel/Secret.kdbx for user alice");
-        assert!(!masked.contains("/home/alice"), "home path is masked: {masked}");
+        assert!(
+            !masked.contains("/home/alice"),
+            "home path is masked: {masked}"
+        );
         assert!(masked.contains("$HOME/Wusel"));
         assert!(masked.contains("<user>"));
 
@@ -891,38 +1182,206 @@ mod tests {
         }
     }
 
-    #[test]
-    fn findings_flag_a_wedged_mount_from_waiting_and_parked_replies() {
-        // waiting > 0 and at least as many parked replies => the wedged-mount
-        // FAIL, the exact signature of the bug doctor was built for.
-        let daemon = Daemon {
+    /// A mount daemon, so the daemon check does not drown out the mount finding.
+    fn a_daemon() -> Daemon {
+        Daemon {
             processes: vec![Process {
                 cmdline: "/usr/bin/wusel mount --account default".into(),
                 ..Default::default()
             }],
+            unit: Some("wusel@default.service".into()),
             systemd: None,
-        };
-        let mount = Mount {
+        }
+    }
+
+    fn a_mount(waiting: u64) -> Mount {
+        Mount {
             connections: vec![FuseConnection {
                 id: 67,
-                waiting: Some(3),
+                waiting: Some(waiting),
                 max_background: None,
                 congestion_threshold: None,
             }],
             responsive: Some("ok (1 ms)".into()),
             ..Default::default()
-        };
+        }
+    }
+
+    fn mount_finding(findings: &[Finding]) -> &Finding {
+        findings
+            .iter()
+            .find(|f| f.section == "mount" && !f.message.contains("mountpoint"))
+            .expect("a finding about waiting requests")
+    }
+
+    #[test]
+    fn a_job_still_outstanding_in_both_samples_is_a_wedged_mount() {
+        // The real signature: the *same* inode, intent and step still handed out
+        // to a worker two seconds later, with the kernel still waiting.
         let engine = Engine {
             available: true,
             note: None,
-            report: Some(sample_report(3)),
+            report: Some(sample_report(1, &[fetching(26298)])),
         };
-        let findings = derive_findings(&daemon, &mount, &engine, &ConfigInfo::default());
+        let recheck = Recheck {
+            taken: true,
+            after_ms: 2000,
+            engine_answered: true,
+            waiting: Some(1),
+            replies_pending: Some(1),
+            outstanding: outstanding_keys(engine.report.as_ref()),
+        };
+        let findings = derive_findings(
+            &a_daemon(),
+            &a_mount(1),
+            &engine,
+            &recheck,
+            &ConfigInfo::default(),
+        );
+        let f = mount_finding(&findings);
+        assert_eq!(f.level, "FAIL", "expected a wedge, got {f:?}");
+        assert!(f.message.contains("inode 26298 fetch/FetchBytes"), "{f:?}");
+    }
+
+    #[test]
+    fn work_that_moves_between_the_samples_is_load_not_a_wedge() {
+        // The false positive this check was rewritten for: a busy mount always
+        // has `waiting` and `replies_pending` in step, because a reply is parked
+        // the moment a request arrives. Only the *identity* of the work separates
+        // the two, and here it changed — a different inode each sample.
+        let engine = Engine {
+            available: true,
+            note: None,
+            report: Some(sample_report(1, &[fetching(12901)])),
+        };
+        let recheck = Recheck {
+            taken: true,
+            after_ms: 2000,
+            engine_answered: true,
+            waiting: Some(1),
+            replies_pending: Some(1),
+            outstanding: vec!["inode 29845 lookup/LookRemote".into()],
+        };
+        let findings = derive_findings(
+            &a_daemon(),
+            &a_mount(1),
+            &engine,
+            &recheck,
+            &ConfigInfo::default(),
+        );
+        let f = mount_finding(&findings);
+        assert_eq!(f.level, "PASS", "expected ordinary load, got {f:?}");
+    }
+
+    #[test]
+    fn a_parked_reply_with_nothing_running_behind_it_is_a_wedged_mount() {
+        // The other shape: the flow ended without its reply being sent. The
+        // machine is idle in both samples, yet the kernel still waits and the
+        // frontend still holds the handle.
+        let engine = Engine {
+            available: true,
+            note: None,
+            report: Some(sample_report(2, &[])),
+        };
+        let recheck = Recheck {
+            taken: true,
+            after_ms: 2000,
+            engine_answered: true,
+            waiting: Some(2),
+            replies_pending: Some(2),
+            outstanding: Vec::new(),
+        };
+        let findings = derive_findings(
+            &a_daemon(),
+            &a_mount(2),
+            &engine,
+            &recheck,
+            &ConfigInfo::default(),
+        );
+        let f = mount_finding(&findings);
+        assert_eq!(f.level, "FAIL", "expected a lost reply, got {f:?}");
+        assert!(f.message.contains("never sent"), "{f:?}");
+    }
+
+    #[test]
+    fn requests_that_drain_between_the_samples_pass() {
+        let engine = Engine {
+            available: true,
+            note: None,
+            report: Some(sample_report(3, &[fetching(7)])),
+        };
+        let recheck = Recheck {
+            taken: true,
+            after_ms: 2000,
+            engine_answered: true,
+            waiting: Some(0),
+            replies_pending: Some(0),
+            outstanding: Vec::new(),
+        };
+        let findings = derive_findings(
+            &a_daemon(),
+            &a_mount(3),
+            &engine,
+            &recheck,
+            &ConfigInfo::default(),
+        );
+        assert_eq!(mount_finding(&findings).level, "PASS");
+    }
+
+    #[test]
+    fn a_daemon_that_stops_answering_leaves_the_question_open() {
+        // Not a wedge and not a clean bill: with no second sample of the engine
+        // there is nothing to compare, and saying so beats guessing.
+        let engine = Engine {
+            available: true,
+            note: None,
+            report: Some(sample_report(1, &[fetching(5)])),
+        };
+        let recheck = Recheck {
+            taken: true,
+            after_ms: 2000,
+            engine_answered: false,
+            waiting: Some(1),
+            replies_pending: None,
+            outstanding: Vec::new(),
+        };
+        let findings = derive_findings(
+            &a_daemon(),
+            &a_mount(1),
+            &engine,
+            &recheck,
+            &ConfigInfo::default(),
+        );
+        assert_eq!(mount_finding(&findings).level, "WARN");
+    }
+
+    #[test]
+    fn the_probes_ask_about_the_account_instance_not_the_template() {
+        // The service is a template. Asking systemd about the bare name reports
+        // a running mount as `inactive, dead`, and asking journalctl about it
+        // matches nothing at all — which is how every bundle came to carry
+        // "-- No entries --" without saying that it had asked the wrong thing.
+        assert_eq!(
+            unit_for("default").as_deref(),
+            Some("wusel@default.service")
+        );
+        assert_eq!(unit_for("work").as_deref(), Some("wusel@work.service"));
+        // An account systemd cannot name has no unit, rather than a wrong one.
+        assert_eq!(unit_for("Müller"), None);
+    }
+
+    #[test]
+    fn an_empty_journal_names_the_unit_it_asked_about() {
+        // Silence must be attributable. The old text ("no user journal for the
+        // unit") read like a fact about the daemon; it was a fact about the
+        // question.
+        let lines = probe_logs(
+            Some("wusel@nonexistent-test.service"),
+            &Redactor::new(false),
+        );
         assert!(
-            findings
-                .iter()
-                .any(|f| f.level == "FAIL" && f.section == "mount" && f.message.contains("wedged")),
-            "expected a wedged-mount FAIL, got {findings:?}"
+            lines[0].contains("wusel@nonexistent-test.service"),
+            "the unit is named: {lines:?}"
         );
     }
 
@@ -936,20 +1395,39 @@ mod tests {
                 note: None,
                 report: None,
             },
+            &Recheck::default(),
             &ConfigInfo::default(),
         );
-        assert!(findings.iter().any(|f| f.level == "FAIL" && f.section == "daemon"));
+        assert!(findings
+            .iter()
+            .any(|f| f.level == "FAIL" && f.section == "daemon"));
     }
 
-    fn sample_report(replies_pending: usize) -> DiagReport {
+    fn fetching(object: u64) -> wusel_core::diag::ObjectReport {
+        wusel_core::diag::ObjectReport {
+            object,
+            intent: "fetch".into(),
+            step: "FetchBytes".into(),
+            outstanding: true,
+            waiters: 1,
+            queued: 0,
+            abort: false,
+        }
+    }
+
+    fn sample_report(
+        replies_pending: usize,
+        objects: &[wusel_core::diag::ObjectReport],
+    ) -> DiagReport {
         DiagReport {
             schema: wusel_core::diag::SCHEMA,
             machine: wusel_core::diag::MachineReport {
-                objects: vec![],
+                objects: objects.to_vec(),
                 buffers_open: 0,
                 buffers_dirty: 0,
             },
             refreshing: 0,
+            hydrating: Vec::new(),
             pools: wusel_core::diag::PoolsReport {
                 db_readers: 2,
                 net: 4,

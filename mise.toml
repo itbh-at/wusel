@@ -31,8 +31,11 @@ description = "cargo check (wusel-core + wusel without the fuse feature)"
 run = "cargo check --workspace --exclude wusel-fuse"
 
 [tasks.test]
-description = "cargo test (natively on macOS)"
-run = "cargo test --workspace --exclude wusel-fuse"
+description = "cargo test (engine + CLI; on Linux inside a throwaway keyring session)"
+# Not a bare `cargo test`: on Linux the suite runs under a private D-Bus session
+# with an empty keyring, so the credential tests are deterministic and never
+# touch the developer's own secrets. See the header of scripts/test.sh.
+run = "./scripts/test.sh"
 
 [tasks.fmt]
 description = "Format the code"

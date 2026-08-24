@@ -113,6 +113,10 @@ pub struct SubstrateSnapshot {
     pub machine: wusel_fsm::MachineSnapshot,
     pub refreshing: usize,
     pub pools: PoolSizes,
+    /// File ids of whole-file hydrations running right now. Not the decider's to
+    /// know — a hydration never becomes a flow — so it is read straight from the
+    /// content source; see [`ContentSource::hydrating`].
+    pub hydrating: Vec<u64>,
 }
 
 /// A cloneable, `Send` handle for taking diagnostics snapshots of a running
@@ -123,6 +127,11 @@ pub struct SubstrateSnapshot {
 pub struct DiagHandle {
     to_fsm: Sender<Event>,
     pools: PoolSizes,
+    /// Asked directly for its running hydrations, rather than through the
+    /// decider: the decider does not know about them (they never become flows),
+    /// and a snapshot has no business adding work to the one thread whose
+    /// promptness it is trying to measure.
+    content: Arc<dyn ContentSource>,
 }
 
 impl DiagHandle {
@@ -149,6 +158,7 @@ impl DiagHandle {
             machine: diag.machine,
             refreshing: diag.refreshing,
             pools: self.pools,
+            hydrating: self.content.hydrating(),
         })
     }
 }
@@ -333,6 +343,17 @@ pub struct Substrate {
     threads: Vec<JoinHandle<()>>,
     /// Kept only so a diagnostics snapshot can report them.
     pools: PoolSizes,
+    /// Kept only so a diagnostics snapshot can ask it what it is hydrating.
+    content: Arc<dyn ContentSource>,
+    /// Set on the way out, so a worker takes no further job from its queue. A
+    /// queue that still holds work is abandoned rather than worked off — nobody
+    /// is waiting for it once the mount is gone.
+    stopping: Arc<std::sync::atomic::AtomicBool>,
+    /// Disconnects when the last thread has dropped its half: shutdown waits on
+    /// this instead of joining, so the wait can have a deadline. Nothing is ever
+    /// sent on it. Behind a `Mutex` only because a bare `Receiver` is not
+    /// `Sync`, and the frontend needs the whole substrate to be.
+    done: Mutex<Option<Receiver<()>>>,
     /// Dropped first on teardown, to wake the uploader out of its wait so the
     /// join below does not block for a whole retry interval.
     uploader_shutdown: Option<Sender<()>>,
@@ -349,43 +370,85 @@ impl Substrate {
 
         let (db_read_tx, db_read_rx) = channel::<Dispatched>();
         let (db_write_tx, db_write_rx) = channel::<Dispatched>();
-        let (net_tx, net_rx) = channel::<Dispatched>();
         let (file_tx, file_rx) = channel::<Dispatched>();
+        // Not a channel: the net pool serves interactive work ahead of
+        // background revalidation. See [`NetQueue`].
+        let net = NetQueue::new();
 
         let inbox: Inbox = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let mut threads = Vec::new();
+        // Shutdown bookkeeping: a flag every worker consults before taking its
+        // next job, and a channel that disconnects once the last thread is gone.
+        // See [`SHUTDOWN_GRACE`].
+        let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (done_tx, done_rx) = channel::<()>();
         // Several threads on one queue: a receiver behind a mutex *is* a work
         // queue, and the lock is held only long enough to take the next item.
         let db_read_rx = Arc::new(Mutex::new(db_read_rx));
-        let net_rx = Arc::new(Mutex::new(net_rx));
         let file_rx = Arc::new(Mutex::new(file_rx));
 
         for (name, count, rx) in [
             ("wusel-db-read", pools.db_readers, &db_read_rx),
-            ("wusel-net", pools.net, &net_rx),
             ("wusel-file", pools.file, &file_rx),
         ] {
             for n in 0..count.max(1) {
                 let worker = Worker::open(ctx, Arc::clone(&inbox))?;
                 let rx = Arc::clone(rx);
                 let back = to_fsm.clone();
+                // The flag is checked *before* taking work, so a queue that
+                // still holds jobs is abandoned rather than worked off.
+                let stop = Arc::clone(&stopping);
                 threads.push(spawn_worker(
                     format!("{name}-{n}"),
                     back,
                     worker,
-                    move || rx.lock().unwrap_or_else(|e| e.into_inner()).recv().ok(),
+                    move || {
+                        if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                            return None;
+                        }
+                        rx.lock().unwrap_or_else(|e| e.into_inner()).recv().ok()
+                    },
+                    done_tx.clone(),
                 ));
             }
+        }
+
+        // The net pool takes from its two-tier queue instead of a channel; the
+        // end-of-stream contract is the same, so `spawn_worker` is unchanged.
+        for n in 0..pools.net.max(1) {
+            let worker = Worker::open(ctx, Arc::clone(&inbox))?;
+            let queue = Arc::clone(&net);
+            let back = to_fsm.clone();
+            let stop = Arc::clone(&stopping);
+            threads.push(spawn_worker(
+                format!("wusel-net-{n}"),
+                back,
+                worker,
+                move || {
+                    if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                        return None;
+                    }
+                    queue.pop()
+                },
+                done_tx.clone(),
+            ));
         }
 
         // The writer is alone by design, so it takes its queue directly.
         let worker = Worker::open(ctx, Arc::clone(&inbox))?;
         let back = to_fsm.clone();
+        let stop = Arc::clone(&stopping);
         threads.push(spawn_worker(
             "wusel-db-write".into(),
             back,
             worker,
-            move || db_write_rx.recv().ok(),
+            move || {
+                if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    return None;
+                }
+                db_write_rx.recv().ok()
+            },
+            done_tx.clone(),
         ));
 
         threads.push(spawn_decider(
@@ -394,11 +457,13 @@ impl Substrate {
             Queues {
                 db_read: db_read_tx,
                 db_write: db_write_tx,
-                net: net_tx,
+                net: NetSender(Arc::clone(&net)),
                 file: file_tx,
             },
+            Arc::clone(&net),
             answers_tx,
             ctx.async_upload,
+            done_tx.clone(),
         ));
 
         // The asynchronous uploader: resume anything owed at start-up, and retry
@@ -410,10 +475,14 @@ impl Substrate {
             let (uploader_shutdown, up_rx) = channel::<()>();
             let up_to_fsm = to_fsm.clone();
             let up_db = ctx.db_path.clone();
+            let up_done = done_tx.clone();
             threads.push(
                 std::thread::Builder::new()
                     .name("wusel-uploader".into())
-                    .spawn(move || uploader_loop(&up_to_fsm, &up_db, &up_rx))
+                    .spawn(move || {
+                        let _done = up_done;
+                        uploader_loop(&up_to_fsm, &up_db, &up_rx);
+                    })
                     .expect("spawn the uploader thread"),
             );
             Some(uploader_shutdown)
@@ -431,6 +500,12 @@ impl Substrate {
                     net: pools.net.max(1),
                     file: pools.file.max(1),
                 },
+                content: Arc::clone(&ctx.content),
+                stopping,
+                // The original sender is dropped here on purpose: only the
+                // threads hold one, so the channel disconnects exactly when the
+                // last of them is gone.
+                done: Mutex::new(Some(done_rx)),
                 uploader_shutdown,
             },
             answers_rx,
@@ -454,6 +529,7 @@ impl Substrate {
         DiagHandle {
             to_fsm: self.to_fsm.clone(),
             pools: self.pools,
+            content: Arc::clone(&self.content),
         }
     }
 
@@ -499,15 +575,59 @@ impl Substrate {
     }
 }
 
+/// How long shutdown waits for the pools before giving up on them.
+///
+/// Stopping used to be unbounded: every worker was joined, and a worker only
+/// notices that it should stop between jobs. One request against an unreachable
+/// server therefore held the whole process for as long as the HTTP read timeout
+/// (30 s), and a backlog held it for longer — past systemd's stop timeout, which
+/// then killed the daemon with `SIGABRT` and a core dump. A restart cost 45
+/// seconds and ended in a crash report.
+///
+/// So the wait is bounded well inside any service manager's patience. What is
+/// left running when it expires is abandoned deliberately: the process is about
+/// to exit, an unfinished upload is durable in the pending record and resumes at
+/// the next start, and everything else is speculative work nobody waits for.
+pub const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
 impl Drop for Substrate {
     fn drop(&mut self) {
-        // Wake the uploader first — dropping the sender disconnects its wait — so
-        // the join below is prompt rather than blocking for a whole retry
-        // interval.
+        // Take no *new* work first, so a queue that is still full does not have
+        // to be worked off before anybody can stop.
+        self.stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // Wake the uploader — dropping the sender disconnects its wait — so it
+        // does not sit out a whole retry interval.
         self.uploader_shutdown.take();
+        // The decider returns on this, which drops the pool queues and lets the
+        // workers see end-of-stream.
         let _ = self.to_fsm.send(Event::Stop);
-        for t in self.threads.drain(..) {
-            let _ = t.join();
+
+        // Wait for every thread to drop its half of `done`, but never longer
+        // than the grace. `Disconnected` is the signal that the last one is
+        // gone; a timeout means somebody is still inside a job.
+        let waiting = self
+            .done
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let stopped = matches!(
+            waiting.map(|done| done.recv_timeout(SHUTDOWN_GRACE)),
+            None | Some(Err(std::sync::mpsc::RecvTimeoutError::Disconnected))
+        );
+        if stopped {
+            // They have all finished, so these joins return at once and leave
+            // nothing running behind us.
+            for t in self.threads.drain(..) {
+                let _ = t.join();
+            }
+        } else {
+            tracing::warn!(
+                grace_secs = SHUTDOWN_GRACE.as_secs(),
+                "a worker did not finish in time — stopping without it rather than \
+                 holding up the shutdown"
+            );
+            self.threads.clear(); // detach: joining is what we are avoiding
         }
     }
 }
@@ -582,29 +702,227 @@ fn uploader_loop(to_fsm: &Sender<Event>, db_path: &std::path::Path, shutdown: &R
 struct Queues {
     db_read: Sender<Dispatched>,
     db_write: Sender<Dispatched>,
-    net: Sender<Dispatched>,
+    net: NetSender,
     file: Sender<Dispatched>,
 }
 
 impl Queues {
     /// Hand a job to the pool its executor names.
-    fn send(
-        &self,
-        object: ObjectId,
-        job: Job,
-        deliver: Deliver,
-    ) -> std::result::Result<(), std::sync::mpsc::SendError<Dispatched>> {
-        let to = match job.executor() {
-            Executor::DbRead => &self.db_read,
-            Executor::DbWrite => &self.db_write,
-            Executor::Net => &self.net,
-            Executor::FileIo => &self.file,
-        };
-        to.send(Dispatched {
+    ///
+    /// `Err` means that pool is gone, which for the caller means one thing —
+    /// stop — so the channel's error payload is dropped here rather than
+    /// carried: the net pool is not an mpsc channel and has none to give.
+    fn send(&self, object: ObjectId, job: Job, deliver: Deliver) -> std::result::Result<(), ()> {
+        let d = Dispatched {
             object,
             job,
             deliver,
+        };
+        // The net pool is two-tiered; everything else is one queue. See
+        // [`NetQueue`] for why only this pool needs the distinction.
+        if matches!(d.job.executor(), Executor::Net) {
+            return self.net.send(d);
+        }
+        let to = match d.job.executor() {
+            Executor::DbRead => &self.db_read,
+            Executor::DbWrite => &self.db_write,
+            Executor::FileIo => &self.file,
+            Executor::Net => unreachable!("handled above"),
+        };
+        to.send(d).map_err(|_| ())
+    }
+}
+
+/// The net pool's work queue: two tiers, served strictly in order.
+///
+/// Every other pool is a plain mpsc channel, and this one deliberately is not.
+/// The net pool is the only place where work **nobody waits for** shares a queue
+/// with work a user is blocked on — a background directory revalidation
+/// ([`wusel_fsm::Action::Refresh`]) is dispatched as an ordinary `ListRemote`,
+/// and lands in the same FIFO as the `FetchRange` serving somebody's `read`.
+///
+/// A single FIFO makes that ordering arbitrary, and at scale it makes it wrong.
+/// A cold start against a large tree marks every directory's listing stale at
+/// once, so thousands of revalidations queue up; a read dispatched after them
+/// waits for all of them. Measured on a real account: a mount that took over
+/// half an hour to show a directory, with 1552 revalidations in flight and every
+/// worker busy serving them.
+///
+/// The fix is not a bigger pool — the server is the bottleneck, not the threads.
+/// It is that background work may only run on capacity nobody else wants: a
+/// worker takes an interactive job whenever one exists, and reaches for the
+/// background tier only when the interactive tier is empty. Refreshes therefore
+/// still use the whole pool while the mount is idle, which is when they should,
+/// and get out of the way the instant a user asks for anything.
+struct NetQueue {
+    inner: Mutex<NetQueueInner>,
+    /// Signalled when work arrives or the queue closes.
+    ready: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct NetQueueInner {
+    interactive: std::collections::VecDeque<Dispatched>,
+    background: std::collections::VecDeque<Dispatched>,
+    /// The producer is gone; drain what is left, then stop.
+    closed: bool,
+}
+
+impl NetQueue {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(NetQueueInner::default()),
+            ready: std::sync::Condvar::new(),
         })
+    }
+
+    /// Take the next job, waiting for one. `None` once the queue is closed and
+    /// empty — the same end-of-stream signal a dropped `Sender` gives the other
+    /// pools, so [`spawn_worker`] needs no special case.
+    fn pop(&self) -> Option<Dispatched> {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            // Interactive first, always. This one line is the whole fix.
+            if let Some(d) = inner.interactive.pop_front() {
+                return Some(d);
+            }
+            if let Some(d) = inner.background.pop_front() {
+                return Some(d);
+            }
+            if inner.closed {
+                return None;
+            }
+            inner = self.ready.wait(inner).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// How much background work is waiting. Read by the decider to keep the
+    /// backlog bounded (see `MAX_REFRESH_BACKLOG`).
+    fn background_len(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .background
+            .len()
+    }
+}
+
+#[cfg(test)]
+mod net_queue_tests {
+    use super::*;
+    use wusel_fsm::ObjectId;
+
+    fn job(object: u64) -> Dispatched {
+        Dispatched {
+            object: ObjectId(object),
+            job: Job::ListRemote {
+                object: ObjectId(object),
+            },
+            deliver: Deliver::Flow,
+        }
+    }
+
+    fn refresh(object: u64) -> Dispatched {
+        Dispatched {
+            deliver: Deliver::Detached,
+            ..job(object)
+        }
+    }
+
+    #[test]
+    fn interactive_work_is_served_ahead_of_a_refresh_backlog() {
+        // The bug this queue exists for: a read dispatched *after* thousands of
+        // revalidations must not wait for them.
+        let q = NetQueue::new();
+        let tx = NetSender(Arc::clone(&q));
+        for i in 0..1000 {
+            tx.send(refresh(i)).expect("open");
+        }
+        tx.send(job(9999)).expect("open");
+
+        let first = q.pop().expect("a job");
+        assert_eq!(
+            first.object,
+            ObjectId(9999),
+            "the interactive job comes first, despite 1000 refreshes queued ahead of it"
+        );
+    }
+
+    #[test]
+    fn background_work_still_runs_when_nothing_else_wants_the_pool() {
+        // The other half of the contract: refreshes are deprioritised, not
+        // starved. An idle mount must still revalidate.
+        let q = NetQueue::new();
+        let tx = NetSender(Arc::clone(&q));
+        tx.send(refresh(1)).expect("open");
+        assert_eq!(q.pop().expect("a job").object, ObjectId(1));
+    }
+
+    #[test]
+    fn a_dropped_producer_discards_the_queue_and_ends_the_stream() {
+        // How the workers learn to exit. The queue is *discarded* rather than
+        // handed out: the producer is gone, so nobody is waiting for any of it,
+        // and working a backlog off is what made stopping outlast a service
+        // manager's patience (see `SHUTDOWN_GRACE`).
+        let q = NetQueue::new();
+        let tx = NetSender(Arc::clone(&q));
+        tx.send(job(1)).expect("open");
+        tx.send(refresh(2)).expect("open");
+        drop(tx);
+        assert!(q.pop().is_none(), "nothing is worked off on the way out");
+    }
+
+    #[test]
+    fn the_backlog_the_decider_bounds_is_only_the_background_tier() {
+        let q = NetQueue::new();
+        let tx = NetSender(Arc::clone(&q));
+        tx.send(job(1)).expect("open");
+        tx.send(refresh(2)).expect("open");
+        assert_eq!(q.background_len(), 1, "interactive work is not a backlog");
+    }
+}
+
+/// The producer half of [`NetQueue`].
+///
+/// Dropping it closes the queue and wakes every worker, which is how the net
+/// pool inherits the shutdown shape of the mpsc pools: the decider owns the
+/// producer, the decider returning drops it, the workers see end-of-stream and
+/// exit so `Substrate::drop` can join them.
+struct NetSender(Arc<NetQueue>);
+
+impl NetSender {
+    fn send(&self, d: Dispatched) -> std::result::Result<(), ()> {
+        let mut inner = self.0.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.closed {
+            return Err(());
+        }
+        // A detached job is one nobody is waiting for — precisely the definition
+        // of background. Nothing else needs to be decided here, and deciding it
+        // from the delivery mode rather than from the job kind keeps the two in
+        // step by construction.
+        if matches!(d.deliver, Deliver::Detached) {
+            inner.background.push_back(d);
+        } else {
+            inner.interactive.push_back(d);
+        }
+        drop(inner);
+        self.0.ready.notify_one();
+        Ok(())
+    }
+}
+
+impl Drop for NetSender {
+    fn drop(&mut self) {
+        let mut inner = self.0.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.closed = true;
+        // Discard what is still queued instead of working it off. The producer
+        // is gone, so nobody is waiting for any of it, and draining a backlog is
+        // how stopping came to take longer than a service manager will wait
+        // (see [`SHUTDOWN_GRACE`]).
+        inner.interactive.clear();
+        inner.background.clear();
+        drop(inner);
+        self.0.ready.notify_all();
     }
 }
 
@@ -623,16 +941,33 @@ enum Deliver {
 ///
 /// It never blocks on anything but its own channel — the one property the whole
 /// design is built to preserve.
+/// How many background revalidations may be waiting for the net pool before new
+/// ones are dropped rather than queued.
+///
+/// A refresh is best-effort by definition — nobody waits for it, and the next
+/// listing of that directory schedules another. So a backlog is not work owed,
+/// it is work already overtaken by events: with thousands queued, the oldest are
+/// re-reading directories whose listing has since been read again. Dropping the
+/// surplus costs nothing and keeps the queue a queue instead of a pile.
+///
+/// Generous enough that an ordinary browse never reaches it, small enough that a
+/// tree walk cannot turn into a backlog measured in hours.
+const MAX_REFRESH_BACKLOG: usize = 64;
+
 fn spawn_decider(
     self_tx: Sender<Event>,
     events: Receiver<Event>,
     queues: Queues,
+    net: Arc<NetQueue>,
     answers: Sender<Answered>,
     async_upload: bool,
+    done: Sender<()>,
 ) -> JoinHandle<()> {
     std::thread::Builder::new()
         .name("wusel-fsm".into())
         .spawn(move || {
+            // Dropped when this thread ends; see [`SHUTDOWN_GRACE`].
+            let _done = done;
             let mut machine = Machine::new();
             machine.set_async_upload(async_upload);
             // Bytes a step produced, waiting for the flow to end so they can go
@@ -765,6 +1100,17 @@ fn spawn_decider(
                             if refreshing.contains(&object) || machine.is_busy(object) {
                                 continue;
                             }
+                            // Third guard: do not let the backlog grow without
+                            // bound. A cold start against a large tree marks
+                            // every listing stale at once, and queueing all of
+                            // them buys nothing — see `MAX_REFRESH_BACKLOG`.
+                            if net.background_len() >= MAX_REFRESH_BACKLOG {
+                                tracing::debug!(
+                                    object = object.0,
+                                    "refresh backlog full — skipping this revalidation"
+                                );
+                                continue;
+                            }
                             refreshing.insert(object);
                             if queues
                                 .send(object, Job::ListRemote { object }, Deliver::Detached)
@@ -827,6 +1173,7 @@ fn spawn_worker<F>(
     back: Sender<Event>,
     mut worker: Worker,
     mut next: F,
+    done: Sender<()>,
 ) -> JoinHandle<()>
 where
     F: FnMut() -> Option<Dispatched> + Send + 'static,
@@ -834,6 +1181,9 @@ where
     std::thread::Builder::new()
         .name(name)
         .spawn(move || {
+            // Never sent on: dropping it at the end of this thread is the
+            // signal shutdown waits for (see [`SHUTDOWN_GRACE`]).
+            let _done = done;
             while let Some(d) = next() {
                 let (completion, payload) = worker.run(&d.job);
                 let event = match d.deliver {
@@ -1073,10 +1423,11 @@ impl Worker {
                 Err(e) => failed(job, &e),
             },
             Job::SetUploadError { object, message } => {
-                match self
-                    .db
-                    .set_upload_state(*object, crate::state::UploadState::Error, Some(message))
-                {
+                match self.db.set_upload_state(
+                    *object,
+                    crate::state::UploadState::Error,
+                    Some(message),
+                ) {
                     Ok(()) => (Completion::Done, Payload::None),
                     Err(e) => failed(job, &e),
                 }
@@ -1161,6 +1512,15 @@ impl Worker {
             }
             Job::BufferSize { object } => match std::fs::metadata(self.buffer_path(*object)) {
                 Ok(m) => (Completion::Size(m.len()), Payload::None),
+                // A missing buffer will not reappear by retrying: past the
+                // commit (where this job runs) that would otherwise leave the
+                // pending upload `pending` forever, retried on every uploader
+                // pass with nothing to send. Park it like any other
+                // unrecoverable failure instead.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    tracing::debug!(job = "buffer-size", error = %e, "step failed permanently");
+                    (Completion::Failed(Failure::Permanent), Payload::None)
+                }
                 Err(e) => failed(job, &e),
             },
             Job::Upload {

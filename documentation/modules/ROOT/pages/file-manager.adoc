@@ -66,6 +66,12 @@ The engine guarantees this read is local and network-free, so a file manager
 may query it for every visible file. Directories report a value only when
 pinned.
 
+IMPORTANT: The attribute describes where a file *is*, not what it is — it is
+only meaningful **inside the mount**. Linux copies extended attributes along
+with the file, so a copy made outside `~/Wusel` carries a dead value, and every
+reader must establish that the path is on a Wusel mount before trusting it. See
+xref:known-limitations.adoc#emblem-survives-the-copy[Known limitations].
+
 == GNOME / Nautilus
 
 A native C `libnautilus-extension` module in `integration/nautilus/` (source +
@@ -160,6 +166,11 @@ honours to skip the whole subtree. Opt back in with `[desktop]
 exclude_from_indexers = false` in `config.toml`. KDE Baloo ignores such markers —
 exclude `~/Wusel` in its own settings instead.
 
+The markers cover indexers, not *previews*: a thumbnailer reads far enough into
+a file to hydrate it, and the desktop offers no way to decline a preview for a
+local mount. See
+xref:known-limitations.adoc#previews-hydrate-files[Known limitations].
+
 == Desktop search (GNOME)
 
 Instead of letting a local indexer walk the mount (a download storm, since
@@ -177,7 +188,10 @@ later addition.
 == Other file managers (planned)
 
 All read the same xref:xattr[`user.wusel.state`] xattr; only the presentation
-plugin differs — there is no single mechanism across desktops:
+plugin differs — there is no single mechanism across desktops. Each of them owes
+the same scope check: decide that the path is on a Wusel mount *before* reading
+the attribute's meaning off it, because a copy carries the value out of the
+mount (xref:known-limitations.adoc#emblem-survives-the-copy[Known limitations]).
 
 * *KDE Dolphin*: a C++ `KOverlayIconPlugin` (emblems) built against KIO/KF6, plus
   *declarative* KDE ServiceMenus (`.desktop` files, no code) for the actions.

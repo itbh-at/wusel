@@ -226,7 +226,11 @@ fn a_transient_upload_failure_leaves_the_record_pending_for_retry() {
     let (flow, _) = advance(flow, Completion::Size(4096), &facts); // -> Upload
 
     let (_, next) = advance(flow, Completion::Failed(Failure::Io), &facts);
-    assert_eq!(next, Next::Fail(Failure::Io), "no job — the record stays queued");
+    assert_eq!(
+        next,
+        Next::Fail(Failure::Io),
+        "no job — the record stays queued"
+    );
 }
 
 #[test]

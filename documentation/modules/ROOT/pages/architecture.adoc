@@ -270,6 +270,40 @@ Therefore the design is *try the keyring, else fall back to the `0600` file*:
   Because the secret is a revocable app password, the file fallback is acceptable
   hardening-wise — it is a "better by default on the desktop", not a hard gate.
 
+==== How that fallback is tested
+
+The rule above is only worth as much as the evidence for it, and its interesting
+half — *what happens when the keyring misbehaves* — cannot be staged on a real
+machine. You cannot ask a running Secret Service to be absent, to be locked on
+demand, or (the case `store` actually guards against) to accept a write and then
+not have it. Tests that simply used the machine's keyring inherited its state
+instead: green in a container, red on an unlocked desktop, and a statement about
+neither.
+
+So the keyring sits behind the `keyring::Secrets` trait, with exactly one
+production implementation (`keyring::Os`). Both halves are then covered, and
+both run on every machine, in every run:
+
+* *The decisions* — `credentials::store_with` / `load_with` take the store as a
+  parameter, and the tests pass an in-memory keyring that is absent, locked, or
+  forgetful. No D-Bus is reachable from those tests at all, so the host's keyring
+  is not merely irrelevant, it is unobservable.
+* *The backend* — one contract test states what a `Secrets` implementation
+  promises (notably: "no such entry" is `Ok(None)`, not an error) and is run
+  against the fake **and** against `Os`. `mise run test` provides what the latter
+  needs: `scripts/test.sh` starts a private D-Bus session with an empty, unlocked
+  gnome-keyring under a temporary `XDG_DATA_HOME`.
+
+Deliberately *not* `#[ignore]`: a test that only runs when someone remembers to
+ask for it does not run. Just as deliberately not skipped-when-absent: a green
+run must mean the thing was checked. Without the tools the suite stops and names
+the package to install.
+
+The throwaway session has a second benefit. No test can reach the developer's
+real login keyring even by accident — which is not hypothetical: the credential
+tests used to write a dummy secret over the `wusel` entry of the *default*
+account, because a test and the product naturally pick the same account key.
+
 == Change detection
 
 * *Primary (implemented):* `notify_push` (Nextcloud high-performance backend) via
@@ -729,6 +763,46 @@ place we speak the user's language: OS notifications reach non-technical users,
 many of whom do not read English. Everything else — logs, CLI output, terminal
 errors — stays English. Adding a language is one match arm; a background systemd
 service that does not inherit `LANG` just falls back to English (safe).
+
+=== "Can we reach the server?" — one shared answer (`health::Reachability`)
+
+Of those cases, *the connection is gone* is the one the user cannot diagnose at
+all. It does not present as an error: the file manager simply stops drawing the
+folder and the application stops opening its document, so the mount looks
+**hung**, and a user who reads it that way starts killing the daemon. Meanwhile
+the engine knew — it logged `[connect] … dns error` per failed request and
+carried on. Nobody reads the journal.
+
+The difficulty is that reachability is not a property of any one operation: a
+listing, a content read, an upload and the notify_push discovery each learn it
+separately, and each would notify separately. So the answer lives in **one**
+place, `health::Reachability` in `wusel-core`, and every request reports its
+outcome to it — `WebDavClient` has a single private `send` for exactly this
+reason, so a new call site cannot forget. Three rules keep thousands of events
+down to one notification:
+
+* *Only transport failures count* (`Error::is_transport`): no answer at all —
+  DNS, connect, TLS, timeout, a dropped connection. The distinction is
+  structural, not textual: `From<reqwest::Error>` keeps a status code as
+  `HttpStatus` and everything without one as `Http`, and "no status" is precisely
+  "nobody answered". A server that answers with a 500 is *reachable*; that is a
+  different problem, with a different message.
+* *A blip is not an outage.* The first failure only starts a clock; the notice
+  fires when failures are still arriving ten seconds later. (The WebDAV client
+  already retries a dropped keep-alive connection internally, so a lone failure
+  reaching this layer is rare to begin with.)
+* *One notice per incident*, and the first success both clears the state and —
+  only if the user was told — announces the recovery.
+
+*The heartbeat.* An idle mount issues no requests, and the interesting moment
+during an outage is precisely the one nobody is asking about: the recovery. The
+notify_push listener is the only component that keeps talking to the server on
+its own, so both of its retry loops report reachability — endpoint discovery
+while the socket has never come up, and the reconnect loop once it has. A mount
+nobody is touching therefore still learns within about half a minute that the
+server went away, and that it is back. Making discovery retry at all also fixes
+a defect of its own: it used to happen exactly once, so a daemon that started
+before the network had DNS ran without push until the next restart.
 
 == File-manager integration (`libcloudproviders`)
 

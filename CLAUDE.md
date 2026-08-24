@@ -55,6 +55,17 @@ XDG paths by hand instead of adding the `dirs` crate.)
   Types: `feat`, `fix`, `docs`, `refactor`, `test`, `chore`, `build`, `ci`.
   Breaking changes: `!` after the type or a `BREAKING CHANGE:` footer.
   Example: `feat(webdav): parse PROPFIND multistatus`.
+- **A commit or MR message states the *what*, short and factual.** The diff
+  already shows the *how* — do not narrate it a second time. Say what the change
+  does and, in a clause, why it matters.
+- **No working through the past.** No account of the investigation, no story of
+  how the defect came about, no dwelling on what the code used to do, no
+  self-justification. One sentence of prior behaviour is allowed where the change
+  is otherwise unintelligible; more is noise in `git log`.
+- Mechanism belongs in the message only when the change is genuinely intricate
+  and the diff cannot carry the reasoning alone — then a short paragraph, never
+  an essay. Durable explanation belongs in code comments and the docs, which are
+  read; a commit body is read once, if ever.
 
 ## Architecture & crates
 

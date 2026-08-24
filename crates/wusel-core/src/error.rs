@@ -91,13 +91,30 @@ impl From<reqwest::Error> for Error {
             src = s.source();
         }
         match status {
-            Some(status) => Error::HttpStatus { status, message: msg },
+            Some(status) => Error::HttpStatus {
+                status,
+                message: msg,
+            },
             None => Error::Http(msg),
         }
     }
 }
 
 impl Error {
+    /// Whether this is a **transport** failure — the server never answered at
+    /// all (DNS, connect, TLS, a timeout, a dropped connection), as opposed to a
+    /// server that answered, even badly.
+    ///
+    /// The distinction is structural, not textual: `From<reqwest::Error>` keeps
+    /// a status code as [`Error::HttpStatus`] and everything without one as
+    /// [`Error::Http`], and "no status" is precisely "nobody answered". It is
+    /// what [`crate::health`] watches: an unreachable server is a user-facing
+    /// event ("your folder cannot be reached"), a 500 is not.
+    #[must_use]
+    pub fn is_transport(&self) -> bool {
+        matches!(self, Error::Http(_))
+    }
+
     /// Whether retrying this failure is pointless. Used by the asynchronous
     /// uploader: a permanent failure is parked and the user is told; a transient
     /// one is retried until it lands.
@@ -111,8 +128,7 @@ impl Error {
         match self {
             Error::Denied => true,
             Error::HttpStatus { status, .. } => {
-                *status == 507
-                    || ((400..500).contains(status) && *status != 408 && *status != 429)
+                *status == 507 || ((400..500).contains(status) && *status != 408 && *status != 429)
             }
             _ => false,
         }
@@ -152,5 +168,19 @@ mod tests {
             "a transport error is transient"
         );
         assert!(!Error::NotFound.is_permanent());
+    }
+
+    #[test]
+    fn only_a_missing_answer_counts_as_unreachable() {
+        // No status code — nobody answered.
+        assert!(Error::Http("[connect] dns error".into()).is_transport());
+        assert!(Error::Http("[timeout] operation timed out".into()).is_transport());
+        // A status code is an answer, however unwelcome; so is everything that
+        // never left this machine.
+        assert!(!http(500).is_transport(), "the server answered");
+        assert!(!http(401).is_transport(), "the server refused us");
+        assert!(!Error::NotFound.is_transport());
+        assert!(!Error::Auth("revoked".into()).is_transport());
+        assert!(!Error::Other("no write context".into()).is_transport());
     }
 }

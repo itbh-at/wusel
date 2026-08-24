@@ -13,7 +13,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential pkg-config \
         fuse3 libfuse3-dev \
         iproute2 \
+        gnome-keyring dbus-bin \
     && rm -rf /var/lib/apt/lists/*
+
+# gnome-keyring/dbus-bin belong to the *tests*, not to the product: `mise run
+# test` starts a throwaway D-Bus session with an empty keyring so the credential
+# tests exercise the real Secret Service backend (see scripts/test.sh). Without
+# them the suite stops with an install hint instead of quietly testing less.
 
 # iproute2 provides `tc`/`ip`: the E2E responsiveness check (step 9) shapes the
 # download path down to a 3G link so a large read visibly monopolises the single

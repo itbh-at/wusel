@@ -20,6 +20,7 @@ use clap::{Parser, Subcommand};
 use wusel_core::config::{self, Account};
 
 mod doctor;
+mod status;
 
 /// wusel — a virtual Nextcloud filesystem.
 #[derive(Parser)]
@@ -99,6 +100,16 @@ enum Command {
     /// Run the GNOME Shell search provider (a D-Bus service, normally started on
     /// demand by GNOME Shell — see the file-manager integration docs).
     SearchProvider,
+    /// Show what the mount is doing right now, by file name: uploads owed to the
+    /// server (including any parked after a permanent failure), files coming
+    /// down, and the rest of the work in flight. For the person whose files
+    /// these are — unlike `doctor`, which is name-free and made to be shared.
+    Status {
+        /// Keep redrawing until interrupted. Individual reads are far too short
+        /// to be caught by a single print.
+        #[arg(long)]
+        watch: bool,
+    },
     /// Collect diagnostics for a support case: system, daemon, mount, the FUSE
     /// connection's waiting count, the daemon's internal state, and a redacted
     /// journal tail. Prints a report and, with `-o`, writes `<PREFIX>.txt` and
@@ -225,6 +236,10 @@ fn main() -> anyhow::Result<()> {
             CacheCmd::Clear { path } => cmd_cache_clear(&account, path.as_deref()),
         },
         Command::SearchProvider => cmd_search_provider(&account),
+        Command::Status { watch } => status::run(&status::Options {
+            account: account.name().to_string(),
+            watch,
+        }),
         Command::Doctor {
             output,
             include_listing,
@@ -425,11 +440,20 @@ async fn cmd_login(account: &Account, server: &str, use_keyring: bool) -> anyhow
 fn cmd_mount(account: &Account, mountpoint: Option<&str>) -> anyhow::Result<()> {
     let creds_path = account.credentials_path();
     let creds = wusel_core::credentials::load(&creds_path, account.name()).with_context(|| {
-        format!(
-            "no credentials at {} — run `wusel login{} <server-url>` first",
-            creds_path.display(),
-            account_flag(account),
-        )
+        // Only claim the credentials are missing when they actually are. A file
+        // that exists but cannot be used fails for a reason the cause below
+        // states precisely — a keyring entry that is gone, one that cannot be
+        // read, a corrupt file — and prefixing all of them with "no credentials
+        // at …" buried that reason under a wrong summary.
+        if creds_path.exists() {
+            format!("could not load the credentials at {}", creds_path.display())
+        } else {
+            format!(
+                "no credentials at {} — run `wusel login{} <server-url>` first",
+                creds_path.display(),
+                account_flag(account),
+            )
+        }
     })?;
 
     let settings = account.settings();
@@ -444,14 +468,41 @@ fn cmd_mount(account: &Account, mountpoint: Option<&str>) -> anyhow::Result<()> 
     };
     let mountpoint = mountpoint.as_path();
 
+    // The daemon owns the mountpoint, so a systemd unit stays trivial.
+    std::fs::create_dir_all(mountpoint).ok();
+    let target = mountpoint
+        .canonicalize()
+        .unwrap_or_else(|_| mountpoint.to_path_buf());
+
+    // The platform OS-integration backend (Linux notifications + the file-manager
+    // cloud-provider status for this account's mountpoint; a no-op elsewhere or
+    // when D-Bus is absent — fail-soft). Built *before* the first network call,
+    // not after the provider: the very first thing that can go wrong is that the
+    // server cannot be reached, and a start-up that says nothing is exactly the
+    // silence this exists to break.
+    let desktop = wusel_desktop::backend(account.name(), &target);
+    // One shared answer to "can we reach the server?", fed by every request the
+    // engine makes, and the only thing allowed to notify about it.
+    let health = std::sync::Arc::new(wusel_core::health::Reachability::new(
+        &creds.server,
+        std::sync::Arc::clone(&desktop),
+    ));
+
     let http = build_http_client(&settings.tls)?;
-    let dav_user = resolve_dav_user(&http, &creds.server, &creds.login_name, &creds.app_password);
+    let dav_user = resolve_dav_user(
+        &http,
+        &creds.server,
+        &creds.login_name,
+        &creds.app_password,
+        Some(&health),
+    );
     let dav = wusel_core::webdav::WebDavClient::new(
         http,
         &creds.server,
         &creds.login_name,
         &creds.app_password,
-    );
+    )
+    .with_health(std::sync::Arc::clone(&health));
     let dav = match dav_user {
         Some(uid) => dav.with_dav_user(&uid),
         None => dav,
@@ -462,7 +513,10 @@ fn cmd_mount(account: &Account, mountpoint: Option<&str>) -> anyhow::Result<()> 
     let mut provider = wusel_core::provider::Provider::new(dav, state, account)
         .context("could not initialise the provider")?;
 
-    // Instant cache invalidation over notify_push; degrades to TTL if absent.
+    // Instant cache invalidation over notify_push; degrades to TTL if absent. Its
+    // retry loops keep talking to the server when nothing else does, which makes
+    // them the mount's heartbeat: an otherwise idle daemon still learns that the
+    // connection went away — and came back — and tells the user.
     let _push = wusel_core::push::spawn(
         &creds.server,
         &creds.login_name,
@@ -470,18 +524,10 @@ fn cmd_mount(account: &Account, mountpoint: Option<&str>) -> anyhow::Result<()> 
         settings.tls.clone(),
         provider.invalidation_handle(),
         provider.sync_trigger(),
+        Some(std::sync::Arc::clone(&health)),
     );
 
-    // The daemon owns the mountpoint, so a systemd unit stays trivial.
-    std::fs::create_dir_all(mountpoint).ok();
-    let target = mountpoint
-        .canonicalize()
-        .unwrap_or_else(|_| mountpoint.to_path_buf());
-
-    // Plug in the platform OS-integration backend (Linux notifications + the
-    // file-manager cloud-provider status for this account's mountpoint; a no-op
-    // elsewhere or when D-Bus is absent — fail-soft).
-    provider.set_desktop(wusel_desktop::backend(account.name(), &target));
+    provider.set_desktop(desktop);
 
     // Refuse to mount where it would clobber another mount (a shared or nested
     // mountpoint between accounts, or a plain double-mount).
@@ -871,7 +917,16 @@ fn build_provider(account: &Account) -> anyhow::Result<wusel_core::provider::Pro
             )
         })?;
     let http = build_http_client(&account.settings().tls)?;
-    let dav_user = resolve_dav_user(&http, &creds.server, &creds.login_name, &creds.app_password);
+    // No reachability tracking here: this builds a provider for a one-shot
+    // command (search, diagnostics), where a failure is reported in the terminal
+    // the user is looking at — a desktop notification would be redundant noise.
+    let dav_user = resolve_dav_user(
+        &http,
+        &creds.server,
+        &creds.login_name,
+        &creds.app_password,
+        None,
+    );
     let dav = wusel_core::webdav::WebDavClient::new(
         http,
         &creds.server,
@@ -898,24 +953,37 @@ fn build_provider(account: &Account) -> anyhow::Result<wusel_core::provider::Pro
 /// Best-effort: if the lookup fails (offline, an older server), return `None`
 /// and let the caller keep the login name — the previous behaviour, which still
 /// serves reads and small uploads.
+///
+/// This is usually the mount's **first** request, so it is also where an outage
+/// is first seen: the outcome goes to `health` like any other, and the user is
+/// told once it is clear the server is really gone rather than briefly busy.
 fn resolve_dav_user(
     http: &reqwest::Client,
     server: &str,
     login: &str,
     password: &str,
+    health: Option<&wusel_core::health::Reachability>,
 ) -> Option<String> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .ok()?;
-    match rt.block_on(wusel_core::capabilities::whoami(http, server, login, password)) {
+    match rt.block_on(wusel_core::capabilities::whoami(
+        http, server, login, password,
+    )) {
         Ok(id) => {
+            if let Some(health) = health {
+                health.ok();
+            }
             if id != login {
                 tracing::info!(user_id = %id, "resolved the DAV user id (the login name is an alias)");
             }
             Some(id)
         }
         Err(e) => {
+            if let Some(health) = health {
+                health.failed(&e);
+            }
             tracing::warn!(error = %e, "could not resolve the user id; using the login name for DAV paths");
             None
         }

@@ -287,10 +287,7 @@ impl Replies {
     /// difference that pinpointed the read that never got answered.
     #[must_use]
     pub fn pending_count(&self) -> usize {
-        self.pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .len()
+        self.pending.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     /// Give back a parked reply — used when submitting fails, so the caller is

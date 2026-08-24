@@ -834,7 +834,10 @@ mod tests {
     fn the_diag_socket_path_is_deterministic_and_within_the_unix_limit() {
         let a = diag_socket_for_mount(std::path::Path::new("/home/gnome/Wusel"));
         let b = diag_socket_for_mount(std::path::Path::new("/home/gnome/Wusel"));
-        assert_eq!(a, b, "same mountpoint, same socket — producer and consumer agree");
+        assert_eq!(
+            a, b,
+            "same mountpoint, same socket — producer and consumer agree"
+        );
         assert_ne!(
             a,
             diag_socket_for_mount(std::path::Path::new("/home/gnome/Other")),
@@ -916,7 +919,12 @@ mod tests {
 
     #[test]
     fn http1_only_defaults_off() {
-        assert!(!parse_settings("[tls]\ninsecure = false\n").unwrap().tls.http1_only);
+        assert!(
+            !parse_settings("[tls]\ninsecure = false\n")
+                .unwrap()
+                .tls
+                .http1_only
+        );
         assert!(!parse_settings("").unwrap().tls.http1_only);
     }
 

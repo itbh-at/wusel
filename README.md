@@ -73,6 +73,10 @@ Files appear *online-only* and are streamed from the server as you read them
   or nothing for the whole account), `wusel unpin`, `wusel pins`.
 - **Multiple accounts** (optional): add `--account work` to `login`/`mount`;
   `wusel accounts`, `wusel account remove <name>`. The default account needs no flag.
+- **What is happening right now**: `wusel status` names the uploads still owed to
+  the server, the files coming down and the rest of the work in flight
+  (`--watch` to follow it). `wusel doctor` is the other half — a name-free
+  diagnostics bundle you can attach to a ticket.
 - **Configuration** (optional): `~/.config/wusel/config.toml` — cache
   budget/age, revalidation TTL, TLS trust (`ca_cert` / `insecure` for
   self-signed servers), mountpoint. Step-by-step: [Trying it

@@ -1,0 +1,153 @@
+////
+  // SPDX-License-Identifier: Apache-2.0
+  // Copyright 2026 IT Beratung Hermann GmbH
+////
+
+= Known limitations
+:description: Behaviour that is understood, reproducible and not yet fixed — what you see, why it is so, and what removing it would take.
+
+Behaviour that is understood, reproducible and *not* fixed yet. Every entry says
+what you see, why the software behaves that way, and what removing the
+limitation would take — including the cases where the desktop offers no
+cooperative way out and the answer has to come from the filesystem itself.
+
+This page is deliberately separate from its neighbours: the
+xref:roadmap.adoc[Roadmap] says what is *planned*, and
+xref:troubleshooting.adoc[Troubleshooting] answers "my mount is broken, what
+now?". Nothing here is broken — it is the current shape of the product, stated
+plainly so nobody has to rediscover it.
+
+[#cache-clear-needs-unmount]
+== `cache clear <path>` refuses while the account is mounted
+
+[source,console]
+----
+$ wusel cache clear Photos/Birdie.jpg
+Error: account 'default' is currently mounted at /home/you/Wusel — unmount
+first (`wusel service disable` or stop the running `wusel mount`)
+----
+
+The guard is unconditional: it refuses the same way whether you clear the whole
+account or one path below it.
+
+For the *whole account* that is necessary. A full clear deletes the state
+database and the blob cache directory outright, and a running daemon holds both
+open — removing them under a live mount pulls the session's ground out from
+under it.
+
+For a *single path* there is no such reason. Dropping the cached content of one
+file, or forgetting one subtree's metadata, is an ordinary write to structures
+the daemon writes to all day; it has one writer and a collision policy for
+exactly this (xref:concurrency.adoc[Concurrency]). The command refuses because
+of *where* the work happens, not what it is: `cache clear` does it itself, in
+the CLI process, opening the account's database from a second process. The blunt
+guard is what keeps that second writer out of the daemon's way.
+
+Removing the limitation needs no new machinery. The daemon already answers a
+per-user socket — that is how `wusel status` and `wusel doctor` ask it what it
+is doing. A per-path clear handed over that socket would run *inside* the
+daemon, where it is just another write, and the mount could stay up; the file's
+emblem would fall back to `online-only` as the eviction lands.
+
+Until then, stop the account for the moment it takes:
+
+[source,sh]
+----
+systemctl --user stop wusel@default
+wusel cache clear Photos/Birdie.jpg
+systemctl --user start wusel@default
+----
+
+`wusel unpin` is unaffected and works on a live mount — but it only releases a
+file for eviction, it does not free the space now.
+
+[#previews-hydrate-files]
+== A preview or an indexer can pull whole files down
+
+Open a folder of large, never-opened documents in the file manager and the cache
+fills with files nobody asked for: `du -sh ~/.cache/wusel` grows, emblems flip
+from online-only to cached by themselves, and the traffic is real. PDFs are the
+clearest case, because rendering a thumbnail means parsing the document.
+
+*Why it happens.* A VFS has exactly one signal for "the user wants this file":
+reads. Wusel tallies what has been read per file, and once a file is read past a
+floor of half a megabyte it stops serving bytes piecemeal and caches the whole
+file in the background. That threshold is what makes an ordinary open cheap
+(a MIME sniff of a few kilobytes never triggers it) and reliable (a real open
+crosses it at once, so the file is cached on the *first* open). A thumbnailer is
+indistinguishable from a person at this level: it opens the file and reads it,
+and for a PDF it reads well past the floor. The download is correct by the rule
+and wrong by intent.
+
+*Why the desktop cannot simply be asked.* Verified on a live mount under GNOME
+50 / glib 2.88: GIO reports `filesystem::type: fuse` and `filesystem::remote:
+FALSE` — a FUSE mount is *local* as far as the desktop is concerned. The one
+attribute that would say otherwise, `filesystem::use-preview`, is never
+delivered by the local GIO backend; only GVfs backends set it, and a kernel
+mount is not one. So Nautilus's own "thumbnails for local files only" setting
+counts us as local, and an extension cannot decline on our behalf either:
+`libnautilus-extension` offers info, menu, column and property-page providers,
+and nothing that vetoes a preview. There is no cooperative channel — the
+decision can only be made in the filesystem.
+
+*What a fix would have to do.* The filesystem knows which process is calling.
+A file *opened* by a process that is recognisably a previewer or an indexer can
+be refused instead of fetched, while anything already on local disk keeps
+opening as before. That makes Wusel judge callers by name, which is a heuristic
+and a policy — so it belongs in the configuration, not in silent built-in
+behaviour. It also has a price worth knowing in advance: GNOME records a
+*failed* thumbnailer run and does not retry it until the file's timestamp or
+size changes, so a file that is pinned later can keep a generic icon until that
+record is cleared (`rm -rf ~/.cache/thumbnails/fail/gnome-thumbnail-factory`).
+
+Today, only the indexer half has an answer: `[desktop]
+exclude_from_indexers` (on by default) makes the mount serve synthetic
+`.trackerignore` / `.nomedia` markers that GNOME Tracker/LocalSearch honour —
+see xref:file-manager.adoc[File-manager integration]. Previews are not covered
+by it. Turning thumbnails off in the file manager works, but it is a global
+setting; there is no per-folder scope for it.
+
+[#emblem-survives-the-copy]
+== A copy made outside the mount keeps its emblem
+
+Copy a file from `~/Wusel` to `~/Documents` in the file manager, and the copy
+still carries a Wusel emblem — and its context menu still offers *Make Available
+Offline* — on a plain ext4 file that has nothing to do with Nextcloud any more.
+
+*Why it happens.* Per-file state travels as the extended attribute
+xref:file-manager.adoc#xattr[`user.wusel.state`], a deliberate contract that any
+file manager's plugin can read with one local, network-free call. The copy is
+faithful to it: GIO declares the *entire* extended-attribute namespace as "copy
+the value when the file is copied", and `cp -a`, `rsync -X` and `tar --xattrs`
+do the same on request. So the attribute arrives at the destination, where it is
+dead — nothing updates it, and no daemon owns that path.
+
+*Why no attribute can fix this.* There is no channel on Linux that can express
+"do not copy me". The one namespace flagged copy-on-move-only is `xattr-sys`,
+which is not ours to write, and freedesktop's own emblem channel
+`metadata::emblems` carries the same copy-with-the-file flag. This is also why
+nobody solves it that way: every comparable client — Nextcloud's own desktop
+client, Dropbox, Seafile, MEGA, pCloud — pushes per-file state to its
+file-manager extension over a socket and *registers its sync roots with the
+extension first*, so the extension only judges paths beneath a root it knows.
+Where extended attributes genuinely do drive emblems (tags, ratings, download
+origin) they describe a property *of the file*, and travelling with a copy is
+the point. `user.wusel.state` describes where the file *is*, not what it is.
+
+*Where the fix belongs.* On the reading side. Every reader of the attribute — the
+Nautilus extension today, the planned Dolphin/Nemo/Thunar plugins tomorrow — has
+to establish that the path is on a Wusel mount before it trusts what it finds
+there, instead of taking the attribute's presence as proof. Dropping the
+attribute from the mount's `listxattr` would stop the copy at the source, but it
+would also break `getfattr -d` as the diagnostic affordance it is built to be,
+and it is a trick nobody else plays: once no reader trusts the value off the
+mount, the leftover is inert.
+
+A stale emblem is cosmetic — the menu actions address a path the daemon does not
+manage and simply fail. Leftovers can be found and removed by hand:
+
+[source,sh]
+----
+getfattr -R -n user.wusel.state ~ 2>/dev/null   # find copies carrying it
+setfattr -x user.wusel.state <file>             # drop it from one file
+----

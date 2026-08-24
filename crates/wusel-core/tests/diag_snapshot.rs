@@ -110,7 +110,9 @@ fn the_substrate_reports_a_stuck_fetch_while_the_decider_stays_responsive() {
 
     // The snapshot comes back even though the fetch is stuck — the decider is
     // not what is blocked.
-    let snap = substrate.snapshot().expect("snapshot while a fetch is stuck");
+    let snap = substrate
+        .snapshot()
+        .expect("snapshot while a fetch is stuck");
     assert_eq!(snap.machine.objects.len(), 1, "one object is busy");
     let o = &snap.machine.objects[0];
     assert_eq!(o.object, object.0, "named by inode, not by file name");

@@ -17,4 +17,5 @@
 * xref:trying-it-out.adoc[Trying it out]
 * xref:file-manager.adoc[File-manager integration]
 * xref:troubleshooting.adoc[Troubleshooting]
+* xref:known-limitations.adoc[Known limitations]
 * xref:rust-learning-path.adoc[Rust Learning Path]

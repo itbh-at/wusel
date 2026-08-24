@@ -124,6 +124,18 @@ config must survive it. A `Notice` variant for it (there is none today; the
 closest is `ConnectionLost`), and a re-auth path that resumes the loops once a
 fresh app password is in place.
 
+* ⬜ **Restructure the documentation by audience — high priority, right after the
+  current release.** Testers report the docs are hard to navigate and, in
+  particular, that it is not clear what to do after installing the RPM (the
+  content exists — xref:installation.adoc[Installation] covers login, the
+  systemd service and, in _More than one Nextcloud account_, per-account
+  `desktop install-provider` — but testers do not find it). The fix is
+  structural, not just more content: split into an end-user section (install,
+  turn on, day-to-day use, troubleshooting), an administrator section where it
+  actually differs from the end-user path (currently it mostly does not — call
+  that out explicitly rather than inventing a distinction), and a developer
+  section (architecture, building, contributing). Landing page and nav should
+  route by audience from the top, not leave a flat page list to search.
 * ◐ The 3-way text merge is implemented and covered by mock end-to-end tests, but
   not yet verified against a live Nextcloud — treat it as experimental until it is.
 * ◐ Emblem refresh announces a file *arriving* in the cache on every route
@@ -137,10 +149,10 @@ fresh app password is in place.
   with the bottom-left menu to switch. The version is supplied by the *site*
   playbook (`antora-playbook-site.yml`, run by `build.sh site`), not by
   `antora.yml` — a value there would override the mapping, which is precisely how
-  the pre-versioning tags collided when first tried (they carry `version: ~`).
-  `v0.1.0` stays excluded; `v0.2.0` was re-tagged onto a commit whose `antora.yml`
-  omits the key, so it joins the menu as `0.2.0`, and each `vX.Y.Z` from then on
-  appears automatically. Local editing is unaffected — `antora-playbook.yml`
+  the original release commits collided (they carry `version: ~`). Both tags were
+  moved onto commits whose `antora.yml` omits the key, so `v0.1.0` → `0.1.0` (its
+  shipped docs) and `v0.2.0` → `0.2.0` join the menu, and each `vX.Y.Z` from then
+  on appears automatically. Local editing is unaffected — `antora-playbook.yml`
   still previews the working tree via `build.sh` / `build.sh watch`.
 * ⬜ Re-crawl a pinned directory to pick up files added after the pin; prefetch
   policy and exclusion patterns.

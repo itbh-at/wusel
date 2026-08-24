@@ -31,6 +31,18 @@ pub struct DiagReport {
     pub machine: MachineReport,
     /// Background refreshes in flight.
     pub refreshing: usize,
+    /// File ids of whole-file hydrations running right now — the background
+    /// downloads that never become flows and so appear nowhere in `machine`.
+    ///
+    /// File ids rather than paths, for the same reason the rest of this report
+    /// speaks in inodes: a support bundle must not carry the user's names.
+    /// Whoever holds the state database resolves them (`wusel status` does).
+    ///
+    /// Defaulted rather than required, so a newer `doctor` reading an older
+    /// mount gets an empty list instead of a parse error — which is why adding
+    /// it did not need a [`SCHEMA`] bump.
+    #[serde(default)]
+    pub hydrating: Vec<u64>,
     /// How many threads each pool runs.
     pub pools: PoolsReport,
     /// FUSE replies parked while their work runs — the count that, held against
@@ -94,6 +106,7 @@ impl DiagReport {
                 buffers_dirty: s.machine.buffers_dirty,
             },
             refreshing: s.refreshing,
+            hydrating: s.hydrating.clone(),
             pools: PoolsReport {
                 db_readers: s.pools.db_readers,
                 net: s.pools.net,
@@ -118,8 +131,7 @@ impl DiagReport {
     /// # Errors
     /// If the bytes are not the JSON this version understands.
     pub fn from_json(s: &str) -> crate::Result<Self> {
-        serde_json::from_str(s)
-            .map_err(|e| crate::Error::Other(format!("parse diagnostics: {e}")))
+        serde_json::from_str(s).map_err(|e| crate::Error::Other(format!("parse diagnostics: {e}")))
     }
 }
 
@@ -145,6 +157,7 @@ mod tests {
                 buffers_dirty: 1,
             },
             refreshing: 0,
+            hydrating: vec![9001],
             pools: PoolSizes {
                 db_readers: 2,
                 net: 4,
@@ -171,6 +184,10 @@ mod tests {
         assert_eq!(o.step, "FetchBytes");
         assert_eq!(o.waiters, 3);
         assert_eq!(report.pools.net, 4);
+        // The background download nothing else can see: absent from `machine`,
+        // because a hydration never becomes a flow.
+        assert_eq!(report.hydrating, vec![9001]);
+        assert!(report.machine.objects.iter().all(|o| o.object != 9001));
         // Produced without a frontend: no parked-reply count, and omitted from
         // the JSON rather than written as null.
         assert_eq!(report.replies_pending, None);

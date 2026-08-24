@@ -37,8 +37,31 @@ pub struct Mock {
 impl Mock {
     /// Serve `root` as user `alice` (what every test uses) on an OS-chosen port.
     pub fn serve(root: &Path) -> Self {
-        // Bind synchronously so the port is ours before this returns.
-        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock listener");
+        Self::serve_on(root, "127.0.0.1:0")
+    }
+
+    /// Serve on a *named* address. Only one test needs it — the one that takes
+    /// the server away and brings it back, where "back" has to mean the same
+    /// address the engine is already pointed at. `127.0.0.1:0` (an OS-chosen
+    /// port) is what everything else uses; see [`serve`](Self::serve).
+    pub fn serve_on(root: &Path, bind: &str) -> Self {
+        // Bind synchronously so the port is ours before this returns. A rebind
+        // right after the previous listener was dropped can lose a race with the
+        // kernel releasing it, so give it a moment rather than failing the test
+        // over a timing artefact.
+        let std_listener = {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                match std::net::TcpListener::bind(bind) {
+                    Ok(l) => break l,
+                    Err(e) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(50));
+                        let _ = e;
+                    }
+                    Err(e) => panic!("bind mock listener on {bind}: {e}"),
+                }
+            }
+        };
         let addr = std_listener
             .local_addr()
             .expect("mock listener addr")
@@ -177,6 +200,18 @@ impl Engine {
         addr: &str,
         desktop: Option<std::sync::Arc<dyn wusel_core::desktop::Desktop>>,
     ) -> Self {
+        Self::start_with_health(addr, desktop, None)
+    }
+
+    /// The same again, with a reachability tracker attached to the WebDAV client
+    /// *before* the provider derives its background clients from it — so the
+    /// syncer, the hydrator and the revalidator all report to the same one, the
+    /// way the daemon wires them.
+    pub fn start_with_health(
+        addr: &str,
+        desktop: Option<std::sync::Arc<dyn wusel_core::desktop::Desktop>>,
+        health: Option<std::sync::Arc<wusel_core::health::Reachability>>,
+    ) -> Self {
         let account = Account::new("default");
         let dav = WebDavClient::new(
             reqwest::Client::new(),
@@ -184,6 +219,10 @@ impl Engine {
             "alice",
             "pw",
         );
+        let dav = match health {
+            Some(h) => dav.with_health(h),
+            None => dav,
+        };
         std::fs::create_dir_all(account.state_db_path().parent().unwrap()).unwrap();
         let state = StateDb::open(&account.state_db_path()).unwrap();
         let mut provider = Provider::new(dav, state, &account).unwrap();

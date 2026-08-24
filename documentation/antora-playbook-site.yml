@@ -18,10 +18,13 @@ content:
       start_path: documentation
       # `main` is "latest"; a release tag vX.Y.Z becomes the version X.Y.Z.
       branches: [main]
-      # v0.1.0 predates this setup — its antora.yml carries an explicit
-      # `version: ~`, which overrides the mapping below and would collide with
-      # every other ref. It is excluded. (v0.2.0 was re-tagged onto a commit
-      # whose antora.yml omits the key, so it joins the selector as 0.2.0.)
+      # Release tags join the selector, with one exception. The retagging onto
+      # commits whose antora.yml omits the `version` key happened in the
+      # internal repository; the tag published as v0.1.0 still points at the
+      # original commit and carries `version: ~`. That makes the ref
+      # *unversioned*, which collides with any other unversioned ref and takes
+      # the site root — visitors would land on one release's documentation
+      # instead of the current one. Excluded until it is ever republished.
       tags: ['v*', '!v0.1.0']
       version:
         'v(?<version>+({0..9}).+({0..9}).+({0..9}))': $<version>

@@ -51,6 +51,24 @@ All three tiers run under `mise run test` — they are ordinary `cargo test` cas
 (the standalone mock via an integration test; `wusel-mock` is also a library, so
 tests can drive it in-process).
 
+[NOTE]
+====
+On Linux `mise run test` is not a bare `cargo test`: `scripts/test.sh` wraps the
+run in a private D-Bus session with an empty, unlocked keyring
+(`dbus-run-session` + `gnome-keyring-daemon`, files under a temporary
+`XDG_DATA_HOME`). Install those two on a fresh machine — Fedora
+`sudo dnf install gnome-keyring dbus-daemon`, Debian/Ubuntu
+`sudo apt-get install gnome-keyring dbus-bin`; without them the suite stops and
+says so rather than testing less than it claims.
+
+It buys two things. The credential tests answer the same on an unlocked GNOME
+desktop and in a bare container, instead of depending on whether the machine
+happens to have a Secret Service. And no test can touch your own login keyring —
+the same account key the product uses. See _Credential storage_ in
+xref:architecture.adoc[Architecture] for how the keyring's failure modes are
+covered without a keyring at all.
+====
+
 * *Real FUSE mount (Linux, `/dev/fuse`).* `mise run fuse-test` mounts the full
   stack — engine + FUSE — against the in-process `wusel-mock` and drives it through
   the kernel: `ls`, `cat`, `stat`, `statfs`, then unmount. It needs a Linux

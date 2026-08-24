@@ -25,9 +25,18 @@ kernel wait-channels, the mount table, the FUSE connection's `waiting` count, a
 timed check that the mountpoint still answers, the effective configuration, and
 — from the running daemon over a per-user socket — the engine's own view of what
 each object is doing. A `PASS`/`WARN`/`FAIL` summary sits on top; the headline
-check is the one that matters most, the `waiting` count held against the
-daemon's parked-reply total, which is the signature of a mount that has stopped
-answering.
+check is the one that matters most, and it is the reason `doctor` sometimes
+pauses for two seconds before it prints: it samples the mount twice.
+
+No single instant can tell a wedged mount from a busy one. A request that is
+merely in flight has a reply parked for it from the moment it arrives, so
+`waiting` and the parked-reply total agree on any mount that is doing work.
+What separates the two is whether the work *moves*. If the same job — the same
+inode, intent and step — is still handed out to a worker two seconds later, or
+a reply is still parked with nothing running behind it at all, the mount has
+stopped answering and that is a `FAIL`. If the work moved on, it was load, and
+`doctor` says so. Both samples are printed in the `ENGINE` section, so the
+report shows its own evidence.
 
 To send the result to us, write the bundle to files and attach them:
 
@@ -47,6 +56,45 @@ states exactly what is and is not redacted. `--no-logs` omits the journal tail;
 Every probe is best-effort: one that cannot run says why, and the rest go on —
 so the report is still useful on a half-broken system, which is exactly when it
 is needed.
+
+== "Is my file saved?" — `wusel status`
+
+`doctor` answers *is the mount healthy*. When the question is *what is happening
+to my files*, use:
+
+[source,console]
+----
+$ wusel status
+wusel status — account default
+
+UPLOADS (1)
+  PARKED     Documents/report.odt
+               Permanent (after 3 attempt(s))
+
+DOWNLOADS (1)
+  caching    Videos/talk.mp4 (412.0 MiB)
+
+buffers: 1 open, 1 with unsaved changes
+----
+
+It names files, which is exactly why it is a separate command and not a flag on
+`doctor`: this output is for you, in your terminal, and there is no way to write
+it to a file for someone else.
+
+The **UPLOADS** section is the one to check after saving something. It is read
+from the state database rather than from the daemon, so it is reported even when
+nothing is mounted, and it distinguishes three states: `waiting` (owed, the
+uploader will get to it), `sending` (on its way), and `PARKED` — an upload given
+up after a *permanent* failure such as a conflict, missing permissions or a full
+quota. A parked upload is the one case that needs you: the file reads as saved
+locally, it is **not** on the server, and nothing will retry it on its own. Your
+bytes are safe in the buffer either way.
+
+**DOWNLOADS** separates the two things a user would call downloading: `reading`
+is a range being served live to whoever asked for it, `caching` is a whole-file
+hydration running in the background with nobody waiting for it. Individual reads
+last milliseconds, so a single run only catches a sample of them —
+`wusel status --watch` redraws once a second.
 
 == Where things have been tested
 
@@ -158,6 +206,38 @@ Historically two distinct causes; both are visible in the logs now:
 * On a Range-ignoring server (see above) every partial read transfers the whole
   file — the warning line tells you.
 
+== The folder stalls and nothing happens — is it hung, or is it the network?
+
+Almost always the network, and the mount says so on its own: when the server
+stays unreachable for about ten seconds, a **"Connection lost"** notification
+names the server, and the file manager's account status switches to *error*. A
+second notification announces the connection coming back. Both are localized;
+neither repeats while the outage lasts (one per incident, not one per failed
+request).
+
+Two things follow from that, when a mount seems stuck:
+
+* *You got the notification* — this is an outage, not a defect. Files that are
+  kept offline stay readable; everything else waits. Nothing has to be killed or
+  unmounted, and no work is lost: pending uploads are retried when the connection
+  returns.
+* *You got no notification* — either the server is answering (then it is not a
+  connectivity problem: look at the journal for the status it answers with), or
+  the notification channel itself is not working. Check that with
+  `wusel desktop notify`; if the test notices do not appear either, see
+  <<ssh-session>>.
+
+The journal carries the detail in both cases — the failing URL and the reason
+(`[connect] … dns error`, `[timeout] …`):
+
+[source,sh]
+----
+journalctl --user -u wusel@default -g 'unreachable|connect|timeout' -n 50
+----
+
+`wusel doctor` also reports connectivity, and is the better first step if the
+mount answers to nothing at all.
+
 == Cache vs. server problems
 
 To rule the cache out (or reset a tester's machine to a fresh-connect state)
@@ -169,8 +249,11 @@ wusel cache clear            # whole account: metadata, content, pins
 wusel cache clear Photos     # one subtree, recursively
 ----
 
-Run it while the account is not mounted. If a problem survives `cache clear`,
-it is not a caching problem.
+Run it while the account is not mounted — including for a single path, where
+that requirement is a
+xref:known-limitations.adoc#cache-clear-needs-unmount[known limitation] rather
+than a technical necessity. If a problem survives `cache clear`, it is not a
+caching problem.
 
 == What a conflict should look like
 

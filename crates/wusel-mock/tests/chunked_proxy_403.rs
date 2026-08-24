@@ -26,7 +26,9 @@ fn a_proxy_403_on_the_assembly_move_counts_as_success_when_the_file_landed() {
 
     // >4 MiB so it is chunked; the name carries the mock's proxy-403 marker.
     let data: Vec<u8> = (0..6 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
-    let node = engine.create(ROOT_INODE, "big.proxy-403.bin").expect("create");
+    let node = engine
+        .create(ROOT_INODE, "big.proxy-403.bin")
+        .expect("create");
     engine.write(node.inode, 0, &data).expect("write");
     engine.flush(node.inode).expect("flush");
     engine.wait_for_uploads();
@@ -50,7 +52,10 @@ fn a_proxy_403_on_the_assembly_move_counts_as_success_when_the_file_landed() {
         .flatten()
         .filter(|e| e.file_name().to_string_lossy().contains("conflicted copy"))
         .count();
-    assert_eq!(copies, 0, "a recognised success must not spawn a conflicted copy");
+    assert_eq!(
+        copies, 0,
+        "a recognised success must not spawn a conflicted copy"
+    );
 
     std::fs::remove_dir_all(&base).ok();
 }

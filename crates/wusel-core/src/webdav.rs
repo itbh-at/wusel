@@ -11,6 +11,7 @@
 
 use std::io::Read;
 use std::path::Path;
+use std::sync::Arc;
 
 use quick_xml::events::Event;
 use quick_xml::Reader;
@@ -31,6 +32,10 @@ pub struct WebDavClient {
     base: String,
     login_name: String,
     app_password: String,
+    /// Where every request outcome is reported, so an outage becomes one
+    /// notification instead of a mount that looks hung. `None` in tests and for
+    /// callers with no desktop — the client works exactly the same without it.
+    health: Option<Arc<crate::health::Reachability>>,
 }
 
 impl WebDavClient {
@@ -50,7 +55,18 @@ impl WebDavClient {
             base,
             login_name: login_name.to_string(),
             app_password: app_password.to_string(),
+            health: None,
         }
+    }
+
+    /// Report every request outcome to `health`, so a server that stops
+    /// answering becomes a notification the user actually sees (see
+    /// [`crate::health`]). Carried into every derived client, so the
+    /// hydrator, the revalidator and the syncer all report to the same place.
+    #[must_use]
+    pub fn with_health(mut self, health: Arc<crate::health::Reachability>) -> Self {
+        self.health = Some(health);
+        self
     }
 
     /// A copy of this client that uses a **separate** reqwest client (its own
@@ -66,6 +82,7 @@ impl WebDavClient {
             base: self.base.clone(),
             login_name: self.login_name.clone(),
             app_password: self.app_password.clone(),
+            health: self.health.clone(),
         }
     }
 
@@ -115,6 +132,33 @@ impl WebDavClient {
         Ok(url)
     }
 
+    /// Send a request (retrying a dropped connection, see [`send_retrying`]) and
+    /// report the outcome to the reachability tracker.
+    ///
+    /// **Every** request goes through here, and that is the point: whether the
+    /// server can be reached is a property of the connection, not of any one
+    /// operation. One choke point turns it into a fact the engine holds — and
+    /// can tell the user once — instead of a warning each call site logs into a
+    /// journal nobody reads.
+    async fn send(&self, req: reqwest::RequestBuilder) -> Result<reqwest::Response> {
+        match send_retrying(req).await {
+            Ok(resp) => {
+                // An answer is an answer: a 500 says the server is *there*.
+                if let Some(health) = &self.health {
+                    health.ok();
+                }
+                Ok(resp)
+            }
+            Err(e) => {
+                let e = Error::from(e);
+                if let Some(health) = &self.health {
+                    health.failed(&e);
+                }
+                Err(e)
+            }
+        }
+    }
+
     /// Lists a directory (depth 1) and returns its immediate children.
     pub async fn propfind_dir(&self, path: &str) -> Result<Vec<RemoteEntry>> {
         const BODY: &str = r#"<?xml version="1.0"?>
@@ -129,19 +173,20 @@ impl WebDavClient {
   </d:prop>
 </d:propfind>"#;
 
-        let resp = send_retrying(
-            self.http
-                .request(
-                    reqwest::Method::from_bytes(b"PROPFIND").unwrap(),
-                    self.url_for(path, true)?,
-                )
-                .basic_auth(&self.login_name, Some(&self.app_password))
-                .header("Depth", "1")
-                .header("Content-Type", "application/xml")
-                .body(BODY),
-        )
-        .await?
-        .error_for_status()?;
+        let resp = self
+            .send(
+                self.http
+                    .request(
+                        reqwest::Method::from_bytes(b"PROPFIND").unwrap(),
+                        self.url_for(path, true)?,
+                    )
+                    .basic_auth(&self.login_name, Some(&self.app_password))
+                    .header("Depth", "1")
+                    .header("Content-Type", "application/xml")
+                    .body(BODY),
+            )
+            .await?
+            .error_for_status()?;
 
         let xml = resp.text().await?;
         let mut entries = parse_multistatus(&xml, &self.base)?;
@@ -179,18 +224,19 @@ impl WebDavClient {
     pub async fn remote_meta(&self, path: &str) -> Result<Option<(u64, String)>> {
         const BODY: &str = r#"<?xml version="1.0"?>
 <d:propfind xmlns:d="DAV:"><d:prop><d:getcontentlength/><d:getetag/></d:prop></d:propfind>"#;
-        let resp = send_retrying(
-            self.http
-                .request(
-                    reqwest::Method::from_bytes(b"PROPFIND").unwrap(),
-                    self.url_for(path, false)?,
-                )
-                .basic_auth(&self.login_name, Some(&self.app_password))
-                .header("Depth", "0")
-                .header("Content-Type", "application/xml")
-                .body(BODY),
-        )
-        .await?;
+        let resp = self
+            .send(
+                self.http
+                    .request(
+                        reqwest::Method::from_bytes(b"PROPFIND").unwrap(),
+                        self.url_for(path, false)?,
+                    )
+                    .basic_auth(&self.login_name, Some(&self.app_password))
+                    .header("Depth", "0")
+                    .header("Content-Type", "application/xml")
+                    .body(BODY),
+            )
+            .await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
@@ -221,7 +267,7 @@ impl WebDavClient {
         if let Some((start, len)) = range {
             req = req.header("Range", format!("bytes={}-{}", start, start + len - 1));
         }
-        let resp = send_retrying(req).await?;
+        let resp = self.send(req).await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             // Deleted on the server since we last listed it — a distinct, benign
             // signal (the caller prunes the stale node), not a transport failure.
@@ -258,7 +304,7 @@ impl WebDavClient {
             .http
             .get(self.url_for(path, false)?)
             .basic_auth(&self.login_name, Some(&self.app_password));
-        let resp = send_retrying(req).await?;
+        let resp = self.send(req).await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Err(Error::NotFound);
         }
@@ -276,10 +322,11 @@ impl WebDavClient {
     pub async fn get_with_etag(&self, path: &str) -> Result<(bytes::Bytes, Option<String>)> {
         tracing::debug!(%path, "GET (with ETag)");
         let resp = self
-            .http
-            .get(self.url_for(path, false)?)
-            .basic_auth(&self.login_name, Some(&self.app_password))
-            .send()
+            .send(
+                self.http
+                    .get(self.url_for(path, false)?)
+                    .basic_auth(&self.login_name, Some(&self.app_password)),
+            )
             .await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Err(Error::NotFound);
@@ -296,14 +343,15 @@ impl WebDavClient {
     /// later refinement; a plain PUT is correct for any size.
     pub async fn put(&self, path: &str, body: Vec<u8>) -> Result<Option<String>> {
         tracing::debug!(%path, bytes = body.len(), "PUT");
-        let resp = send_retrying(
-            self.http
-                .put(self.url_for(path, false)?)
-                .basic_auth(&self.login_name, Some(&self.app_password))
-                .body(body),
-        )
-        .await?
-        .error_for_status()?;
+        let resp = self
+            .send(
+                self.http
+                    .put(self.url_for(path, false)?)
+                    .basic_auth(&self.login_name, Some(&self.app_password))
+                    .body(body),
+            )
+            .await?
+            .error_for_status()?;
         Ok(etag_from_headers(&resp))
     }
 
@@ -327,7 +375,7 @@ impl WebDavClient {
         if let Some(m) = mtime {
             req = req.header("X-OC-Mtime", m.to_string());
         }
-        let resp = send_retrying(req.body(body)).await?;
+        let resp = self.send(req.body(body)).await?;
         if resp.status() == reqwest::StatusCode::PRECONDITION_FAILED {
             return Ok(PutResult::Conflict);
         }
@@ -339,27 +387,29 @@ impl WebDavClient {
     /// Creates a collection (directory) with `MKCOL`.
     pub async fn mkcol(&self, path: &str) -> Result<()> {
         tracing::debug!(%path, "MKCOL");
-        self.http
-            .request(
-                reqwest::Method::from_bytes(b"MKCOL").unwrap(),
-                self.url_for(path, true)?,
-            )
-            .basic_auth(&self.login_name, Some(&self.app_password))
-            .send()
-            .await?
-            .error_for_status()?;
+        self.send(
+            self.http
+                .request(
+                    reqwest::Method::from_bytes(b"MKCOL").unwrap(),
+                    self.url_for(path, true)?,
+                )
+                .basic_auth(&self.login_name, Some(&self.app_password)),
+        )
+        .await?
+        .error_for_status()?;
         Ok(())
     }
 
     /// Deletes a file or directory.
     pub async fn delete(&self, path: &str, is_dir: bool) -> Result<()> {
         tracing::debug!(%path, is_dir, "DELETE");
-        self.http
-            .delete(self.url_for(path, is_dir)?)
-            .basic_auth(&self.login_name, Some(&self.app_password))
-            .send()
-            .await?
-            .error_for_status()?;
+        self.send(
+            self.http
+                .delete(self.url_for(path, is_dir)?)
+                .basic_auth(&self.login_name, Some(&self.app_password)),
+        )
+        .await?
+        .error_for_status()?;
         Ok(())
     }
 
@@ -421,15 +471,16 @@ impl WebDavClient {
         let id = format!("wusel-{}-{}", std::process::id(), unique_suffix());
 
         // 1. MKCOL the upload collection. (Nothing to clean up if this fails.)
-        self.http
-            .request(
-                reqwest::Method::from_bytes(b"MKCOL").unwrap(),
-                self.uploads_url(&id)?,
-            )
-            .basic_auth(&self.login_name, Some(&self.app_password))
-            .send()
-            .await?
-            .error_for_status()?;
+        self.send(
+            self.http
+                .request(
+                    reqwest::Method::from_bytes(b"MKCOL").unwrap(),
+                    self.uploads_url(&id)?,
+                )
+                .basic_auth(&self.login_name, Some(&self.app_password)),
+        )
+        .await?
+        .error_for_status()?;
 
         let outcome = self
             .upload_chunks_and_assemble(&id, target, source, total, mtime)
@@ -469,13 +520,14 @@ impl WebDavClient {
                 break;
             }
             let chunk = self.uploads_url(&format!("{id}/{offset:016}"))?;
-            self.http
-                .put(chunk)
-                .basic_auth(&self.login_name, Some(&self.app_password))
-                .body(buf[..n].to_vec())
-                .send()
-                .await?
-                .error_for_status()?;
+            self.send(
+                self.http
+                    .put(chunk)
+                    .basic_auth(&self.login_name, Some(&self.app_password))
+                    .body(buf[..n].to_vec()),
+            )
+            .await?
+            .error_for_status()?;
             offset += n as u64;
         }
 
@@ -496,7 +548,7 @@ impl WebDavClient {
         if let Some(m) = mtime {
             req = req.header("X-OC-Mtime", m.to_string());
         }
-        let moved = req.send().await;
+        let moved = self.send(req).await;
 
         // Trust the assembled file, not only the MOVE's status code. A reverse
         // proxy in front of Nextcloud can answer the long server-side assembly
@@ -535,12 +587,13 @@ impl WebDavClient {
     /// Best-effort DELETE of an abandoned upload collection (see
     /// [`put_chunked`](Self::put_chunked)).
     async fn delete_upload_collection(&self, id: &str) -> Result<()> {
-        self.http
-            .delete(self.uploads_url(id)?)
-            .basic_auth(&self.login_name, Some(&self.app_password))
-            .send()
-            .await?
-            .error_for_status()?;
+        self.send(
+            self.http
+                .delete(self.uploads_url(id)?)
+                .basic_auth(&self.login_name, Some(&self.app_password)),
+        )
+        .await?
+        .error_for_status()?;
         Ok(())
     }
 
@@ -549,17 +602,18 @@ impl WebDavClient {
     pub async fn move_(&self, from: &str, to: &str, is_dir: bool) -> Result<()> {
         tracing::debug!(%from, %to, is_dir, "MOVE");
         let dest = self.url_for(to, is_dir)?;
-        self.http
-            .request(
-                reqwest::Method::from_bytes(b"MOVE").unwrap(),
-                self.url_for(from, is_dir)?,
-            )
-            .basic_auth(&self.login_name, Some(&self.app_password))
-            .header("Destination", dest.as_str())
-            .header("Overwrite", "T")
-            .send()
-            .await?
-            .error_for_status()?;
+        self.send(
+            self.http
+                .request(
+                    reqwest::Method::from_bytes(b"MOVE").unwrap(),
+                    self.url_for(from, is_dir)?,
+                )
+                .basic_auth(&self.login_name, Some(&self.app_password))
+                .header("Destination", dest.as_str())
+                .header("Overwrite", "T"),
+        )
+        .await?
+        .error_for_status()?;
         Ok(())
     }
 }
@@ -1291,9 +1345,8 @@ mod tests {
     #[test]
     fn with_dav_user_is_a_noop_when_equal_or_empty() {
         for user in ["alice", ""] {
-            let dav =
-                WebDavClient::new(reqwest::Client::new(), "https://x.org", "alice", "pw")
-                    .with_dav_user(user);
+            let dav = WebDavClient::new(reqwest::Client::new(), "https://x.org", "alice", "pw")
+                .with_dav_user(user);
             assert_eq!(
                 dav.url_for("f", false).unwrap().as_str(),
                 "https://x.org/remote.php/dav/files/alice/f"

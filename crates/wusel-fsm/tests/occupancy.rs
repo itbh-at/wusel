@@ -209,6 +209,54 @@ fn a_joined_reader_is_answered_by_the_one_transfer() {
 }
 
 #[test]
+fn a_reader_arriving_at_a_flow_that_was_given_up_is_still_served() {
+    // The mount hung on opening a file with no job left running behind the
+    // parked reply. A reader joined a flow whose last waiter had just left, so
+    // the flow was marked to give up; at its next step it ended as Abandoned,
+    // which answers nobody — and the joiner waited for ever on a locked page.
+    let mut m = Machine::new();
+    let _ = m.on_request(req(1, A, read(0, 16)));
+    // The only waiter goes away: the flow is now marked to give up.
+    let gone = m.abandon(RequestId(1));
+    assert_eq!(
+        answers(&gone),
+        vec![(vec![RequestId(1)], Outcome::Failed(Failure::Interrupted))],
+        "the departing reader is still answered"
+    );
+
+    // A fresh reader of the same range arrives before the flow notices.
+    let joiner = m.on_request(req(2, A, read(0, 16)));
+    assert!(joiner.is_empty(), "nothing dispatched while the flow ends");
+
+    // The step in flight finishes and the flow gives up.
+    let after = m.on_completion(A, a_file());
+    assert!(
+        answers(&after)
+            .iter()
+            .all(|(r, _)| !r.contains(&RequestId(2))),
+        "the abandoned flow does not answer the newcomer with its own outcome"
+    );
+    // …and the newcomer is served by a flow of its own rather than dropped.
+    assert!(m.is_busy(A), "the queued reader started");
+    let after_row = m.on_completion(A, a_file());
+    assert_eq!(
+        jobs(&after_row),
+        vec![Job::FetchRange {
+            object: A,
+            offset: 0,
+            len: 16
+        }],
+        "its own transfer"
+    );
+    let done = m.on_completion(A, Completion::Bytes);
+    assert_eq!(
+        answers(&done),
+        vec![(vec![RequestId(2)], Outcome::Ok)],
+        "and it gets its bytes"
+    );
+}
+
+#[test]
 fn a_queued_request_starts_when_the_object_goes_idle() {
     let mut m = Machine::new();
     let _ = m.on_request(req(1, A, read(0, 16)));
@@ -336,9 +384,11 @@ fn an_abort_lets_the_running_flow_finish_its_step_then_drops_it() {
     // The refresh's outstanding step still completes; the flow then gives up
     // without answering anybody, and the remove starts.
     let actions = m.on_completion(A, a_file());
-    assert!(
-        answers(&actions).is_empty(),
-        "an abandoned flow owes nobody an answer"
+    assert_eq!(
+        answers(&actions),
+        vec![(vec![RequestId(1)], Outcome::Failed(Failure::Interrupted))],
+        "giving up is not a reason to stay silent: whoever is still waiting is \
+         answered, because a dropped reply leaves the kernel holding a locked page"
     );
     // The remove starts by resolving the child it was given by name — the
     // kernel never hands us an identity for it.
@@ -421,7 +471,10 @@ fn abandoning_a_queued_request_answers_it_too() {
     // And having left the queue, it does not start when the flow ends.
     let after_row = m.on_completion(A, a_file());
     let done = m.on_completion(A, Completion::Bytes);
-    let served: Vec<_> = answers(&after_row).into_iter().chain(answers(&done)).collect();
+    let served: Vec<_> = answers(&after_row)
+        .into_iter()
+        .chain(answers(&done))
+        .collect();
     assert_eq!(
         served,
         vec![(vec![RequestId(1)], Outcome::Ok)],

@@ -246,6 +246,17 @@ impl Machine {
                 busy.queue.push_back(request);
                 Vec::new()
             }
+            // A flow that has been given up takes no new riders. Joining one is
+            // how a live reader ends up owed an answer that is never sent: the
+            // flow reaches its next step boundary, sees `abort`, and ends as
+            // [`Next::Abandoned`] — which answers nobody, because "nobody is
+            // waiting" is exactly what setting `abort` meant. The joiner *is*
+            // waiting. Queue it instead, so it runs as its own flow once this
+            // one is gone.
+            Collision::Join if busy.flow.abort => {
+                busy.queue.push_back(request);
+                Vec::new()
+            }
             Collision::Join => {
                 // One transfer, several answers — the whole point of the row.
                 busy.flow.waiters.push(request.id);
@@ -357,7 +368,11 @@ impl Machine {
         let (flow, next) = start(object, request.intent, id, &facts);
         if let Next::Do(job) = next {
             self.beside.insert(id, flow);
-            return vec![Action::ReadBeside { object, job, request: id }];
+            return vec![Action::ReadBeside {
+                object,
+                job,
+                request: id,
+            }];
         }
         // Stat/State always start with a Do; nothing else routes here. Stay
         // total by settling it as an ordinary flow rather than dropping it.
@@ -444,12 +459,17 @@ impl Machine {
                     return actions;
                 }
                 Next::Done | Next::Fail(_) | Next::Abandoned => {
-                    // Abandoned answers nobody: the flow was given up because
-                    // whoever wanted it is gone.
+                    // Abandoned normally answers nobody — the flow was given up
+                    // *because* whoever wanted it is gone. Anyone still waiting
+                    // is therefore not covered by that reasoning and is still
+                    // owed a reply: dropping it leaves the kernel holding a
+                    // locked page for good (see [`Self::abandon`]). Interrupted
+                    // is the honest outcome — the work was given up, not done.
                     if let Some(outcome) = match next {
                         Next::Done => Some(Outcome::Ok),
                         Next::Fail(f) => Some(Outcome::Failed(f)),
-                        Next::Abandoned | Next::Do(_) | Next::AnswerThen(_) => None,
+                        Next::Abandoned => Some(Outcome::Failed(Failure::Interrupted)),
+                        Next::Do(_) | Next::AnswerThen(_) => None,
                     } {
                         if !flow.waiters.is_empty() {
                             actions.push(Action::Answer {

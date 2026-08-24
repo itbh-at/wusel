@@ -2541,12 +2541,6 @@ footer.footer {
     }
 }
 
-/* Single component and version: the component/version selector adds no
-   navigation, so hide it. */
-.nav-panel-explore {
-    display: none;
-}
-
 /* ── ITBH theme accents ──────────────────────────────────────────────────
    Soft blue gradients, navy headings, a pill badge and rounded, accented
    cards — echoing the itbh.at look. Appended last so it layers over the

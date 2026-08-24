@@ -48,7 +48,10 @@ fn a_large_file_written_in_many_chunks_reaches_the_server() {
         "the server file is the wrong size: got {} bytes, expected {total}",
         landed.len()
     );
-    assert_eq!(landed, data, "the server file is not byte-for-byte the source");
+    assert_eq!(
+        landed, data,
+        "the server file is not byte-for-byte the source"
+    );
 
     // Now overwrite it in place — the "compress to ZIP" pattern that spawned a
     // flood of conflicted copies. With the pre-flight precondition check the
@@ -76,7 +79,10 @@ fn a_large_file_written_in_many_chunks_reaches_the_server() {
         .flatten()
         .filter(|e| e.file_name().to_string_lossy().contains("conflicted copy"))
         .count();
-    assert_eq!(copies, 0, "the overwrite spawned {copies} conflicted copies");
+    assert_eq!(
+        copies, 0,
+        "the overwrite spawned {copies} conflicted copies"
+    );
 
     std::fs::remove_dir_all(&base).ok();
 }

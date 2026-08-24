@@ -449,11 +449,21 @@ impl Filesystem for NcFs {
         if name != OsStr::new(STATE_XATTR) {
             return reply.error(Errno::ENODATA);
         }
-        self.go(Pending::Xattr { reply, size }, ino.0, Intent::State);
+        let ino = ino.0;
+        if self.markers && marker_name(ino).is_some() {
+            // A fabrication has no availability state to report — the same
+            // answer a real, unpinned directory gets.
+            return reply.error(Errno::ENODATA);
+        }
+        self.go(Pending::Xattr { reply, size }, ino, Intent::State);
     }
 
     fn listxattr(&self, _req: &Request_, ino: INodeNo, size: u32, reply: ReplyXattr) {
-        self.go(Pending::XattrList { reply, size }, ino.0, Intent::State);
+        let ino = ino.0;
+        if self.markers && marker_name(ino).is_some() {
+            return reply_xattr(reply, &[], size);
+        }
+        self.go(Pending::XattrList { reply, size }, ino, Intent::State);
     }
 
     fn write(

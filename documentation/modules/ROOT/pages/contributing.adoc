@@ -57,9 +57,9 @@ helped write it.
 
 A suspected *vulnerability* does not belong in a public issue. Report it
 privately — GitHub's "Report a vulnerability" form on the repository, or
-mailto:christoph.hermann@itbh.at[christoph.hermann@itbh.at]. Scope, what counts
-as out of scope, and the response times you can expect are in `SECURITY.md` in
-the repository root.
+mailto:support@itbh.at[support@itbh.at] with "Wusel Security" in the subject.
+Scope, what counts as out of scope, and the response times you can expect are
+in `SECURITY.md` in the repository root.
 
 == In short
 

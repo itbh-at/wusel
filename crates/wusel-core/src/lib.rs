@@ -14,6 +14,7 @@
 //! * [`content`] — content delivery: `ContentSource` (live WebDAV) + a caching decorator
 //! * [`capabilities`] — OCS capability discovery (the notify_push endpoint)
 //! * [`push`]   — notify_push WebSocket client for instant cache invalidation
+//! * [`health`] — is the server reachable? one shared answer, and the connection-lost/restored notices
 //! * [`provider`] — the frontend-agnostic facade (list/stat/lookup/read) every OS frontend calls
 //!
 //! This crate builds and tests natively on Linux and macOS — no FUSE, no kernel module.
@@ -22,10 +23,11 @@ pub mod auth;
 pub mod capabilities;
 pub mod config;
 pub mod content;
-pub mod diag;
 pub mod credentials;
 pub mod desktop;
+pub mod diag;
 pub mod error;
+pub mod health;
 pub mod ignore;
 pub mod keyring;
 pub mod model;

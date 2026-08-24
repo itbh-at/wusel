@@ -161,6 +161,22 @@ pub trait ContentSource: Send + Sync {
         stream_full(self, node, out)
     }
 
+    /// The file ids of whole-file hydrations running right now.
+    ///
+    /// The one piece of real work nothing else can see. A hydration is requested
+    /// by the read path and then runs on its own thread with nobody waiting for
+    /// it (see [`CachingSource::read_windowed`]), so it never becomes a flow and
+    /// never appears in the machine's occupancy — the engine reads as idle while
+    /// megabytes are coming down. That is precisely the question `wusel status`
+    /// exists to answer, hence this.
+    ///
+    /// File ids and not paths: this feeds a diagnostics report that stays
+    /// name-free (see [`crate::diag`]), and whoever holds the state database
+    /// resolves them. Default: empty — only a caching source hydrates.
+    fn hydrating(&self) -> Vec<u64> {
+        Vec::new()
+    }
+
     /// Write the node's **full** content to `dest`, streaming — so it works for
     /// files of any size (`u64` throughout) with only one chunk in memory. This
     /// seeds a write buffer's base. Default: via [`stream_to`](Self::stream_to).
@@ -242,9 +258,28 @@ const FETCH_CHUNK: u32 = 8 * 1024 * 1024;
 const READAHEAD_AFTER: u64 = 256 * 1024;
 
 /// At most this many files tracked for sequential reading at once; the
-/// least-recently-used tracker is dropped beyond that. Bounds memory to
-/// `MAX_WINDOWS × FETCH_CHUNK` even if a scanner touches thousands of files.
-const MAX_WINDOWS: usize = 8;
+/// least-recently-used tracker is dropped beyond that.
+///
+/// It used to be 8, which was the same number as the default dispatch threads —
+/// so any concurrent activity evicted a window that was still mid-run, and an
+/// evicted window takes its unfinished spill with it. The visible effect was a
+/// small file that never got cached however often it was read: each read started
+/// a run, the run was displaced before it reached the file's end, nothing was
+/// ever published, and the next read went to the server again. Tracking a file
+/// is cheap — a spill is a path, not an open descriptor — so the count may be
+/// generous; what actually costs memory is the prefetch buffer, and that is
+/// bounded separately by [`MAX_READAHEAD_BYTES`].
+const MAX_WINDOWS: usize = 256;
+
+/// Ceiling on the prefetch buffers held across all windows.
+///
+/// The buffer is the only expensive part of a window (up to [`FETCH_CHUNK`]),
+/// and only a run past [`READAHEAD_AFTER`] ever has one — a walk over small
+/// files holds none at all. Over budget, buffers are dropped oldest first; the
+/// window and its spill survive, so a run keeps going and at worst refetches one
+/// chunk. Set to the bound the old `MAX_WINDOWS × FETCH_CHUNK` implied, so
+/// raising the window count costs no memory.
+const MAX_READAHEAD_BYTES: usize = 64 * 1024 * 1024;
 
 /// The read floor that separates *opening* a file from an incidental peek. A
 /// MIME sniff or content-type guess reads a few KB (≤ 64 KiB) and stops; an
@@ -766,6 +801,38 @@ impl CachingSource {
         // while ours was out of the map (reads run unlocked); last one wins,
         // the loser's spill is abandoned.
         windows.insert(file_id, w);
+        Self::trim_readahead(windows);
+    }
+
+    /// Keep the prefetch buffers under [`MAX_READAHEAD_BYTES`], oldest first.
+    ///
+    /// Only the buffer is dropped, never the window and never its spill: the run
+    /// continues and the file can still be cached by completing it. That is the
+    /// whole point of separating the two limits — the count may be generous
+    /// because the expensive part is capped on its own.
+    fn trim_readahead(windows: &mut HashMap<u64, ReadWindow>) {
+        let mut total: usize = windows.values().map(|w| w.buf.len()).sum();
+        if total <= MAX_READAHEAD_BYTES {
+            return;
+        }
+        let mut by_age: Vec<(u64, std::time::Instant)> = windows
+            .iter()
+            .filter(|(_, w)| !w.buf.is_empty())
+            .map(|(id, w)| (*id, w.last_use))
+            .collect();
+        by_age.sort_by_key(|(_, t)| *t);
+        for (id, _) in by_age {
+            if total <= MAX_READAHEAD_BYTES {
+                break;
+            }
+            if let Some(w) = windows.get_mut(&id) {
+                total -= w.buf.len();
+                // `buffered` reports a miss on an empty buffer, so the next read
+                // simply refills — no other state has to be undone.
+                w.buf = Vec::new();
+                w.buf_start = 0;
+            }
+        }
     }
 
     /// Best-effort eviction: age-based expiry, then LRU down to the size budget.
@@ -945,6 +1012,22 @@ impl Hydrator {
         }
     }
 
+    /// The file ids queued or downloading right now. The set is the dedup index
+    /// the requester already maintains, so watching it costs nothing extra.
+    fn in_flight(&self) -> Vec<u64> {
+        let mut ids: Vec<u64> = self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .copied()
+            .collect();
+        // A stable order, so two samples of one state read the same — the same
+        // reason the machine snapshot sorts.
+        ids.sort_unstable();
+        ids
+    }
+
     /// Enqueue a whole-file hydration for `node`, unless one is already in flight
     /// for it. No-op for a node without a stable cache key (no file id).
     fn request(&self, node: &NodeRow) {
@@ -1003,6 +1086,13 @@ fn hydrate_loop(
 }
 
 impl ContentSource for CachingSource {
+    fn hydrating(&self) -> Vec<u64> {
+        self.hydrator
+            .as_ref()
+            .map(Hydrator::in_flight)
+            .unwrap_or_default()
+    }
+
     fn read(&self, node: &NodeRow, offset: u64, len: u32) -> Result<Vec<u8>> {
         if len == 0 || offset >= node.size {
             return Ok(Vec::new());
@@ -1284,6 +1374,27 @@ mod tests {
         }
     }
 
+    /// A source whose whole-file download blocks until it is released, so a
+    /// hydration can be observed while it is genuinely in flight rather than
+    /// raced against.
+    struct BlockingHydration {
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+    impl ContentSource for BlockingHydration {
+        fn read(&self, _node: &NodeRow, _offset: u64, _len: u32) -> Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+        fn stream_to(&self, _node: &NodeRow, out: &mut File) -> Result<()> {
+            let _ = self
+                .release
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .recv();
+            out.write_all(b"hydrated")?;
+            Ok(())
+        }
+    }
+
     fn node(size: u64, etag: &str) -> NodeRow {
         NodeRow {
             inode: 2,
@@ -1297,6 +1408,133 @@ mod tests {
             file_id: Some(42),
             permissions: String::new(),
         }
+    }
+
+    #[test]
+    fn a_sequential_run_survives_other_files_being_read_in_between() {
+        // The reason a small file could be fetched from the server again and
+        // again: its read window was evicted mid-run by other files, and an
+        // evicted window takes its unfinished spill with it — so the run never
+        // completed, nothing was ever published, and the next read went out
+        // again. With the window count at 8 (the dispatch-thread default),
+        // ordinary concurrent browsing was enough to do it.
+        let dir = std::env::temp_dir().join(format!("wusel-windows-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let data = vec![7u8; 4096];
+        let cache = CachingSource::new(
+            Box::new(Counting {
+                calls: Arc::new(AtomicUsize::new(0)),
+                data: data.clone(),
+            }),
+            dir.clone(),
+            None,
+            None,
+            None, // no hydration: this is about the spill path alone
+        );
+
+        let mut ours = node(data.len() as u64, "etag-1");
+        ours.file_id = Some(1);
+        assert_eq!(cache.read(&ours, 0, 2048).unwrap().len(), 2048);
+
+        // Twenty other files touched while our run is half done — more than the
+        // old limit, so under it ours would have been evicted.
+        for id in 100..120u64 {
+            let mut other = node(data.len() as u64, "etag-1");
+            other.file_id = Some(id);
+            let _ = cache.read(&other, 0, 16).unwrap();
+        }
+
+        // Finish the run. It is still there, so the spill completes.
+        assert_eq!(cache.read(&ours, 2048, 2048).unwrap().len(), 2048);
+
+        let blob = dir.join("1");
+        assert!(
+            blob.exists(),
+            "the completed run is published as a cache blob"
+        );
+        assert_eq!(std::fs::read(&blob).unwrap(), data, "and holds the file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dropping_prefetch_buffers_keeps_the_run_and_its_spill() {
+        // The budget may take the buffer; it must never take the window, or we
+        // are back to the bug above.
+        let mut windows: HashMap<u64, ReadWindow> = HashMap::new();
+        for id in 0..3u64 {
+            let mut w = ReadWindow::start(&node(4096, "etag-1"), 0, PathBuf::from("/tmp/x"));
+            w.buf = vec![0u8; MAX_READAHEAD_BYTES / 2];
+            w.run = 999;
+            windows.insert(id, w);
+        }
+        CachingSource::trim_readahead(&mut windows);
+
+        let buffered: usize = windows.values().map(|w| w.buf.len()).sum();
+        assert!(
+            buffered <= MAX_READAHEAD_BYTES,
+            "the prefetch budget is honoured, holds {buffered} bytes"
+        );
+        assert_eq!(windows.len(), 3, "every window is still tracked");
+        assert!(
+            windows.values().all(|w| w.part.is_some() && w.run == 999),
+            "runs and spills are untouched"
+        );
+    }
+
+    #[test]
+    fn a_running_hydration_is_visible_and_clears_when_it_finishes() {
+        // A background hydration never becomes a flow, so the state machine
+        // cannot report it and the engine reads as idle while it downloads.
+        // This is the only place that knows, which is why it is asked directly.
+        let dir = std::env::temp_dir().join(format!("wusel-hydrating-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (release, blocked) = std::sync::mpsc::channel();
+        let source = CachingSource::new(
+            Box::new(Counting {
+                calls: Arc::new(AtomicUsize::new(0)),
+                data: Vec::new(),
+            }),
+            dir.clone(),
+            None,
+            None,
+            Some(HydrationConfig {
+                source: Box::new(BlockingHydration {
+                    release: Mutex::new(blocked),
+                }),
+                invalidations: None,
+                evicted: None,
+            }),
+        );
+        assert!(source.hydrating().is_empty(), "nothing running yet");
+
+        let node = node(8, "etag-1");
+        source.hydrator.as_ref().expect("configured").request(&node);
+        // The dedup set is written before the work is queued, so observing it
+        // here is not a race with the worker picking the job up.
+        assert_eq!(
+            source.hydrating(),
+            vec![42],
+            "the file id of the download in flight"
+        );
+
+        release.send(()).expect("the worker is waiting");
+        assert!(
+            wait_until(|| source.hydrating().is_empty()),
+            "the id is dropped once the download finishes"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Poll a condition for up to two seconds. The hydrator is a real thread, so
+    /// the alternative is a sleep long enough to be flaky in CI anyway.
+    fn wait_until(mut cond: impl FnMut() -> bool) -> bool {
+        for _ in 0..200 {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        false
     }
 
     #[test]
