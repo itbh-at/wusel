@@ -12,6 +12,18 @@ the RPM is terse because a package changelog is, this page has room to say why.
 The format follows https://keepachangelog.com/en/1.1.0/[Keep a Changelog]; the
 project uses https://semver.org/[Semantic Versioning].
 
+== 0.2.2 — 2026-08-24
+
+=== Fixed
+
+* **Installing no longer drags in a desktop you did not ask for.** The Nautilus
+  extension and the GNOME Shell search provider were declared as `Recommends`,
+  and `dnf` installs weak dependencies by default — so on a server, a minimal
+  install or a KDE machine, a client whose only stated dependency is `fuse3`
+  pulled in several hundred packages, GNOME Shell among them. They are now
+  `Suggests`. On a desktop that already runs GNOME Files nothing changes; the
+  extension and the search provider work exactly as before.
+
 == 0.2.1 — 2026-08-24
 
 === Changed

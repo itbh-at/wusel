@@ -14,7 +14,7 @@ members = [
 # simply does not get it, so a new field added below is only live once the crate
 # manifests reference it.
 [workspace.package]
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 rust-version = "1.97"
 license = "Apache-2.0"
