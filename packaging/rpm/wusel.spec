@@ -79,6 +79,8 @@ fi
 # Native Nautilus extension + its emblem icons.
 %{_libdir}/nautilus/extensions-4/libwusel-nautilus.so
 %{_datadir}/icons/hicolor/scalable/emblems/wusel-emblem-*.svg
+# App icon — resolved by the .desktop file and the cloud-provider sidebar entry.
+%{_datadir}/icons/hicolor/scalable/apps/at.itbh.Wusel.svg
 # GNOME Shell search provider registration + its launcher app.
 %{_datadir}/applications/at.itbh.Wusel.desktop
 %{_datadir}/dbus-1/services/at.itbh.Wusel.SearchProvider.service
@@ -92,6 +94,10 @@ fi
 # with no system-wide preset to apply; each user enables their own instance.
 
 %changelog
+* Mon Aug 24 2026 Christoph D. Hermann <christoph.hermann@itbh.at> - 0.2.1-1
+- Wusel ships its own application icon; the file-manager sidebar entry and the
+  GNOME search entry no longer fall back to the generic folder-remote icon.
+
 * Wed Aug 19 2026 Christoph D. Hermann <christoph.hermann@itbh.at> - 0.2.0-1
 - See the Changelog page in the documentation for the full notes; in brief:
 - Uploads are asynchronous: a save returns once the change is durable locally

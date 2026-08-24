@@ -6,6 +6,8 @@
 = Wusel
 :description: Virtual Nextcloud file system in Rust — VFS-first.
 
+image::wusel-logo.png[Wusel,140,role="right"]
+
 _Nextcloud, woven into your desktop._
 
 *Wusel* is a virtual file system for Nextcloud, written in Rust (referred to

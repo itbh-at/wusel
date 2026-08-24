@@ -90,6 +90,10 @@ emblemdir="$ROOT/usr/share/icons/hicolor/scalable/emblems"
 install -d "$emblemdir"
 install -m644 integration/nautilus/emblems/wusel-emblem-*.svg "$emblemdir/"
 
+appicondir="$ROOT/usr/share/icons/hicolor/scalable/apps"
+install -d "$appicondir"
+install -m644 integration/icons/at.itbh.Wusel.svg "$appicondir/"
+
 appdir="$ROOT/usr/share/applications"
 dbusdir="$ROOT/usr/share/dbus-1/services"
 provdir="$ROOT/usr/share/gnome-shell/search-providers"

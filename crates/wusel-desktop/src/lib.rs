@@ -469,7 +469,7 @@ mod linux {
                 Account {
                     name: display,
                     path: mount.to_string(),
-                    icon: "folder-remote".to_string(),
+                    icon: "at.itbh.Wusel".to_string(),
                     status,
                     status_details: String::new(),
                 },

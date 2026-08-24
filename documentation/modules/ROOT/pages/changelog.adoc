@@ -12,6 +12,15 @@ the RPM is terse because a package changelog is, this page has room to say why.
 The format follows https://keepachangelog.com/en/1.1.0/[Keep a Changelog]; the
 project uses https://semver.org/[Semantic Versioning].
 
+== 0.2.1 — 2026-08-24
+
+=== Changed
+
+* **Wusel has its own icon.** The mount's entry in the file manager's sidebar
+  and its entry in GNOME's search settings both used `folder-remote`, the
+  generic icon every other remote mount shows. They now carry the Wusel mark,
+  which the package installs alongside the binary.
+
 == 0.2.0 — 2026-08-19
 
 The release that made wusel concurrent and then made it quiet. FUSE callbacks

@@ -2018,6 +2018,11 @@ body {
     line-height: 1
 }
 
+.navbar-brand .navbar-logo {
+    height: 2rem;
+    vertical-align: middle
+}
+
 .navbar-brand .navbar-item:first-child a {
     color: inherit;
     word-wrap: normal

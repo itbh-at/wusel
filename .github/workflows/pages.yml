@@ -9,6 +9,10 @@ name: Docs
 on:
   push:
     branches: [main]
+    # A release tag adds a version to the site, and the site is only rebuilt by
+    # the events listed here — without this, a release's documentation is
+    # missing from the version selector until the next push to main.
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
