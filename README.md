@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="documentation/modules/ROOT/images/wusel-logo.svg" alt="" width="170">
+</p>
+
 # Wusel
 
 **Nextcloud, woven into your desktop.**
