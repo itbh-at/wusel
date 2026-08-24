@@ -66,6 +66,26 @@ fi
 # old default only as a fallback.
 NET_IF="${NET_IF:-$(ip route show default 2>/dev/null | awk '{print $5; exit}')}"
 NET_IF="${NET_IF:-eth0}"
+
+# Whether this machine will let us shape the link at all. The throttled steps
+# were written for the dev container, which is privileged and has a plain
+# interface; a CI runner is neither, and its default qdisc refuses to be
+# displaced ("Exclusivity flag on, cannot modify"). Rather than guess at another
+# machine's kernel, probe once: add a qdisc and take it away again.
+SHAPING=1
+probe_shaping() {
+    if ! $PRIV tc qdisc add dev "$NET_IF" root netem delay 1ms >/dev/null 2>&1; then
+        SHAPING=0
+        return
+    fi
+    $PRIV tc qdisc del dev "$NET_IF" root >/dev/null 2>&1 || true
+}
+
+# Announce a skipped step as loudly as a passing one. A test that quietly does
+# not run is worse than one that fails: this suite already spent a month looking
+# green while the gate skipped it entirely.
+skip() { echo "!! SKIPPED: $*  (no link shaping on this host)"; SKIPPED=$((SKIPPED + 1)); }
+SKIPPED=0
 NET_3G_RATE="${NET_3G_RATE:-3mbit}"
 NET_3G_DELAY="${NET_3G_DELAY:-150ms}"
 net_3g_on() {
@@ -157,6 +177,14 @@ ADMIN_RC="$TMPROOT/curl-admin.rc"
 APP_RC="$TMPROOT/curl-app.rc"
 write_curl_rc "$ADMIN_RC" "$NC_USER" "$NC_PASS"
 ADMIN=(--config "$ADMIN_RC")
+
+# --- 0. Can this host shape the link? --------------------------------------
+probe_shaping
+if [ "$SHAPING" = 1 ]; then
+    echo ">> link shaping available on $NET_IF — the throttled steps will run"
+else
+    echo ">> link shaping NOT available on $NET_IF — the throttled steps will be skipped"
+fi
 
 # --- 1. Wait for Nextcloud to finish installing ----------------------------
 echo ">> waiting for Nextcloud at $NC_URL ..."
@@ -363,6 +391,7 @@ ok "3-way text merge combined both non-overlapping edits, no conflict copy"
 # cached listing here — no out-of-band upload to wait on.
 ls "$MNT" >/dev/null                       # both nodes are known from the listing
 cat "$MNT/small.txt" >/dev/null            # cache the small one (local content)
+if [ "$SHAPING" = 1 ]; then
 net_3g_on
 cat "$MNT/big.bin" > /dev/null &           # the (now slow) transfer under test
 READER_PID=$!
@@ -383,6 +412,9 @@ wait "$READER_PID" 2>/dev/null || true
 net_3g_off
 [ "$STALLS" -eq 0 ] || fail "$STALLS of the probes stalled >2s while a read was in flight"
 ok "the mount stays responsive during a large transfer (3G link)"
+else
+    skip "step 9 - responsiveness during a throttled download"
+fi
 
 # --- 10. Ordering and responsiveness under a running upload ----------------
 # Two writes to the same file in quick succession must reach the server in
@@ -406,6 +438,7 @@ ok "writes to one file keep their order"
 # unrelated, already-cached file (small.txt, cached in step 9) must still return
 # promptly. Probe every 1.1 s (> the 1 s attribute TTL) so each stat forces a
 # fresh, dispatch-bound getattr.
+if [ "$SHAPING" = 1 ]; then
 dd if=/dev/urandom of="$WORK/up.bin" bs=1M count=64 status=none
 net_3g_on
 cp "$WORK/up.bin" "$MNT/up.bin" &          # blocks in close() on the throttled flush
@@ -421,6 +454,9 @@ net_3g_off                                  # unthrottle so the upload can finis
 wait "$UPLOADER_PID" 2>/dev/null || true
 [ "$STALLS" -eq 0 ] || fail "$STALLS probes stalled >2s while an upload was in flight"
 ok "the mount stays responsive during a large upload (3G link)"
+else
+    skip "step 10b - responsiveness during a throttled upload"
+fi
 
 # --- 11. Hydration cost: pinning a whole file is ONE GET -------------------
 # Pin hydra.bin (never range-read), which forces a whole-file download. Since
@@ -443,6 +479,7 @@ ok "pinned hydra.bin (hydration cost checked on the host)"
 # background whole-file hydration that competes. We log the numbers (ms) and warn
 # if parallel was not faster, without failing the run.
 ls "$MNT" >/dev/null
+if [ "$SHAPING" = 1 ]; then
 net_latency_on
 t0=$(date +%s%3N)
 cat "$MNT/par1.bin" >/dev/null &
@@ -460,7 +497,16 @@ echo ">> parallel ${t_par}ms vs sequential ${t_seq}ms (informational; see the mo
 if [ "$t_par" -lt "$t_seq" ]; then
     ok "concurrent transfers overlapped (${t_par}ms < ${t_seq}ms)"
 else
+    skip "step 12 - overlap of concurrent transfers under added latency"
+fi
+else
     echo ">> note: parallel was not faster this run (${t_par}ms vs ${t_seq}ms) — expected on a throughput-throttled link; the deterministic proof is the mock test"
 fi
 
-echo ">> E2E PASSED"
+if [ "$SKIPPED" -gt 0 ]; then
+    echo ">> E2E PASSED — but $SKIPPED step(s) were SKIPPED for want of link shaping."
+    echo ">> Those checks only run where NET_ADMIN and a shapeable interface exist:"
+    echo ">>   mise run e2e-local   (podman, privileged)"
+else
+    echo ">> E2E PASSED"
+fi
