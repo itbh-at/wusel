@@ -507,10 +507,10 @@ echo ">> parallel ${t_par}ms vs sequential ${t_seq}ms (informational; see the mo
 if [ "$t_par" -lt "$t_seq" ]; then
     ok "concurrent transfers overlapped (${t_par}ms < ${t_seq}ms)"
 else
-    skip "step 12 - overlap of concurrent transfers under added latency"
+    echo ">> note: parallel was not faster this run (${t_par}ms vs ${t_seq}ms) — expected on a throughput-throttled link; the deterministic proof is the mock test"
 fi
 else
-    echo ">> note: parallel was not faster this run (${t_par}ms vs ${t_seq}ms) — expected on a throughput-throttled link; the deterministic proof is the mock test"
+    skip "step 12 - overlap of concurrent transfers under added latency"
 fi
 
 if [ "$SKIPPED" -gt 0 ]; then
