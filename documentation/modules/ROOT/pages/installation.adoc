@@ -32,6 +32,12 @@ xref:distribution.adoc[Project, licence & distribution] and
 sudo dnf install ./wusel-*.rpm
 ----
 
+The GNOME pieces are *suggested*, not required, so a machine without GNOME gets
+the mount and nothing else — roughly five packages, since the only stated
+dependency is `fuse3`. On a desktop that already runs GNOME Files nothing extra
+is pulled in either. (Before 0.2.2 these were `Recommends`, which `dnf` installs
+by default; on a server or a KDE machine that meant several hundred packages.)
+
 The one dependency the spec states explicitly is `fuse3`, for the setuid
 `fusermount3` helper the unprivileged mount needs; the shared libraries the
 binary and the Nautilus extension link against come in automatically as

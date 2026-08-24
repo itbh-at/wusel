@@ -2847,7 +2847,7 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
 name = "wusel"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -2864,7 +2864,7 @@ dependencies = [
 
 [[package]]
 name = "wusel-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "bytes",
  "diffy",
@@ -2889,7 +2889,7 @@ dependencies = [
 
 [[package]]
 name = "wusel-desktop"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "tracing",
  "wusel-core",
@@ -2898,11 +2898,11 @@ dependencies = [
 
 [[package]]
 name = "wusel-fsm"
-version = "0.2.1"
+version = "0.2.2"
 
 [[package]]
 name = "wusel-fuse"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "fuser",
@@ -2917,7 +2917,7 @@ dependencies = [
 
 [[package]]
 name = "wusel-mock"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "reqwest",
  "rusqlite",

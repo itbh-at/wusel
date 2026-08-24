@@ -31,9 +31,13 @@ ExclusiveArch:  x86_64 aarch64
 # come in automatically as auto-generated soname dependencies of the binary/.so.
 Requires:       fuse3
 # The Nautilus extension and GNOME Shell search provider live in this package;
-# they are inert without their host, so pull them softly rather than hard.
-Recommends:     nautilus
-Recommends:     gnome-shell
+# they are inert without their host. `Suggests` rather than `Recommends`, because
+# dnf installs weak dependencies by default: on a desktop these are already
+# present and the difference is invisible, but on a server, a minimal install or
+# a KDE machine `Recommends` drags in the whole GNOME stack — several hundred
+# packages — for a mount that needs `fuse3` and nothing else.
+Suggests:       nautilus
+Suggests:       gnome-shell
 
 %description
 Wusel makes a Nextcloud appear as an ordinary folder on Linux — VFS-first:
@@ -94,6 +98,10 @@ fi
 # with no system-wide preset to apply; each user enables their own instance.
 
 %changelog
+* Mon Aug 24 2026 Christoph D. Hermann <christoph.hermann@itbh.at> - 0.2.2-1
+- The GNOME hosts are suggested rather than recommended, so installing on a
+  machine without GNOME no longer pulls in the whole desktop stack.
+
 * Mon Aug 24 2026 Christoph D. Hermann <christoph.hermann@itbh.at> - 0.2.1-1
 - Wusel ships its own application icon; the file-manager sidebar entry and the
   GNOME search entry no longer fall back to the generic folder-remote icon.
