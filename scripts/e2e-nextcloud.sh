@@ -48,27 +48,45 @@ ok()   { echo ">> ok: $*"; }
 # cannot be rate-limited directly, so it is redirected to an intermediate `ifb`
 # device and shaped there. Profile: a few Mbit/s at mobile latency, so one large
 # transfer takes many seconds — long enough that an operation stuck on it visibly
-# freezes an unrelated `stat`. Needs NET_ADMIN + iproute2 (both from the dev
-# container).
+# freezes an unrelated `stat`. Needs NET_ADMIN and iproute2.
+#
+# `tc` and `ip` need NET_ADMIN. In the dev container the script is root and has
+# it; on a CI runner it is an ordinary user with passwordless sudo. Resolving it
+# once here keeps the shaping helpers identical in both places.
+if [ "$(id -u)" -eq 0 ]; then
+    PRIV=""
+elif command -v sudo >/dev/null 2>&1; then
+    PRIV="sudo"
+else
+    fail "link shaping needs NET_ADMIN: run as root or provide sudo"
+fi
+
+# The interface carrying the traffic to Nextcloud. `eth0` in the dev container,
+# but a CI runner may name it anything, so ask the routing table and keep the
+# old default only as a fallback.
+NET_IF="${NET_IF:-$(ip route show default 2>/dev/null | awk '{print $5; exit}')}"
 NET_IF="${NET_IF:-eth0}"
 NET_3G_RATE="${NET_3G_RATE:-3mbit}"
 NET_3G_DELAY="${NET_3G_DELAY:-150ms}"
 net_3g_on() {
     # Egress (upload) shaping: the interface's root qdisc.
-    tc qdisc add dev "$NET_IF" root netem delay "$NET_3G_DELAY" rate "$NET_3G_RATE"
+    $PRIV tc qdisc add dev "$NET_IF" root netem delay "$NET_3G_DELAY" rate "$NET_3G_RATE"
     # Ingress (download) shaping: redirect to an ifb device and shape that.
-    ip link add ifb0 type ifb 2>/dev/null || true
-    ip link set ifb0 up
-    tc qdisc add dev "$NET_IF" handle ffff: ingress
-    tc filter add dev "$NET_IF" parent ffff: protocol ip u32 match u32 0 0 \
+    # The module is built in the dev container's kernel but not loaded on a bare
+    # runner, where `ip link add ... type ifb` would fail without it.
+    $PRIV modprobe ifb 2>/dev/null || true
+    $PRIV ip link add ifb0 type ifb 2>/dev/null || true
+    $PRIV ip link set ifb0 up
+    $PRIV tc qdisc add dev "$NET_IF" handle ffff: ingress
+    $PRIV tc filter add dev "$NET_IF" parent ffff: protocol ip u32 match u32 0 0 \
         action mirred egress redirect dev ifb0
-    tc qdisc add dev ifb0 root netem delay "$NET_3G_DELAY" rate "$NET_3G_RATE"
+    $PRIV tc qdisc add dev ifb0 root netem delay "$NET_3G_DELAY" rate "$NET_3G_RATE"
 }
 net_3g_off() {
-    tc qdisc del dev "$NET_IF" root 2>/dev/null || true
-    tc qdisc del dev "$NET_IF" ingress 2>/dev/null || true
-    tc qdisc del dev ifb0 root 2>/dev/null || true
-    ip link del ifb0 2>/dev/null || true
+    $PRIV tc qdisc del dev "$NET_IF" root 2>/dev/null || true
+    $PRIV tc qdisc del dev "$NET_IF" ingress 2>/dev/null || true
+    $PRIV tc qdisc del dev ifb0 root 2>/dev/null || true
+    $PRIV ip link del ifb0 2>/dev/null || true
 }
 
 # Latency-only shaping for the concurrency check (step 12). Deliberately NOT
@@ -79,10 +97,10 @@ net_3g_off() {
 # engine really runs them at once (multi-threaded runtime + dispatch threads).
 NET_LATENCY="${NET_LATENCY:-300ms}"
 net_latency_on() {
-    tc qdisc add dev "$NET_IF" root netem delay "$NET_LATENCY"
+    $PRIV tc qdisc add dev "$NET_IF" root netem delay "$NET_LATENCY"
 }
 net_latency_off() {
-    tc qdisc del dev "$NET_IF" root 2>/dev/null || true
+    $PRIV tc qdisc del dev "$NET_IF" root 2>/dev/null || true
 }
 
 cleanup() {
