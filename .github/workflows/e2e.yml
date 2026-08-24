@@ -36,8 +36,60 @@ defaults:
     shell: bash
 
 jobs:
+  discover:
+    name: discover the maintained Nextcloud majors
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.majors.outputs.matrix }}
+      versions: ${{ steps.majors.outputs.versions }}
+      digests: ${{ steps.majors.outputs.digests }}
+    steps:
+      - id: majors
+        name: Ask Docker Hub which majors are current
+        run: |
+          set -euo pipefail
+          # The three highest `<major>-apache` tags. Nextcloud maintains roughly
+          # three majors at a time, so "the three highest" and "the maintained
+          # ones" coincide; when a new major lands and the oldest is dropped, the
+          # set follows on its own. The strict pattern also keeps rc/beta tags out.
+          curl -fsSL "https://hub.docker.com/v2/repositories/library/nextcloud/tags?page_size=100&name=-apache" \
+            > /tmp/tags.json
+          python3 - <<'EOF' >> "$GITHUB_OUTPUT"
+          import json, re
+          tags = json.load(open("/tmp/tags.json"))["results"]
+          found = {}
+          for t in tags:
+              m = re.fullmatch(r"(\d+)-apache", t["name"])
+              if m:
+                  found[int(m.group(1))] = t.get("digest") or ""
+          majors = sorted(found, reverse=True)[:3]
+          if not majors:
+              raise SystemExit("no <major>-apache tags found — Docker Hub response changed?")
+          # The newest major is the one we promise to work with; the older two are
+          # reported but never turn the workflow red.
+          include = [{"nc": str(m), "required": i == 0} for i, m in enumerate(majors)]
+          print("matrix=" + json.dumps({"include": include}))
+          print("versions=" + " ".join(str(m) for m in majors))
+          # Only the digests decide whether anything changed: a major tag moves
+          # when Nextcloud ships a patch, and that is exactly a reason to re-test.
+          print("digests=" + ",".join(f"{m}:{found[m]}" for m in majors))
+          EOF
+      - name: Say what will be tested
+        env:
+          VERSIONS: ${{ steps.majors.outputs.versions }}
+          DIGESTS: ${{ steps.majors.outputs.digests }}
+        run: |
+          {
+            echo "### Nextcloud majors under test"
+            echo
+            echo "- versions: \`$VERSIONS\` (the first is binding, the rest are informational)"
+            echo "- image digests: \`$DIGESTS\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   gate:
-    name: gate (run only if code changed)
+    name: gate (run only if code or Nextcloud changed)
+    needs: discover
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -51,12 +103,20 @@ jobs:
           # repository unauthenticated.
           persist-credentials: false
       - id: hash
+        env:
+          DIGESTS: ${{ needs.discover.outputs.digests }}
         run: |
           # $CODE_PATHS is deliberately unquoted — it is a list of pathspecs and
           # must word-split into separate arguments.
-          h=$(git ls-tree -r HEAD -- $CODE_PATHS | sha256sum | cut -d' ' -f1)
+          code=$(git ls-tree -r HEAD -- $CODE_PATHS | sha256sum | cut -d' ' -f1)
+          # The image digests belong in the marker as much as the code does. A
+          # server E2E answers "do we still work against Nextcloud", and that
+          # question reopens when *either* side moves — testing only on our own
+          # changes would let a Nextcloud patch break us in silence.
+          h=$(printf '%s\n%s\n' "$code" "$DIGESTS" | sha256sum | cut -d' ' -f1)
           echo "hash=$h" >> "$GITHUB_OUTPUT"
-          echo "code hash: $h"
+          echo "code hash:     $code"
+          echo "combined hash: $h"
       - id: decide
         env:
           HASH: ${{ steps.hash.outputs.hash }}
@@ -65,9 +125,9 @@ jobs:
           if [ "$EVENT" = "workflow_dispatch" ]; then
             run=true;  reason="manual dispatch"
           elif git ls-remote --exit-code origin "refs/e2e-tested/$HASH" >/dev/null 2>&1; then
-            run=false; reason="this exact code state was already tested (marker refs/e2e-tested/$HASH exists)"
+            run=false; reason="this code state was already tested against these Nextcloud images (marker refs/e2e-tested/$HASH exists)"
           else
-            run=true;  reason="code changed since the last successful E2E"
+            run=true;  reason="the code or a Nextcloud image changed since the last successful E2E"
           fi
           echo "run=$run" >> "$GITHUB_OUTPUT"
           echo "gate -> run=$run ($reason)"
@@ -79,27 +139,38 @@ jobs:
             echo "### E2E gate: $verdict"
             echo
             echo "- reason: $reason"
-            echo "- code hash: \`$HASH\`"
+            echo "- combined hash (code + image digests): \`$HASH\`"
             echo "- watched paths: \`$CODE_PATHS\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
   e2e:
-    name: FUSE + real Nextcloud
-    needs: gate
+    name: FUSE + Nextcloud ${{ matrix.nc }}${{ matrix.required && ' (binding)' || ' (informational)' }}
+    needs: [discover, gate]
     if: needs.gate.outputs.run == 'true'
     runs-on: ubuntu-latest
+    strategy:
+      # One major breaking must not rob us of the answer for the others.
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
+    # Only the newest major is a promise. The older ones are reported so we know
+    # where we stand, but a red build has to mean "we are broken", not "somebody
+    # still runs an old server" -- nobody looks at an alarm that cries wolf.
+    # A swallowed failure also leaves `needs.e2e.result` at success, so the
+    # marker below is still recorded; a failure of the binding major is not
+    # swallowed and does block it.
+    continue-on-error: ${{ !matrix.required }}
     # The script's own waits (Nextcloud install, mount, upload polls) add up to
     # a few minutes; 45 leaves room for a slow runner without letting a hung
     # FUSE request burn the 360-minute default.
     timeout-minutes: 45
     services:
       nextcloud:
-        # Pinned to a major tag rather than `latest`: an unpinned upstream image
-        # is the classic "green yesterday, red today, no code changed". A major
-        # tag still tracks Nextcloud's patch releases — which is what a server
-        # E2E should test against — but never upgrades a major unannounced.
-        # Keep in sync with NC_IMAGE in scripts/podman-e2e.sh.
-        image: nextcloud:34-apache
+        # A major tag, never `latest`: it tracks Nextcloud's patch releases —
+        # which is what a server E2E should test against — but never upgrades a
+        # major unannounced. Which majors these are is discovered above rather
+        # than written down here, so a new Nextcloud release enters the matrix
+        # without anybody editing this file.
+        image: nextcloud:${{ matrix.nc }}-apache
         env:
           SQLITE_DATABASE: nextcloud
           NEXTCLOUD_ADMIN_USER: admin
@@ -146,6 +217,16 @@ jobs:
         run: mise run build-fuse
       - name: Run the E2E test
         run: bash scripts/e2e-nextcloud.sh
+      - name: Record the outcome for this major
+        if: always()
+        env:
+          NC: ${{ matrix.nc }}
+          REQUIRED: ${{ matrix.required }}
+          OUTCOME: ${{ job.status }}
+        run: |
+          if [ "$OUTCOME" = success ]; then mark="pass"; else mark="FAIL"; fi
+          if [ "$REQUIRED" = true ]; then role="binding"; else role="informational"; fi
+          echo "### Nextcloud $NC: $mark ($role)" >> "$GITHUB_STEP_SUMMARY"
 
   mark:
     name: record tested code state
