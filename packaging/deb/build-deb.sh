@@ -70,8 +70,13 @@ cp -a packaging/deb/debian "$SRC/debian"
 
 # debian/changelog's version is static text, unlike the RPM spec's
 # %{wusel_version} macro — keep it from drifting from the one source of
-# truth (Cargo.toml) by rewriting just the version on the top entry.
-sed -i.bak "1s/^wusel ([^)]*)/wusel ($VERSION-1)/" "$SRC/debian/changelog"
+# truth (Cargo.toml) by rewriting just the version on the top entry. No
+# "-1" revision suffix: this is source format "3.0 (native)" (see
+# debian/source/format — there is no separate upstream to version against,
+# this repository *is* upstream), and a native package's version may not
+# carry a debian_revision at all. `dpkg-buildpackage -b` never caught this
+# (it skips building the .dsc entirely) — `dpkg-source -b` does.
+sed -i.bak "1s/^wusel ([^)]*)/wusel ($VERSION)/" "$SRC/debian/changelog"
 rm -f "$SRC/debian/changelog.bak"
 
 # The one point in this whole build that touches the network — see the same

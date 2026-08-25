@@ -148,6 +148,19 @@ jobs:
         run: ./packaging/deb/build-deb.sh --check-version
       - name: Build the .deb
         run: ./packaging/deb/build-deb.sh
+      # An RPM's filename says what it was built for — `fc44` sits right in it.
+      # A .deb's does not: `wusel_0.2.2_amd64.deb` looks universal while being
+      # linked against trixie's glibc and Nautilus ABI, so somebody will try it
+      # on an older Ubuntu and file a bug. The target goes in as its own token,
+      # deliberately not as a `~deb13` version suffix: the version inside the
+      # package is untouched, and this cannot be misread as one.
+      - name: Name the target in the file
+        run: |
+          for f in dist/wusel_*.deb; do
+            case "$f" in *_debian13.deb) continue ;; esac
+            mv "$f" "${f%.deb}_debian13.deb"
+          done
+          ls -1 dist/*.deb
       - name: Upload the DEB artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

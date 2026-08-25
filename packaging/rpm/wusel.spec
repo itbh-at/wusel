@@ -153,9 +153,14 @@ fi
 %{_datadir}/icons/hicolor/scalable/emblems/wusel-emblem-*.svg
 # App icon — resolved by the .desktop file and the cloud-provider sidebar entry.
 %{_datadir}/icons/hicolor/scalable/apps/at.itbh.Wusel.svg
-# GNOME Shell search provider registration + its launcher app.
+# GNOME Shell search provider registration + its launcher app. gnome-shell
+# is only Suggested (see above), so this package must own the directory
+# itself rather than assume gnome-shell's own package created it — openSUSE's
+# build validation (unlike Fedora's) rejects an unowned directory outright.
 %{_datadir}/applications/at.itbh.Wusel.desktop
 %{_datadir}/dbus-1/services/at.itbh.Wusel.SearchProvider.service
+%dir %{_datadir}/gnome-shell
+%dir %{_datadir}/gnome-shell/search-providers
 %{_datadir}/gnome-shell/search-providers/wusel-search-provider.desktop
 # Cloud-provider (Nautilus sidebar) registration for the default account.
 %{_datadir}/applications/org.freedesktop.CloudProviders.wusel.default.desktop

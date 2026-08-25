@@ -1,0 +1,14 @@
+# dpkg-source's default tar-ignore list drops *.o/*.a/*.la/*.so from a native
+# source package — a reasonable default for a package that separates source
+# from build output, but wrong here: some vendored crates (e.g. `ring`) ship
+# genuine, versioned prebuilt object files as part of their *source*
+# distribution, not as build artifacts. cargo's vendored-source checksum
+# manifest expects them present; dpkg-source silently dropping them turned
+# into "failed to calculate checksum of vendor/ring/pregenerated/....o" at
+# build time. Setting tar-ignore at all replaces dpkg-source's default list
+# rather than extending it, so this list intentionally omits *.o/*.a/*.la/*.so
+# and keeps only what should always be excluded regardless.
+tar-ignore = ".git"
+tar-ignore = ".gitignore"
+tar-ignore = ".gitattributes"
+tar-ignore = "*.swp"

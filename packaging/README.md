@@ -7,9 +7,7 @@ Wusel's packaging targets, and where each one stands.
 |---|---|---|
 | Fedora RPM | Builds from source, offline, verified end to end (build, install into a clean `fedora:44`, 5 packages, `wusel --version`). Wired into the GitHub release workflow. | [`rpm/`](rpm) |
 | Debian/Ubuntu `.deb` | Same, verified against a clean `debian:trixie-slim`. Wired into the release workflow, its own container (the runner's own Ubuntu 24.04 ships rustc 1.75, below MSRV). | [`deb/`](deb) |
-| AUR (`PKGBUILD`) | Builds from source, network-permitted (the AUR build model, unlike the other three — no vendoring needed). Verified end to end in a clean Arch container. Not yet published — needs an AUR account. | [`aur/`](aur) |
-| Open Build Service | Not set up — needs a build.opensuse.org account. Would host both the RPM and the DEB, for Fedora/Debian/Ubuntu/openSUSE, as an actual `dnf`/`apt` repository rather than a manual download. | [`obs/`](obs) |
-| COPR, Launchpad PPA | Not planned yet. COPR is cheap to add once OBS (or a direct submission) exists, purely for a `copr.fedorainfracloud.org` URL. A Launchpad PPA is the heaviest of any of these to set up (signed OpenPGP key, Code of Conduct) for Ubuntu only — lowest priority. | — |
+| AUR (`PKGBUILD`) | Builds from source, network-permitted (the AUR build model, unlike the other two — no vendoring needed). Verified end to end in a clean Arch container. Not yet published — needs an AUR account. | [`aur/`](aur) |
 
 ## Why every from-source build looks the same
 
@@ -26,8 +24,8 @@ so installing on a KDE or headless box does not drag in the GNOME stack.
 
 RPM and DEB additionally **vendor their Cargo dependencies** and build
 `--offline`: both build in a network-less chroot on a real build service
-(COPR, OBS, `mock`, `sbuild`) — `git archive` for the source, `cargo vendor`
-for the dependencies (the one step in either build script that touches the
+(COPR, `mock`, `sbuild`) — `git archive` for the source, `cargo vendor` for
+the dependencies (the one step in either build script that touches the
 network) — so `rpmbuild --rebuild`/`dpkg-buildpackage` genuinely need nothing
 else. AUR does not: `makepkg` runs on the user's own machine, which already
 has network access.
@@ -36,14 +34,17 @@ has network access.
 
 None of this needs secrets in this repository as long as uploads are made by
 hand — that is the state today. **These are personal identities** — Fedora's
-FAS (for COPR) and AUR have no company accounts, and the same will be true of
-whoever registers the OBS one. Record here who holds each account and how to
-regain access; a package channel nobody can update any more is a real failure
-mode, not a hypothetical one.
+FAS (for COPR) and AUR have no company accounts. Record here who holds each
+account and how to regain access; a package channel nobody can update any
+more is a real failure mode, not a hypothetical one.
 
 | Target | Account | Held by |
 |---|---|---|
 | AUR | account on aur.archlinux.org + SSH public key | _none yet_ |
-| OBS | account on build.opensuse.org (free for open source) | _none yet_ |
 | COPR (later) | Fedora account (FAS) | _none yet_ |
-| Launchpad PPA (not planned) | account, verified OpenPGP key, signed Ubuntu Code of Conduct | _none yet_ |
+
+## Out of scope for this repository
+
+Hosting an actual `dnf`/`apt`-installable repository (as opposed to a
+downloadable release RPM/deb) is operations, not packaging — it lives in
+ITBH's internal infrastructure, not here.
