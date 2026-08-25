@@ -31,12 +31,6 @@ on:
 permissions:
   contents: read
 
-env:
-  # See ci.yml for both of these; build-rpm.sh calls `mise exec` itself, outside
-  # mise-action's control, which is why the trust path is declared explicitly.
-  MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
-  MISE_AUTO_INSTALL: "false"
-
 defaults:
   run:
     shell: bash # -e plus pipefail; see ci.yml
@@ -64,11 +58,18 @@ jobs:
       # down — build-rpm.sh skips the comparison when this is empty.
       EXPECT_VERSION: ${{ github.event_name == 'push' && github.ref_name || '' }}
     steps:
-      # Native Fedora build deps (git for checkout; the rest for build-rpm.sh).
+      # Native Fedora build deps (git for checkout; the rest for build-rpm.sh
+      # and wusel.spec's own BuildRequires). rust/cargo come from dnf, not
+      # mise: wusel.spec's %build runs inside rpmbuild's own sandbox via
+      # `rpmbuild --rebuild`, which checks BuildRequires against installed RPM
+      # packages — the same thing COPR/OBS/`mock` do, and exactly why this is
+      # the toolchain to build the *package* with, mise-pinned elsewhere or
+      # not. See the Containerfile comment for the same reasoning.
       - name: Install build dependencies
         run: >
           dnf -y install
-          git gcc make pkgconf-pkg-config
+          git rust cargo
+          gcc make pkgconf-pkg-config
           nautilus-devel glib2-devel fuse3-devel
           rpm-build curl ca-certificates
       # Pinned to a commit SHA — see the note in ci.yml.
@@ -76,22 +77,19 @@ jobs:
         with:
           # Nothing here pushes, and everything here compiles third-party code.
           persist-credentials: false
-      - name: Cache the cargo registry and build artefacts
+      # Only the registry needs caching: the actual compile happens inside
+      # rpmbuild's own isolated build tree (a fresh mktemp per run), not under
+      # $REPO/target — `cargo vendor` is the one step this cache speeds up.
+      - name: Cache the cargo registry
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-            target
           key: ${{ runner.os }}-${{ matrix.arch }}-cargo-rpm-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-${{ matrix.arch }}-cargo-rpm-
-      - uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518 # v4.2.5
-        with:
-          install: false
-      - name: Install the pinned Rust toolchain
-        run: mise install rust
       # Earliest point at which the manifest version can be read the robust way
       # (cargo has to exist first). Runs before the ~30-minute build so a
       # mismatch is reported in seconds, not after a full compile.
