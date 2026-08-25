@@ -1,0 +1,6 @@
+wusel (0.2.2-1) unstable; urgency=medium
+
+  * Debian/Ubuntu packaging: from-source build via debhelper, offline
+    (vendored dependencies), mirroring the Fedora RPM's approach.
+
+ -- Christoph D. Hermann <christoph.hermann@itbh.at>  Tue, 25 Aug 2026 11:52:20 +0200

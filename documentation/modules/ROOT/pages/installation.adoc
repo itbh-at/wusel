@@ -52,6 +52,24 @@ The package installs the `wusel` binary, a systemd *user* service template, the
 Nautilus extension with its emblem icons, the GNOME Shell search provider, and
 the Nautilus sidebar (cloud-provider) registration for the default account.
 
+== Arch Linux
+
+Not on the AUR yet, but the `PKGBUILD` is in the repository
+(`packaging/aur/`) and builds the same way any AUR package does — there is
+nothing AUR-specific about running it from a local checkout:
+
+[source,sh]
+----
+git clone https://github.com/itbh-at/wusel.git
+cd wusel/packaging/aur
+makepkg -si
+----
+
+`-s` pulls in the `makedepends` (`rust`, `git`, `pkgconf`, `nautilus`) via
+`pacman` first; `-i` installs the result. See `packaging/aur/README.md` for
+how it works. The rest of this page (login, the systemd service, the desktop
+integration) applies the same regardless of how the package got installed.
+
 == Turn it on
 
 Three steps: log in, enable the mount service, then load the desktop

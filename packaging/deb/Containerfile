@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 IT Beratung Hermann GmbH
+
+# Debian build environment for the Wusel .deb. rustc/cargo come from apt, not
+# mise, deliberately — build-deb.sh's own `cargo vendor` step (outside
+# dpkg-buildpackage, just fetching sources) still prefers mise when present,
+# but debian/rules itself must build with whatever a real sbuild/OBS chroot
+# would install from Build-Depends. See the same reasoning in
+# packaging/rpm/Containerfile.
+
+FROM debian:trixie-slim
+
+ENV LANG=C.UTF-8
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git ca-certificates \
+        build-essential debhelper \
+        cargo rustc \
+        libnautilus-extension-dev libglib2.0-dev libfuse3-dev pkgconf \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /work
+
+CMD ["bash"]

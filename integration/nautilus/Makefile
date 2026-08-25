@@ -42,17 +42,26 @@ install: $(LIB)
 	install -m 0644 $(LIB) "$(DESTDIR)$(EXTDIR)/$(LIB)"
 	install -d "$(DESTDIR)$(EMBLEMDIR)"
 	install -m 0644 emblems/wusel-emblem-*.svg "$(DESTDIR)$(EMBLEMDIR)/"
-	# Refresh the icon cache so Nautilus finds the new emblems (best-effort;
-	# packaging normally does this in a post-install trigger instead).
-	-gtk4-update-icon-cache -q -t -f "$(DESTDIR)$(ICONDIR)" 2>/dev/null \
-	  || gtk-update-icon-cache -q -t -f "$(DESTDIR)$(ICONDIR)" 2>/dev/null || true
+ifeq ($(DESTDIR),)
+	# Refresh the icon cache so Nautilus finds the new emblems immediately —
+	# only for a direct, live install. A DESTDIR build stages files for a
+	# package (RPM/AUR/DEB), which must own only what it ships; baking a
+	# generated icon-theme.cache in here made a real AUR install fail with
+	# "exists in filesystem" against the hicolor-icon-theme package, which
+	# owns that file system-wide. A packaged install relies on the
+	# hicolor-icon-theme post-install hook to do this instead.
+	-gtk4-update-icon-cache -q -t -f "$(ICONDIR)" 2>/dev/null \
+	  || gtk-update-icon-cache -q -t -f "$(ICONDIR)" 2>/dev/null || true
+endif
 	@echo ">> Installed. Restart Nautilus: nautilus -q"
 
 uninstall:
 	rm -f "$(DESTDIR)$(EXTDIR)/$(LIB)"
 	rm -f "$(DESTDIR)$(EMBLEMDIR)"/wusel-emblem-*.svg
-	-gtk4-update-icon-cache -q -t -f "$(DESTDIR)$(ICONDIR)" 2>/dev/null \
-	  || gtk-update-icon-cache -q -t -f "$(DESTDIR)$(ICONDIR)" 2>/dev/null || true
+ifeq ($(DESTDIR),)
+	-gtk4-update-icon-cache -q -t -f "$(ICONDIR)" 2>/dev/null \
+	  || gtk-update-icon-cache -q -t -f "$(ICONDIR)" 2>/dev/null || true
+endif
 	@echo ">> Removed. Restart Nautilus: nautilus -q"
 
 clean:
