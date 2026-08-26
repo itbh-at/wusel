@@ -171,6 +171,10 @@ fi
 # with no system-wide preset to apply; each user enables their own instance.
 
 %changelog
+* Wed Aug 26 2026 Christoph D. Hermann <christoph.hermann@itbh.at> - 0.3.1-1
+- The Debian and Ubuntu packages build again; the documentation installs from
+  the signed repository rather than from a downloaded file.
+
 * Tue Aug 25 2026 Christoph D. Hermann <christoph.hermann@itbh.at> - 0.3.0-1
 - Debian/Ubuntu and Arch packages join the Fedora RPM, built from the same
   recipes and published through the Open Build Service.

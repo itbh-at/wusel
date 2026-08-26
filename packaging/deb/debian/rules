@@ -55,3 +55,19 @@ override_dh_auto_install:
 
 override_dh_dwz:
 	# No split debug info to process — see wusel.spec's debug_package note.
+
+# dh_clean deletes `*.orig` — patch leftovers, normally. `cargo vendor` writes
+# one per crate whose manifest it rewrites (289 of them here) and lists each in
+# that crate's .cargo-checksum.json, so removing them makes the offline build
+# fail on "failed to calculate checksum of vendor/<crate>/Cargo.toml.orig".
+#
+# It bites in the *source* build, before anything is compiled: building the
+# source package runs `debian/rules clean` first, so the tarball was packed
+# without them and every rebuild from it was doomed — including the one the
+# Open Build Service does.
+#
+# Same class of bug as the tar-ignore list in debian/source/options, and the
+# same lesson: a vendored tree is source, not build output, and the tools that
+# tidy build output must be told so one at a time.
+override_dh_clean:
+	dh_clean -X.orig

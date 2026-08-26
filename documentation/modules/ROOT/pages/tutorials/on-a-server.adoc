@@ -51,20 +51,38 @@ disk for what it actually touches, not for the whole cloud.
 
 == Step 1 — Install the package
 
-Copy the file for your distribution and architecture onto the machine from the
-https://github.com/itbh-at/wusel/releases/latest[latest release]. RPM-based:
+Wusel is published as a signed repository, so your package manager installs it
+and keeps it updated like anything else. Run the block for your distribution.
+
+Fedora:
 
 [source,sh]
 ----
-sudo dnf install ./wusel-*.rpm
+sudo dnf config-manager addrepo --from-repofile=https://download.opensuse.org/repositories/home:/cdhermann:/wusel/Fedora_44/home:cdhermann:wusel.repo
+sudo dnf install wusel
 ----
 
-Debian-based:
+openSUSE Tumbleweed:
 
 [source,sh]
 ----
-sudo apt install ./wusel_*.deb
+sudo zypper addrepo https://download.opensuse.org/repositories/home:/cdhermann:/wusel/openSUSE_Tumbleweed/home:cdhermann:wusel.repo
+sudo zypper install wusel
 ----
+
+Debian 13 or Ubuntu 26.04 — substitute `xUbuntu_26.04` for `Debian_13` on Ubuntu:
+
+[source,sh]
+----
+echo 'deb http://download.opensuse.org/repositories/home:/cdhermann:/wusel/Debian_13/ /' \
+  | sudo tee /etc/apt/sources.list.d/home:cdhermann:wusel.list
+curl -fsSL https://download.opensuse.org/repositories/home:cdhermann:wusel/Debian_13/Release.key \
+  | gpg --dearmor | sudo tee /etc/apt/trusted.gpg.d/home_cdhermann_wusel.gpg > /dev/null
+sudo apt update && sudo apt install wusel
+----
+
+Anything else — Arch, an older Ubuntu, a distribution not listed —
+xref:how-to/install-a-package.adoc[Install a package] has the remaining routes.
 
 You get the binary, the systemd unit and `fuse3` — about five packages. The
 GNOME pieces are *suggested*, not required, so nothing graphical is pulled onto
