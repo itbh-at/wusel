@@ -31,12 +31,16 @@ xref:how-to/install-a-package.adoc[Install a package].
 
 | Debian 13 (trixie)
 | `Debian_13`
-| `x86_64`, `aarch64`
+| `amd64`, `arm64`
 
 | Ubuntu 26.04
 | `xUbuntu_26.04`
-| `x86_64`, `aarch64`
+| `amd64`, `arm64`
 |===
+
+The architectures are spelled the way each ecosystem spells them: an RPM
+repository says `x86_64` and `aarch64`, a Debian one says `amd64` and `arm64`
+for the same two machines.
 
 The RPM repositories carry `gpgcheck=1` and a signing key at
 `<repository>/repodata/repomd.xml.key`; the Debian ones a `Release.key`. Your
