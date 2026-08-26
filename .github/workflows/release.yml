@@ -78,6 +78,14 @@ jobs:
         with:
           # Nothing here pushes, and everything here compiles third-party code.
           persist-credentials: false
+      # The job runs in a container as root while the checkout belongs to the
+      # runner's own uid, so git refuses to touch the repository ("detected
+      # dubious ownership"). Harmless here — the workspace is created by the
+      # runner for this job alone — and it has to be declared before anything
+      # calls git. The build scripts do, from the moment they began archiving
+      # the tree with `git archive` rather than copying it.
+      - name: Let git use the runner's checkout
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       # Only the registry needs caching: the actual compile happens inside
       # rpmbuild's own isolated build tree (a fresh mktemp per run), not under
       # $REPO/target — `cargo vendor` is the one step this cache speeds up.
@@ -134,6 +142,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # See the RPM job.
+      - name: Let git use the runner's checkout
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Cache the cargo registry
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
