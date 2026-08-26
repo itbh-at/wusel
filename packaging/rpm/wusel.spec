@@ -171,6 +171,11 @@ fi
 # with no system-wide preset to apply; each user enables their own instance.
 
 %changelog
+* Tue Aug 25 2026 Christoph D. Hermann <christoph.hermann@itbh.at> - 0.3.0-1
+- Debian/Ubuntu and Arch packages join the Fedora RPM, built from the same
+  recipes and published through the Open Build Service.
+- The documentation is restructured onto the Diataxis framework.
+
 * Mon Aug 24 2026 Christoph D. Hermann <christoph.hermann@itbh.at> - 0.2.2-1
 - The GNOME hosts are suggested rather than recommended, so installing on a
   machine without GNOME no longer pulls in the whole desktop stack.
