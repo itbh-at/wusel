@@ -14,7 +14,7 @@ members = [
 # simply does not get it, so a new field added below is only live once the crate
 # manifests reference it.
 [workspace.package]
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 # Distro packaging (RPM/DEB from source, COPR/OBS/AUR) needs this to be the true
 # floor, not "whatever mise happened to pin at scaffold time" (it was 1.97, an

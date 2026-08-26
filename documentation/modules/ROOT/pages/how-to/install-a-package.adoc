@@ -4,13 +4,16 @@
 ////
 
 = Install a package
-:description: Install Wusel from an RPM, a .deb or the Arch PKGBUILD — one command per package family.
+:description: Add the Wusel repository and install with your own package manager — Fedora, openSUSE, Debian, Ubuntu — or take a single file for anything else.
 
-Get the file for your architecture from the
-https://github.com/itbh-at/wusel/releases/latest[latest release].
-xref:reference/packages.adoc[Packages] says which file is built for what; if
-none of them fits your distribution, see
-xref:how-to/install-from-source.adoc[Install from source] instead.
+Wusel is published as a *signed repository* through the openSUSE Build Service,
+so your package manager installs it and keeps it up to date like anything else
+on the machine. Pick your family below; each is two commands.
+
+If your distribution is not one of the four, skip to <<single-file>> or build
+from source: xref:how-to/install-from-source.adoc[Install from source].
+xref:reference/packages.adoc[Packages] is the full table of what is published
+where.
 
 Installing does not switch Wusel on. Do
 xref:how-to/mount-at-login.adoc[Mount at login] afterwards — or follow a
@@ -19,22 +22,51 @@ xref:tutorials/on-gnome.adoc[on GNOME],
 xref:tutorials/on-another-desktop.adoc[on another desktop] or
 xref:tutorials/on-a-server.adoc[on a server].
 
-== RPM-based (Fedora, and relatives)
+== Fedora
 
 [source,sh]
 ----
-sudo dnf install ./wusel-*.rpm
+sudo dnf config-manager addrepo --from-repofile=https://download.opensuse.org/repositories/home:/cdhermann:/wusel/Fedora_44/home:cdhermann:wusel.repo
+sudo dnf install wusel
 ----
 
-== Debian-based (Debian, Ubuntu)
+The repository is built for Fedora 44. `dnf` imports the signing key on first
+install and asks you to confirm its fingerprint.
+
+== openSUSE Tumbleweed
 
 [source,sh]
 ----
-sudo apt install ./wusel_*.deb
+sudo zypper addrepo https://download.opensuse.org/repositories/home:/cdhermann:/wusel/openSUSE_Tumbleweed/home:cdhermann:wusel.repo
+sudo zypper refresh
+sudo zypper install wusel
 ----
 
-Use `apt`, not `dpkg -i`. `apt` resolves the dependencies; `dpkg` only reports
-that they are missing.
+== Debian 13
+
+[source,sh]
+----
+echo 'deb http://download.opensuse.org/repositories/home:/cdhermann:/wusel/Debian_13/ /' \
+  | sudo tee /etc/apt/sources.list.d/home:cdhermann:wusel.list
+curl -fsSL https://download.opensuse.org/repositories/home:cdhermann:wusel/Debian_13/Release.key \
+  | gpg --dearmor | sudo tee /etc/apt/trusted.gpg.d/home_cdhermann_wusel.gpg > /dev/null
+sudo apt update
+sudo apt install wusel
+----
+
+== Ubuntu 26.04
+
+The same, against the Ubuntu repository:
+
+[source,sh]
+----
+echo 'deb http://download.opensuse.org/repositories/home:/cdhermann:/wusel/xUbuntu_26.04/ /' \
+  | sudo tee /etc/apt/sources.list.d/home:cdhermann:wusel.list
+curl -fsSL https://download.opensuse.org/repositories/home:cdhermann:wusel/xUbuntu_26.04/Release.key \
+  | gpg --dearmor | sudo tee /etc/apt/trusted.gpg.d/home_cdhermann_wusel.gpg > /dev/null
+sudo apt update
+sudo apt install wusel
+----
 
 == Arch Linux
 
@@ -50,7 +82,65 @@ makepkg -si
 ----
 
 `-s` installs the build dependencies through `pacman` first; `-i` installs the
-result.
+result. Updating means pulling and running it again.
+
+[[single-file]]
+== A single file, for everything else
+
+Every release also attaches one RPM and one `.deb` per architecture to its
+https://github.com/itbh-at/wusel/releases/latest[GitHub Release]. These are
+*unsigned*, and nothing updates them for you — fetch the next release the same
+way. Use them when you cannot add a repository, or when your distribution is
+none of the four above and is close enough to Fedora 44 or Debian 13 to run
+one.
+
+[source,sh]
+----
+sudo dnf install ./wusel-*.rpm      # RPM-based
+sudo apt install ./wusel_*.deb      # Debian-based
+----
+
+Use `apt`, not `dpkg -i`. `apt` resolves the dependencies; `dpkg` only reports
+that they are missing.
+
+== Staying up to date
+
+This is the point of the repository, and it needs no further setup: Wusel is now
+an ordinary package on the machine, so whatever you already run to update the
+system picks up each new release.
+
+[cols="1,2",options="header"]
+|===
+| Distribution | Updates arrive with
+
+| Fedora
+| `sudo dnf upgrade` — or GNOME Software / the automatic updates you already
+  have configured.
+
+| openSUSE Tumbleweed
+| `sudo zypper dup`, as with the rest of the system.
+
+| Debian, Ubuntu
+| `sudo apt update && sudo apt upgrade`, or unattended-upgrades.
+
+| Arch
+| Nothing automatic. `makepkg -si` again in a fresh checkout; the AUR would
+  change that, and is a xref:project/roadmap.adoc[roadmap] item.
+
+| A single file from a GitHub Release
+| Nothing. Download the next one and install it over the top.
+|===
+
+A new version does not restart your mount. After an update, either log out and
+back in, or:
+
+[source,sh]
+----
+systemctl --user restart wusel@default
+----
+
+The Nautilus extension and the search provider are loaded at session start, so
+a full re-login is what picks *those* up — see below.
 
 == Then log out and back in
 
@@ -70,6 +160,3 @@ neither package manager installs them by default: on a server or a KDE machine
 you get the mount and about five packages rather than a desktop stack. What is
 then missing is the sidebar entry, the emblems and the Shell search — not the
 filesystem. See xref:reference/platform-support.adoc[Platform support].
-
-These are unsigned community packages with no repository behind them, so your
-package manager will not update them. Fetch the next release the same way.

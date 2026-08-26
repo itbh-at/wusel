@@ -10,7 +10,48 @@ Every `v*` tag builds packages for `x86_64` and `aarch64` and attaches them to a
 https://github.com/itbh-at/wusel/releases/latest[GitHub Release]. To actually
 install one, see xref:how-to/install-a-package.adoc[Install a package].
 
-== What is published
+== The repository
+
+Wusel is published as a signed repository through the openSUSE Build Service, at
+`https://download.opensuse.org/repositories/home:/cdhermann:/wusel/`. Adding it
+is the normal way to install; see
+xref:how-to/install-a-package.adoc[Install a package].
+
+[cols="1,1,2",options="header"]
+|===
+| Distribution | Repository | Architectures
+
+| Fedora 44
+| `Fedora_44`
+| `x86_64`, `aarch64`
+
+| openSUSE Tumbleweed
+| `openSUSE_Tumbleweed`
+| `x86_64`, `aarch64`
+
+| Debian 13 (trixie)
+| `Debian_13`
+| `x86_64`, `aarch64`
+
+| Ubuntu 26.04
+| `xUbuntu_26.04`
+| `x86_64`, `aarch64`
+|===
+
+The RPM repositories carry `gpgcheck=1` and a signing key at
+`<repository>/repodata/repomd.xml.key`; the Debian ones a `Release.key`. Your
+package manager verifies every package against it, and updates arrive with the
+rest of the system.
+
+Arch is not in the build service. The `PKGBUILD` under `packaging/aur/` builds
+locally; the AUR itself is a xref:project/roadmap.adoc[roadmap] item.
+
+== Single files, per release
+
+Every `v*` tag also attaches one package per format and architecture to its
+https://github.com/itbh-at/wusel/releases/latest[GitHub Release]. These exist
+for machines that cannot add a repository, and for distributions the build
+service does not target.
 
 [cols="2,2,2",options="header"]
 |===
@@ -26,16 +67,10 @@ install one, see xref:how-to/install-a-package.adoc[Install a package].
 | Debian 13 (trixie), and Ubuntu releases close enough to it. A `.deb` filename
   carries no distribution of its own, which is why the target is spelled into
   it. On an older Ubuntu — 24.04 LTS among them — expect it not to run.
-
-| —
-| Arch `PKGBUILD`
-| Arch Linux. Not published as a file and not on the AUR yet; the recipe is in
-  the repository under `packaging/aur/` and is built locally.
 |===
 
-These are *unsigned community packages*, and there is no repository behind them
-yet — neither `dnf` nor `apt` will update them for you. If your distribution or
-release is not listed, build from source:
+These are *unsigned*, and nothing updates them for you. Prefer the repository
+wherever you can use it. If neither fits, build from source:
 xref:how-to/install-from-source.adoc[Install from source].
 
 == Dependencies

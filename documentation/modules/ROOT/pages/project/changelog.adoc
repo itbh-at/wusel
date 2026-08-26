@@ -13,6 +13,33 @@ the RPM is terse because a package changelog is, this page has room to say why.
 The format follows https://keepachangelog.com/en/1.1.0/[Keep a Changelog]; the
 project uses https://semver.org/[Semantic Versioning].
 
+== 0.3.1 — 2026-08-26
+
+=== Added
+
+* **Install from a signed repository, and get updates with the rest of the
+  system.** Wusel is published through the openSUSE Build Service for Fedora 44,
+  openSUSE Tumbleweed, Debian 13 and Ubuntu 26.04, on `x86_64` and `aarch64`.
+  Adding the repository once means `dnf upgrade`, `zypper dup` or `apt upgrade`
+  picks up every later release, and each package is verified against the
+  repository's signing key. See
+  xref:how-to/install-a-package.adoc[Install a package].
++
+The single files attached to each GitHub Release stay, unsigned and
+self-updating by nobody, for machines that cannot add a repository and for
+distributions the build service does not target.
+
+=== Fixed
+
+* **The Debian and Ubuntu packages build again.** `dh_clean` removes `*.orig` —
+  patch leftovers, normally — and `cargo vendor` writes one per crate whose
+  manifest it rewrites, listing each in that crate's checksum manifest. Building
+  the source package runs `clean` first, so the tarball shipped without those
+  289 files and every rebuild from it failed on
+  `failed to calculate checksum of vendor/<crate>/Cargo.toml.orig`. The RPM was
+  unaffected, which is why 0.3.0 shipped with two of four distributions quietly
+  broken.
+
 == 0.3.0 — 2026-08-25
 
 === Added
