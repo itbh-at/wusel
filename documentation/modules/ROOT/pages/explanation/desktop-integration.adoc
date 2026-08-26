@@ -1,0 +1,314 @@
+////
+  // SPDX-License-Identifier: Apache-2.0
+  // Copyright 2026 IT Beratung Hermann GmbH
+////
+
+= Desktop integration
+:description: The sidebar, the emblems, the search and the notifications are four independent, fail-soft channels — what each one costs and why none of them can break the mount.
+
+A mounted drive announces itself as a drive. Wusel is trying not to be one: the
+sidebar entry, the emblem on every file, the search that finds your Nextcloud
+documents, the notification when an upload fails — these are what make it read
+as part of the desktop rather than as a folder someone attached.
+
+None of it is required for the filesystem to work, and that is deliberate.
+Every channel on this page is fail-soft: on a headless box, on a desktop that
+consumes none of these APIs, or when the session bus is simply absent, the mount
+runs and the integration does nothing.
+
+Today all of it is GNOME and Nautilus. What that costs, and what a KDE
+equivalent would take, is at the bottom.
+
+== The two channels
+
+Sidebar entry + sync status:: `libcloudproviders` (D-Bus). Built into the
+daemon — no extra component to compile. Needs the session bus and a one-time
+*system* registration per machine (xref:reference/cli.adoc[`wusel desktop install-provider`]). Consumed by GNOME Files; KDE/others do not consume it.
+Per-file emblems + context-menu actions:: a *native file-manager extension*
+(one per file manager, see below). It reads each file's state from the FUSE
+xattr `user.wusel.state` and draws emblems / offers "make offline / free
+space". No scripting runtime.
+
+== User-facing notifications
+
+We deliberately ship **no application window** for sync activity or conflicts —
+unlike the reference client. Everything the user needs is surfaced through the
+OS's own channels, along two lines:
+
+*Continuous per-file status and conflicts → the file-manager / cloud framework.*
+Not notifications (that would be spam), but the native per-file state and
+conflict UI:
+
+* *Linux:* `libcloudproviders` (D-Bus) reports provider and sync status to
+  Nautilus; per-file emblems via file-manager plugins. (Nautilus-centric, and its
+  status channel has been historically fragile.)
+* *Windows:* `CfReportSyncStatus` reports sync-root status; the sync root and its
+  state appear natively in File Explorer. Cloud Filter even shows hydration toasts
+  itself.
+* *macOS:* the File Provider surfaces state as Finder badges and errors as
+  `NSFileProviderError` codes — e.g. an auth error becomes a Finder "Sign in"
+  ribbon; conflicts are merged by the system (`FailOnConflict` → re-`modifyItem`).
+
+*Actionable warnings only → native notifications.* A VFS should be invisible, so
+the bar is deliberately high: a transient toast fires **only** when one of two
+things is true — otherwise it is the "sync finished" spam users rightly hate.
+
+. *The user must act, and would learn it nowhere else* (the mount is a background
+  service; nobody reads the journal).
+. *Data is silently at risk* — the user believes something is saved when it is
+  not.
+
+Never for routine success (a file read, uploaded, "synced"), progress, cache
+eviction, or revalidation. The cases that clear the bar, most important first:
+
+* *A conflicted copy was made* (data at risk). The user edited `X`, believes it
+  saved, but their version is now `X (conflicted copy …)` while `X` shows the
+  server's — invisible without a nudge.
+* *An upload cannot complete* after retries (data at risk): quota exceeded,
+  permission revoked, a persistent server error. The edit lives only in the local
+  scratch and is lost on unmount/restart.
+* *Connection or auth is lost* (must act): the app password was revoked, a TLS
+  error, the server is unreachable — the "Nextcloud folder" is then silently
+  stale.
+* *(minor)* the keyring is locked at service start, so the mount cannot begin.
+
+These are largely the structured events the engine **already emits as warnings**
+(the conflicted copy in `resolve_conflict`, "upload failed — keeping the buffer"
+in `flush`); the `Notifier` just routes them to a channel, de-duplicated to one
+notification per incident.
+
+*Good news, only as resolution.* Routine success is never announced, but the
+*recovery* of a problem the user was told about is — e.g. `ConnectionRestored`
+after a `ConnectionLost`. (A successful `login` is not notified: it happens in
+the terminal, where the user already sees the confirmation.) Every notice carries
+a `Severity` (`Success` / `Warning` / `Error`) so the backend renders good vs bad
+distinctly — on Linux, a freedesktop `urgency` hint (critical stays on screen)
+plus a distinct standard icon (`dialog-information` / `dialog-warning` /
+`dialog-error`). The icon goes through the `image-path` hint, not just the
+`app_icon` argument: GNOME Shell honours `app_icon` only when it can resolve the
+sending app, so an unpackaged CLI ("wusel") would otherwise fall back to one
+generic icon for every severity. The severity→urgency/icon mapping is the
+backend's job; the engine stays platform-independent.
+
+* *Linux:* `org.freedesktop.Notifications` (D-Bus) — works from the daemon today,
+  no application identity required. `wusel desktop notify [info|warning|error]`
+  fires a test notice straight through this path, to verify it end to end.
+* *macOS / Windows:* `UNUserNotificationCenter` / toast notifications need an app
+  identity (bundle / AUMID), so they arrive with the packaged frontend layer, not
+  the bare CLI.
+
+*Engine shape — one swappable seam (`desktop::Desktop`).* Both message kinds go
+through a single trait in `wusel-core`, `Desktop`, with two methods: `notify(&Notice)`
+(rare, actionable) and `set_status(Status)` (continuous idle/syncing/error). The
+engine calls these on its hot path and knows nothing of any OS UI. `wusel-core` holds **only** the trait, the message enums, and a
+no-op `NullDesktop` — *no platform code* (the platform-independence rule). The
+frontend injects a backend once via `Provider::set_desktop(Arc<dyn Desktop>)`:
+
+* Linux daemon → a D-Bus backend: `org.freedesktop.Notifications` for notices,
+  `libcloudproviders` for status. (Implemented behind the trait, not in `wusel-core`.)
+* macOS / Windows (later) → their native frameworks (File Provider status +
+  `UNUserNotificationCenter`; Cloud Filter `CfReportSyncStatus` + toasts).
+
+Because the whole surface is one injected trait, swapping the Linux module for a
+macOS/Windows one is a drop-in — the engine is untouched. And because the default
+is `NullDesktop`, a headless box, an unsupported desktop, or a Linux without the
+API simply gets nothing: **desktop integration can never affect whether the
+filesystem works.** The notices are largely events the engine already emits as
+warnings (conflicted copy, upload-failed), now also routed through `notify`.
+
+*Localization.* A `Notice` carries *structured data*, not a finished sentence, so
+the notification is **translated at render time** (`Notice::localize(locale)`,
+locale from `ui_locale()` — `LC_ALL`/`LC_MESSAGES`/`LANG`). This is the **one**
+place we speak the user's language: OS notifications reach non-technical users,
+many of whom do not read English. Everything else — logs, CLI output, terminal
+errors — stays English. Adding a language is one match arm; a background systemd
+service that does not inherit `LANG` just falls back to English (safe).
+
+=== "Can we reach the server?" — one shared answer (`health::Reachability`)
+
+Of those cases, *the connection is gone* is the one the user cannot diagnose at
+all. It does not present as an error: the file manager simply stops drawing the
+folder and the application stops opening its document, so the mount looks
+**hung**, and a user who reads it that way starts killing the daemon. Meanwhile
+the engine knew — it logged `[connect] … dns error` per failed request and
+carried on. Nobody reads the journal.
+
+The difficulty is that reachability is not a property of any one operation: a
+listing, a content read, an upload and the notify_push discovery each learn it
+separately, and each would notify separately. So the answer lives in **one**
+place, `health::Reachability` in `wusel-core`, and every request reports its
+outcome to it — `WebDavClient` has a single private `send` for exactly this
+reason, so a new call site cannot forget. Three rules keep thousands of events
+down to one notification:
+
+* *Only transport failures count* (`Error::is_transport`): no answer at all —
+  DNS, connect, TLS, timeout, a dropped connection. The distinction is
+  structural, not textual: `From<reqwest::Error>` keeps a status code as
+  `HttpStatus` and everything without one as `Http`, and "no status" is precisely
+  "nobody answered". A server that answers with a 500 is *reachable*; that is a
+  different problem, with a different message.
+* *A blip is not an outage.* The first failure only starts a clock; the notice
+  fires when failures are still arriving ten seconds later. (The WebDAV client
+  already retries a dropped keep-alive connection internally, so a lone failure
+  reaching this layer is rare to begin with.)
+* *One notice per incident*, and the first success both clears the state and —
+  only if the user was told — announces the recovery.
+
+*The heartbeat.* An idle mount issues no requests, and the interesting moment
+during an outage is precisely the one nobody is asking about: the recovery. The
+notify_push listener is the only component that keeps talking to the server on
+its own, so both of its retry loops report reachability — endpoint discovery
+while the socket has never come up, and the reconnect loop once it has. A mount
+nobody is touching therefore still learns within about half a minute that the
+server went away, and that it is back. Making discovery retry at all also fixes
+a defect of its own: it used to happen exactly once, so a daemon that started
+before the network had DNS ran without push until the next restart.
+
+== File-manager integration (`libcloudproviders`)
+
+The Linux half of `Desktop::set_status`, in `wusel-desktop`. We speak the
+`org.freedesktop.CloudProviders` D-Bus protocol **directly via `zbus`** — no C
+`libcloudproviders` library, no second D-Bus stack (same one zbus already in the
+tree via the keyring). A file manager (GNOME/Nautilus best) then shows the mount
+with a live sync status.
+
+The daemon's desktop worker, on one session-bus connection (shared with
+notifications):
+
+* *Owns a per-account bus name* — `org.freedesktop.CloudProviders.wusel.<account>`
+  (the account name sanitised to a valid D-Bus element) — and exports, under a
+  matching object path, the three objects the spec's collector expects: an
+  `org.freedesktop.DBus.ObjectManager`, a `Provider` object (`Name`), and an
+  `Account` object (`Name`, `Path` = the mountpoint, `Icon` = an icon *name*,
+  `Status` = the account status enum, `StatusDetails`).
+* *Maps our `Status`* (idle/syncing/error) to the wire enum (1/2/3) and, on each
+  change, emits `PropertiesChanged` for the account's `Status`, so the sidebar
+  updates without polling. The status lives in a shared atomic the property getter
+  reads live.
+
+It is **fail-soft and per-account**: no session bus, or a name/export failure,
+just disables the file-manager status (notifications and the filesystem are
+unaffected); each account gets its own bus name and object path, so several mounts
+coexist.
+
+=== Discovery: the registration file must be *system-installed*
+
+The collector reads a `.desktop` file (`Implements=org.freedesktop.CloudProviders`
+plus a `[org.freedesktop.CloudProviders]` group giving `BusName` + `ObjectPath`)
+to find the provider. **The catch, straight from the source
+(`cloudproviderscollector.c`): it scans only `g_get_system_data_dirs()`** — i.e.
+`$XDG_DATA_DIRS` (`/usr/local/share`, `/usr/share`, Flatpak exports) — and *never*
+`g_get_user_data_dir()` (`~/.local/share`). A file dropped in the user's data home
+is therefore never seen, however valid it is. This is why the official Nextcloud
+client ships its `.desktop` in `/usr/share/applications` (package-installed).
+
+So the running daemon does **not** write this file (it would be useless in the
+user's home). Delivery is separate:
+
+* the *package* installs the default account's file into a system data dir;
+* `wusel desktop install-provider [--account NAME]` writes it there on demand
+  (needs root — it targets a system dir), and `uninstall-provider` removes it.
+
+Because the collector matches *every* implementing `.desktop`, **one provider per
+account** (our per-account bus name) is exactly right: N accounts = N files = N
+sidebar entries, no coordinating daemon.
+
+=== One binary, one package — no GNOME-vs-KDE split
+
+`libcloudproviders` is the **GNOME/Nautilus + GTK** integration; **KDE Dolphin
+does not consume it** (it uses KIO, and would want a Dolphin plugin for per-file
+overlays). That does not fork the build: the daemon simply owns its bus name and
+exports the objects — on a desktop with no consumer this is inert and harmless
+(fail-soft). A future KDE backend is *another* `Desktop`-behind-the-seam module in
+the same binary, chosen at runtime by who actually connects, not by a build flag.
+Per-file-manager extensions (below) ship as inert, optional pieces pulled in by
+whichever file manager is present (weak deps), never as separate distro builds.
+
+Still open (own frontends, reading the *same* daemon state): per-file emblems via
+file-manager plugins — Nautilus-Python, Dolphin `KVersionControlPlugin`,
+Nemo/Thunar.
+
+== GNOME / Nautilus
+
+A native C `libnautilus-extension` module in `integration/nautilus/` (source +
+`Makefile` + README). It adds a per-file emblem and the context-menu actions
+*Make Available Offline* / *Free Up Space* (which call `wusel pin`/`unpin`). The
+distribution packages build and install it for you; to build it by hand see
+xref:how-to/install-from-source.adoc[Install from source].
+
+NOTE: `libnautilus-extension` has no hook for file *activation* (double-click) —
+Nautilus opens files via their MIME default, regardless of folder, so a mount
+cannot special-case it. Wusel therefore never overrides double-click; a file in
+`~/Wusel` opens like any other. The planned collaborative open
+(xref:project/roadmap.adoc[`wusel open`]) is a *context-menu* action, not a double-click
+override.
+
+Every state gets a distinct, always-visible emblem (the OneDrive model). Current
+Adwaita has pruned its stock emblem set, so the extension ships its own icons,
+installed into the hicolor theme; which emblem means what is listed in
+xref:reference/file-states.adoc[File states].
+
+Emblem refresh (live, no F5): a menu pin/unpin re-reads the file when the command
+finishes (`invalidate_extension_info`). A *background* hydration (opening a file →
+cached) is pushed by the daemon: it emits a D-Bus signal
+`at.itbh.Wusel.FileChanged(path)`, which the extension subscribes to and turns
+into the same re-read. The daemon reaches the session bus even when started over
+SSH (it falls back to `$XDG_RUNTIME_DIR/bus`).
+
+[NOTE]
+.Known limitation — live refresh is best-effort
+====
+The push refreshes reliably *once the signal fires*, i.e. when hydration
+completes — so a large or queued download delays it, and a very light open that
+reads below the hydration floor never triggers hydration (so no refresh) until
+the file is opened more. The emblem is always correct on the next view reload
+(F5). Making it fully immediate (e.g. show a transient "syncing" emblem the
+moment an open starts, and parallelize hydration) is a future improvement.
+====
+
+Menu labels follow the session locale (built-in de/en; proper gettext is a
+roadmap item).
+
+=== Desktop indexers (default: excluded)
+
+Since opening a file caches it, letting GNOME Tracker/LocalSearch index the mount
+would hydrate everything it walks — a traffic storm. So `exclude_from_indexers`
+is *on by default*: the FUSE root serves synthetic, local-only
+`.trackerignore`/`.nomedia` markers (never uploaded to Nextcloud) that Tracker
+honours to skip the whole subtree. Opt back in with `[desktop]
+exclude_from_indexers = false` in `config.toml`. KDE Baloo ignores such markers —
+exclude `~/Wusel` in its own settings instead.
+
+The markers cover indexers, not *previews*: a thumbnailer reads far enough into
+a file to hydrate it, and the desktop offers no way to decline a preview for a
+local mount. See
+xref:reference/limitations.adoc#previews-hydrate-files[Known limitations].
+
+== Desktop search (GNOME)
+
+Instead of letting a local indexer walk the mount (a download storm, since
+opening a file caches it), the GNOME *Activities overview* searches Nextcloud
+directly: `wusel search-provider` is a D-Bus service
+(`org.gnome.Shell.SearchProvider2`) that GNOME Shell activates on demand and
+answers from the server's Unified Search (`/ocs/v2.php/search/providers/files/
+search`) — including server-side full text where the `fulltextsearch` app is
+present. Clicking a result opens the file locally in the mount when the path
+resolves, else the Nextcloud web page. Registration lives in
+`integration/gnome-search/` (`install.sh`, system-wide); it needs no running
+mount (it loads the account credentials itself). A KDE KRunner equivalent is a
+later addition.
+
+== Other file managers (planned)
+
+All read the same xref:reference/file-states.adoc[`user.wusel.state`] xattr; only the presentation
+plugin differs — there is no single mechanism across desktops. Each of them owes
+the same scope check: decide that the path is on a Wusel mount *before* reading
+the attribute's meaning off it, because a copy carries the value out of the
+mount (xref:reference/limitations.adoc#emblem-survives-the-copy[Known limitations]).
+
+* *KDE Dolphin*: a C++ `KOverlayIconPlugin` (emblems) built against KIO/KF6, plus
+  *declarative* KDE ServiceMenus (`.desktop` files, no code) for the actions.
+  Dolphin does not consume `libcloudproviders`, so account-level sync status is
+  not surfaced in the file manager there — per-file emblems and freedesktop
+  notifications carry it instead.
+* *Nemo / Thunar*: their own extension interfaces, reading the same xattr.

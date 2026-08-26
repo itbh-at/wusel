@@ -1,0 +1,109 @@
+////
+  // SPDX-License-Identifier: Apache-2.0
+  // Copyright 2026 IT Beratung Hermann GmbH
+////
+
+= Packages
+:description: Which package file is built for which distribution, what it depends on, and every file it installs.
+
+Every `v*` tag builds packages for `x86_64` and `aarch64` and attaches them to a
+https://github.com/itbh-at/wusel/releases/latest[GitHub Release]. To actually
+install one, see xref:how-to/install-a-package.adoc[Install a package].
+
+== What is published
+
+[cols="2,2,2",options="header"]
+|===
+| File | Format | Built for
+
+| `wusel-<version>-1.fc44.<arch>.rpm`
+| RPM
+| Fedora 44. The `fc44` is not decoration — the package is linked against that
+  release's libraries.
+
+| `wusel_<version>_<arch>_debian13.deb`
+| Debian package
+| Debian 13 (trixie), and Ubuntu releases close enough to it. A `.deb` filename
+  carries no distribution of its own, which is why the target is spelled into
+  it. On an older Ubuntu — 24.04 LTS among them — expect it not to run.
+
+| —
+| Arch `PKGBUILD`
+| Arch Linux. Not published as a file and not on the AUR yet; the recipe is in
+  the repository under `packaging/aur/` and is built locally.
+|===
+
+These are *unsigned community packages*, and there is no repository behind them
+yet — neither `dnf` nor `apt` will update them for you. If your distribution or
+release is not listed, build from source:
+xref:how-to/install-from-source.adoc[Install from source].
+
+== Dependencies
+
+Only one dependency is stated outright:
+
+`fuse3`:: for the setuid `fusermount3` helper that an unprivileged mount needs.
+
+The shared libraries the binary and the Nautilus extension link against are
+resolved automatically as soname dependencies, so they are not listed by name.
+
+The GNOME pieces — `nautilus` and `gnome-shell` — are *suggested*, not required
+and not recommended. Neither `dnf` nor `apt` installs a suggestion by default, so
+a server or a KDE machine gets the mount and about five packages, not a desktop
+stack. What such a machine loses is the sidebar entry, the emblems and the Shell
+search; the mount itself is unaffected. The search provider in particular links
+no GNOME library at all — it is the `wusel` binary answering D-Bus, which the
+Shell activates on demand.
+
+NOTE: Before 0.2.2 these were `Recommends`, which both package managers *do*
+install by default.
+
+== What a package installs
+
+[cols="2,3",options="header"]
+|===
+| Path | What it is
+
+| `/usr/bin/wusel`
+| The binary — daemon and CLI in one.
+
+| `/usr/lib/systemd/user/wusel@.service`
+| The systemd *user* service template. One instance per account:
+  `wusel@default`, `wusel@work`.
+
+| `/usr/lib*/nautilus/extensions-4/libwusel-nautilus.so`
+| The native Nautilus extension: per-file emblems and the *Make Available
+  Offline* / *Free Up Space* menu. Tied to the Nautilus major version, so it is
+  built against the target distribution's own Nautilus.
+
+| `/usr/share/icons/hicolor/scalable/emblems/wusel-emblem-*.svg`
+| The emblem icons the extension draws. See
+  xref:reference/file-states.adoc[File states].
+
+| `/usr/share/icons/hicolor/scalable/apps/at.itbh.Wusel.svg`
+| The application icon, used by the sidebar entry and the search results.
+
+| `/usr/share/applications/at.itbh.Wusel.desktop`
+| The launcher entry the search provider resolves its identity from.
+
+| `/usr/share/dbus-1/services/at.itbh.Wusel.SearchProvider.service`
+| D-Bus activation for the search provider — this is what lets GNOME Shell start
+  it on demand, with nothing running in the background.
+
+| `/usr/share/gnome-shell/search-providers/wusel-search-provider.desktop`
+| The search provider's registration with GNOME Shell.
+
+| `/usr/share/applications/org.freedesktop.CloudProviders.wusel.default.desktop`
+| The Files sidebar registration for the *default* account. Named accounts
+  register their own with `wusel desktop install-provider`.
+|===
+
+Nothing is installed into a home directory. Everything Wusel writes per user is
+created at run time; see
+xref:reference/files-and-directories.adoc[Files and directories].
+
+== Building them yourself
+
+The recipes live in the repository under `packaging/rpm/`, `packaging/deb/` and
+`packaging/aur/`, each with its own `README.md`. See
+xref:how-to/build-a-package.adoc[Build a package].

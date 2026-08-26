@@ -1,0 +1,90 @@
+////
+  // SPDX-License-Identifier: Apache-2.0
+  // Copyright 2026 IT Beratung Hermann GmbH
+////
+
+= Uninstall
+:description: Remove Wusel cleanly, and wipe the per-user data when you want a genuinely fresh start.
+
+Order matters: disable the *user* service first. A package cannot stop a service
+running inside your session, and removing the package underneath a live mount
+leaves the mountpoint behind.
+
+[source,sh]
+----
+systemctl --user disable --now wusel@default   # unmount now, and stop auto-mounting
+sudo dnf remove wusel                           # or: sudo apt remove wusel
+----
+
+Repeat the first line for every named account you enabled.
+
+Your Nextcloud is untouched throughout. Wusel only ever mounted it.
+
+== What removal takes with it
+
+Everything the package owns: the binary, the systemd unit template, the Nautilus
+extension and its emblem icons, the search provider, and the default account's
+sidebar registration. Sidebar registrations that Wusel wrote for *named*
+accounts are cleaned up too, by a removal scriptlet.
+
+== What is deliberately left behind
+
+Your per-user data:
+
+* `~/.config/wusel` — configuration, credentials and pins
+* `~/.local/state/wusel` — the state database
+* `~/.cache/wusel` — downloaded file contents
+
+Packages never touch files in a home directory, and keeping these means a later
+reinstall picks up exactly where you left off, with no new login.
+
+== Wipe everything and start fresh
+
+When you want a genuinely clean slate — reinstalling because something is broken
+— remove that data as well:
+
+[source,sh]
+----
+systemctl --user disable --now wusel@default             # if not already done
+systemctl --user reset-failed 'wusel@*' 2>/dev/null || true
+rm -rf ~/.config/wusel ~/.local/state/wusel ~/.cache/wusel
+secret-tool clear service wusel 2>/dev/null || true      # the app password in the keyring
+----
+
+The last line is a no-op if the password was in the `0600` file rather than the
+keyring — that file went with `~/.config/wusel`.
+
+After this nothing of Wusel remains: a fresh install plus `wusel login` starts
+from zero.
+
+The app password is revocable on the server side too. If you are decommissioning
+a machine rather than reinstalling, revoke it in Nextcloud under *Settings →
+Security → Devices & sessions*.
+
+== If you removed the package first
+
+Disabling the service also clears its enable symlink under
+`~/.config/systemd/user`. If the package went first and left a dangling link
+behind:
+
+[source,sh]
+----
+systemctl --user disable wusel@default
+systemctl --user daemon-reload
+----
+
+This tidies it up even though the unit file is already gone.
+
+== A source install
+
+There is no package to remove. Disable the service, then delete the binary you
+installed and, if you built it, the Nautilus extension:
+
+[source,sh]
+----
+systemctl --user disable --now wusel@default
+sudo rm -f /usr/local/bin/wusel        # or ~/.local/bin/wusel
+cd /path/to/wusel/integration/nautilus && sudo make uninstall
+----
+
+Then the per-user data above, if you want it gone.

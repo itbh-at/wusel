@@ -1,0 +1,260 @@
+////
+  // SPDX-License-Identifier: Apache-2.0
+  // Copyright 2026 IT Beratung Hermann GmbH
+////
+
+= Keeping in sync
+:description: How Wusel finds out what changed, on which side, and what happens when both sides changed the same file.
+
+Two copies of a file exist: one on the server, one on your machine. This page
+is about the only interesting question that follows — how Wusel finds out which
+of them moved, without asking the server about every file.
+
+The rule underneath all of it: *the server's ETag is the truth, the local
+database is only the speed.* Reads may be a few seconds stale by design. What is
+never allowed is losing an edit.
+
+== Change detection
+
+* *Primary (implemented):* `notify_push` (Nextcloud high-performance backend) via
+  WebSocket — the endpoint is discovered through OCS capabilities, the client
+  authenticates with login + app password, and each `notify_file` stamps a shared
+  invalidation timestamp. Affected directories are re-listed (and their content
+  cache re-validated) on next access. Runs on its own thread; see `wusel_core::push`.
+* *Fallback (implemented):* TTL revalidation — PROPFIND + ETag reconciliation when
+  a listing is older than `sync.revalidate_secs`, and whenever `notify_push` is
+  unavailable. Used automatically if the server lacks the app.
+
+== Sync state model (ETag-based)
+
+There is **one ETag per node** — the `etag` column in SQLite, holding the last
+ETag the server reported for it. There is no separate "local" or "last known"
+ETag, and no stored sync-state enum: each of the three questions is answered
+where it is actually cheap to answer.
+
+[cols="1,2",options="header"]
+|===
+| Question | How it is answered
+| Do we have a local edit?
+| By the presence of a write buffer for that inode (`Provider::file_state` →
+  `modified`), not by comparing ETags. The buffer *is* the pending change.
+| Did the server copy change?
+| The reconcile walk compares the stored `etag` against the fresh one from
+  PROPFIND (see _Cache coherence_). A difference updates the metadata and makes
+  the cached blob stale, because a blob is only used while its ETag sidecar
+  matches the stored `etag`.
+| Did both change?
+| Not computed at all — it is *asked*. The upload carries a precondition, and the
+  server answers `412 Precondition Failed`. That HTTP status is the conflict
+  signal (see _Conflict handling_).
+|===
+
+Deriving the states this way avoids the classic check-then-write race: nothing we
+computed a moment ago can go stale between the decision and the `PUT`.
+Conflicts never cause a silent overwrite — see _Conflict handling_ below.
+
+NOTE: existing databases still carry `hydration` and `sync` columns from an
+earlier design. They are unused legacy — kept only so an old state DB opens
+unchanged — and nothing maps to them.
+
+== Cache coherence
+
+The SQLite metadata cache must not drift from the server. Guiding rule:
+*the server ETag is the truth, SQLite is only the speed.* Reads may be served
+slightly stale within a small freshness window by design; the system is
+eventually consistent, not strongly consistent.
+
+=== Propagating ETags
+
+In Nextcloud a directory's ETag changes whenever *anything beneath it* changes —
+the change propagates up the tree. This makes "is anything stale?" cheap:
+
+. One PROPFIND `Depth: 0` on a directory → compare its ETag.
+. Unchanged → the entire subtree is guaranteed unchanged. Done, no further requests.
+. Changed → descend one level (`Depth: 1`), compare child ETags, and recurse only
+  into the changed subtrees.
+
+This turns cache validation from O(all files) into O(changed paths).
+
+This is implemented by the **background syncer** (`provider::sync_loop`): on a
+push it walks the cached tree from the root, and at each level descends only into
+the child directories whose stored ETag differs from the fresh listing —
+reaching the directory that actually changed in O(changed paths) and reconciling
+it. Crucially, `notify_push` is **path-less** (it says *something* changed, not
+what), so this ETag walk is how we find *where* without re-listing everything and
+without the event telling us. The syncer owns its own state connection and HTTP
+client, so it runs entirely off the FUSE thread; changed entries it finds are
+pushed to the kernel (see _Invalidating the kernel's FUSE cache_).
+
+=== Reconcile triggers
+
+* *Push:* `notify_push` fires → the syncer walks the tree by propagated ETags and
+  reconciles whatever moved (a delete/add nobody happened to re-list).
+* *Poll fallback:* periodically check the root ETag (`Depth: 0`) — cheap thanks to
+  propagation — when `notify_push` is unavailable.
+* *On access:* if an already-listed directory's cache entry is stale, revalidate
+  it **in the background** (see xref:explanation/architecture.adoc[Architecture]) and serve the cached
+  listing immediately — the slow PROPFIND never blocks the access. Only a
+  directory that was *never* listed is loaded synchronously (there is nothing to
+  serve yet).
+* *On reconnect/startup:* one root ETag check to catch anything missed while offline.
+
+=== Reconcile algorithm (per directory)
+
+PROPFIND `Depth: 1`, then per child compare local vs. server ETag:
+
+* *same* → skip.
+* *different + file* → update the stored metadata (ETag, size, mtime). A cached
+  blob thereby stops matching its ETag sidecar, so it is ignored from then on and
+  the next read re-hydrates from the server.
+* *different + directory* → mark the subtree for a lazy re-check.
+* *local but gone on the server* → deleted remotely → remove from SQLite + blob cache.
+* *on the server but not local* → new → insert.
+
+Keying on Nextcloud's `oc:fileid` (stable across renames) lets us tell a *rename*
+from a *delete + create*, so a rename does not needlessly discard a hydrated blob.
+
+=== Own writes never self-desync
+
+Every PUT/MKCOL/MOVE/DELETE response carries the new ETag (`OC-ETag`/`ETag`).
+We adopt it into SQLite atomically, so our own write never looks "changed" and
+never triggers a needless re-download.
+
+=== Writing: deferred create + write buffer
+
+Writes land in a per-file scratch buffer beside the cache and upload on flush
+(a plain PUT, or chunked upload for large files). Two properties matter for the
+churn a live filesystem otherwise generates:
+
+* *Deferred create.* `create` contacts the server for **nothing** — no `PUT`
+  empty, no PROPFIND. It adds a local node (no `oc:fileid` yet) and an empty,
+  dirty scratch; the file is materialised on the *first flush*. A file created
+  and deleted before any flush — an editor probe (`vim` writes a `4913` file to
+  test writability), a temp file — therefore never touches the server. On flush
+  the upload gives the node its server identity (a reconcile of the parent picks
+  up the `oc:fileid`), and reconcile preserves not-yet-flushed local nodes (a
+  `NULL` file id) instead of deleting them.
+* *Reads see the buffer.* While a scratch is open, reads are served from it, so
+  in-progress edits are coherent and a freshly created file is readable before
+  its first flush.
+* *Ignored files stay local.* Ephemeral editor/OS files (vim swap, LibreOffice/MS
+  Office lock, backup and temp files — `[sync] ignore_patterns`) are never
+  uploaded: no PUT on flush, no DELETE on remove. They build on the deferred-create
+  machinery (a local node, its buffer *is* the file) and, like the reference
+  client's exclude list, keep the server free of throwaway churn. An ignored temp
+  renamed onto a real name is *promoted*: its buffer uploads under the new name —
+  exactly the atomic-save pattern of office suites.
+
+A failed upload keeps the buffer for a later retry (never silent data loss), and
+our own writes adopt the returned ETag so they never look "changed" (above).
+
+=== Invalidating the kernel's FUSE cache
+
+FUSE caches our `getattr`/`readdir` answers for the attribute/entry TTL we return
+(1s). A short TTL means the kernel re-asks quickly — but a file manager sitting
+in a directory does not re-`readdir` on its own, so a server-side change would
+linger in its view until the user refreshes.
+
+So the syncer, when its ETag walk finds an added or removed entry, sends it to
+the frontend, which calls the `fuser` notify API (`Notifier::inval_entry`,
+enabled via the `abi-7-12` feature) to drop that entry from the kernel's cache.
+The file then appears/disappears in the file manager **live**, without a manual
+refresh. The notification runs on its own thread (the `Notifier` is obtained from
+`Session::notifier()`), so it never blocks the FUSE request loop.
+
+All tree updates run inside a SQLite transaction (WAL), so the FUSE layer never
+sees a half-updated tree.
+
+== Conflict handling
+
+The official client treats any double-edit as a whole-file collision with an
+opaque prompt. Wusel does not, and two principles hold across everything below:
+
+* *Access is never blocked.* No modal "what to do with the difference?" on open —
+  you open the file and see content.
+* *No data loss.* Both versions always survive; a conflict never resolves into a
+  silent overwrite.
+
+=== Detection (implemented)
+
+Uploads carry a precondition, so a server-side change under us is rejected with
+412 — the conflict signal (no check-then-write race). Which precondition depends
+on what we know about the target (`webdav::Precondition`):
+
+* *A create* (no file id yet — the file has never existed server-side):
+  `If-None-Match: *`, so losing the race against a same-named file created
+  elsewhere yields a conflict instead of clobbering it.
+* *A known base version:* `If-Match: "<etag>"` — the ordinary case.
+* *The file exists but its ETag is unknown* (the server answered an upload
+  without an `ETag` header, or a listing carried no `getetag`): **no
+  precondition**. A condition we know to be false protects nothing and would
+  turn every single save into a conflicted copy; the exposure is one save until
+  the next PROPFIND restores the ETag, and a genuine concurrent change is still
+  caught by the sync walk.
+
+=== Resolution (implemented)
+
+* *Default (like the reference client):* keep the server version at the original
+  path and save the local edit beside it as `… (conflicted copy <unix>).ext`.
+  Lossless, works for any type including binaries. A desktop notification tells
+  the user a copy was made — otherwise the rename is invisible.
+* *Opt-in `[sync] text_merge = true`:* a 3-way merge (`diffy`) before falling back
+  to that copy. Off by default, since it deviates from the reference client's
+  behaviour.
+
+==== The three-way merge
+
+Because a merge needs the *content* of the common ancestor and not just its ETag,
+the cached blob of the version the edit started from serves as the base — and
+when `text_merge` is on, a write seeds that base into the cache even if the read
+would not otherwise have cached it. The merge then runs base (last known) vs.
+ours (the write buffer) vs. theirs (the current server copy):
+
+* All three must decode as UTF-8; binary content is never merged. Line-based text
+  is the whole scope — Markdown, source, config, CSV and the like — with no
+  per-format special-casing.
+* Non-overlapping edits merge cleanly and upload automatically, *conditioned on
+  the exact version that was merged as "theirs"*, so a third change landing
+  between the merge's read and its write is caught rather than overwritten.
+* A same-line clash, non-UTF-8 content, or a missing base falls back to the
+  conflicted copy above.
+
+The merge is covered by mock end-to-end tests but not yet verified against a live
+Nextcloud — treat it as experimental (xref:project/roadmap.adoc[Roadmap]).
+
+=== Intended direction (not implemented)
+
+Everything from here on is design intent, not current behaviour:
+
+* *Descriptive copy names.* Both versions survive today, but under the reference
+  client's opaque `foo (conflicted copy <unix>).txt`. The intent is a name that
+  says who changed it and when, plus a plain-language note.
+* *In-file git-style markers.* Meet developers in their tools: a real clash would
+  appear as `<<<<<<<` / `=======` / `>>>>>>>` in a clearly named copy, resolvable
+  in any merge editor — no proprietary UI. Today a clash simply yields the
+  conflicted copy, with no markers.
+* *Advisory locking.* Nextcloud supports WebDAV LOCK / file locking. When the web
+  editor (Text app) holds a lock, Wusel would see it and warn before a local
+  write — addressing the web-editor vs. local-editor case at the source.
+
+Conflict *avoidance* is already partly real, though: `notify_push` plus fast
+reconciliation keep the window in which two people unknowingly diverge small.
+
+== File watching (inotify)
+
+Tools (editors, LSP servers, build watchers, file managers) watch files via the
+kernel's inotify API. Wusel supports this, with one honest distinction:
+
+* *Local changes (through the mount)* work natively: a write through the mount
+  goes through the VFS, so the kernel generates the inotify events itself.
+* *Remote changes (another client on the server)* are the known FUSE limit: cache
+  invalidation alone does not emit an inotify event. What we do keep coherent is
+  the *kernel's* cache — the syncer pushes added and removed entries through the
+  one notify call we use, `Notifier::inval_entry` (the kernel's
+  `notify_inval_entry`; see _Invalidating the kernel's FUSE cache_), and the short
+  attribute/entry TTL makes the kernel re-ask for everything else. A re-stat or
+  re-read therefore reflects reality immediately, but a watcher blocked on an
+  inotify event is not woken by it.
+
+We do not promise perfect remote inotify delivery — local watches are
+first-class, remote coherence is immediate.

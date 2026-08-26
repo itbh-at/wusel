@@ -1,0 +1,76 @@
+////
+  // SPDX-License-Identifier: Apache-2.0
+  // Copyright 2026 IT Beratung Hermann GmbH
+////
+
+= Keep files offline
+:description: Pin files and folders so they are downloaded now, never evicted, and readable with the network gone.
+
+Everything in the mount is online-only until you open it, and an opened file is
+cached but *evictable*. Pinning is the stronger promise: downloaded now,
+exempt from eviction, and still readable when the server cannot be reached.
+
+[source,sh]
+----
+wusel pin Documents        # a directory, recursively
+wusel pin Notes.txt        # a single file
+wusel pin                  # no path: the whole account
+wusel pins                 # list what is pinned
+wusel unpin Documents      # release it — the files become evictable cache again
+----
+
+Or, in Files: right-click a file and choose *Make Available Offline*; *Free Up
+Space* undoes it.
+
+None of these need a running mount — they write straight into the cache. Add
+`--account NAME` for a named profile.
+
+A directory pin covers its whole subtree, including entries that have never been
+listed. A pin also overrides the cache size budget, so a file larger than the
+budget is still kept.
+
+== When the server copy changes
+
+A pinned file whose server copy has moved on is marked *stale* — a green check
+with a warning — rather than silently updated. Bring it up to date:
+
+[source,sh]
+----
+wusel update Notes.txt     # one path
+wusel update               # every pin in the account
+----
+
+In Files, the same thing is the *Update now* action on a stale file.
+
+Use `update`, not unpin-then-pin-again: the latter drops the eviction marker
+first, so a re-download that failed would leave the file both outdated *and*
+unprotected.
+
+== Deciding it in advance
+
+Two settings decide what happens to a stale pin, so you are not chasing them by
+hand. Both live in `config.toml`; see xref:reference/configuration.adoc[Configuration reference].
+
+`[sync] refresh_pinned`:: whether a stale pin is fetched *unasked, in the
+background*. `manual` shows the emblem and nothing else, `ask` (the default)
+sends one aggregated notification with an action, `auto` fetches by itself but
+only over a connection known to be unmetered.
+
+`[sync] open_pinned`:: what to serve when you *open* an out-of-date pinned file.
+`newest` (the default) fetches the current version, `newest-unmetered` fetches
+unless the connection is metered, `offline` always serves the local copy.
+
+An unknown connection cost counts as metered in both. If you are about to board
+a train, set `open_pinned = "offline"` — that is the one setting that makes a
+pinned file behave the way "kept offline" sounds.
+
+An outdated copy is never handed out silently — you are told, because an
+application that opens it and saves produces a conflict nobody saw coming.
+
+== Where pins live
+
+In `~/.config/wusel/pins.json`, beside the configuration and deliberately *not*
+in the state database: a pin is what you said, not something Wusel fetched. So
+`wusel cache clear` leaves pins alone, they survive a rebuilt or relocated
+database, and they travel with a roaming home directory. Their contents download
+again on first use after a clear.

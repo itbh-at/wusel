@@ -3,19 +3,51 @@
   // Copyright 2026 IT Beratung Hermann GmbH
 ////
 
-* xref:index.adoc[Overview]
-* xref:architecture.adoc[Architecture]
-* xref:concurrency.adoc[Concurrency (design)]
-** xref:fsm-scripts.adoc[The operation scripts]
-** xref:frontends.adoc[Frontends & portability (design)]
-* xref:roadmap.adoc[Roadmap]
-* xref:changelog.adoc[Changelog]
-* xref:distribution.adoc[Project, licence & distribution]
-* xref:contributing.adoc[Contributing]
-* xref:development.adoc[Development]
-* xref:installation.adoc[Installation (Fedora RPM)]
-* xref:trying-it-out.adoc[Trying it out]
-* xref:file-manager.adoc[File-manager integration]
-* xref:troubleshooting.adoc[Troubleshooting]
-* xref:known-limitations.adoc[Known limitations]
-* xref:rust-learning-path.adoc[Rust Learning Path]
+* xref:index.adoc[Start here]
+
+.Tutorials
+* xref:tutorials/on-gnome.adoc[Your files as a folder — on GNOME]
+* xref:tutorials/on-another-desktop.adoc[… on any Linux desktop]
+* xref:tutorials/on-a-server.adoc[… on a server]
+* xref:tutorials/set-up-a-development-environment.adoc[Set up a Wusel development environment]
+
+.How-to — using Wusel
+* xref:how-to/install-a-package.adoc[Install a package]
+* xref:how-to/install-from-source.adoc[Install from source]
+* xref:how-to/mount-at-login.adoc[Mount at login]
+* xref:how-to/add-another-account.adoc[Add another account]
+* xref:how-to/keep-files-offline.adoc[Keep files offline]
+* xref:how-to/connect-to-a-self-signed-server.adoc[Connect to a server with a private certificate]
+* xref:how-to/diagnose-a-problem.adoc[Diagnose a problem]
+* xref:how-to/uninstall.adoc[Uninstall]
+
+.How-to — working on Wusel
+* xref:how-to/build-a-package.adoc[Build a package]
+* xref:how-to/develop-on-macos.adoc[Develop on macOS]
+
+.Reference
+* xref:reference/cli.adoc[Command line]
+* xref:reference/configuration.adoc[Configuration]
+* xref:reference/packages.adoc[Packages]
+* xref:reference/files-and-directories.adoc[Files and directories]
+* xref:reference/platform-support.adoc[Platform support]
+* xref:reference/file-states.adoc[File states]
+* xref:reference/limitations.adoc[Known limitations]
+* xref:reference/operation-scripts.adoc[Operation scripts]
+
+.Explanation
+* xref:explanation/vfs-first.adoc[VFS-first]
+* xref:explanation/architecture.adoc[Architecture]
+* xref:explanation/keeping-in-sync.adoc[Keeping in sync]
+* xref:explanation/concurrency.adoc[Concurrency]
+* xref:explanation/testing.adoc[How Wusel is tested]
+* xref:explanation/credentials-and-trust.adoc[Credentials and trust]
+* xref:explanation/desktop-integration.adoc[Desktop integration]
+* xref:explanation/portability.adoc[Portability]
+* xref:explanation/compatibility.adoc[Compatibility and stability]
+
+.Project
+* xref:project/roadmap.adoc[Roadmap]
+* xref:project/changelog.adoc[Changelog]
+* xref:project/licence.adoc[Licence]
+* xref:project/contributing.adoc[Contributing]

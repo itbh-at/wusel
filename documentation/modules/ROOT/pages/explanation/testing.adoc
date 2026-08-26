@@ -1,0 +1,106 @@
+////
+  // SPDX-License-Identifier: Apache-2.0
+  // Copyright 2026 IT Beratung Hermann GmbH
+////
+
+= How Wusel is tested
+:description: A pyramid rather than a Nextcloud per run: what each tier proves, and why nothing is skipped quietly.
+
+Wusel talks to a server over the network and to a kernel through FUSE. Both are
+expensive to stand up and easy to fake badly, so the question of *what a green
+run actually proves* is not a detail here — it is most of the design.
+
+The answer is a pyramid. We do not boot a Nextcloud for every run, and we do not
+pretend a mock proves what only a real server can.
+
+== The tiers
+
+A pyramid — we do not boot a Nextcloud for every run.
+
+* *Unit tests (no server).* Pure logic: PROPFIND parsing, SQLite state, sync-state
+  decisions, three-way merge, path handling. Fast, deterministic, run everywhere.
+* *Purpose-built fake servers (no Nextcloud, no mocking crate).* Protocols that
+  are not WebDAV get a few lines of hand-rolled `tokio` server in the test itself:
+  the `notify_push` websocket and the self-signed-TLS handshake. No HTTP-mocking
+  dependency is pulled in for this — see the dependency policy in
+  xref:explanation/architecture.adoc[Architecture].
+* *Standalone WebDAV mock (`wusel-mock`).* A tiny binary crate that serves a **real
+  directory** as a Nextcloud-style user root (PROPFIND Depth 0/1, range GET, and the
+  write verbs). It is pure Rust with a single dependency (`tokio`) — deliberately no
+  Python and no mocking framework, to keep the project to one language and few
+  dependencies. Because it mirrors a directory on disk, exercising change detection
+  is just `echo`/`rm` in that directory, and fixtures are staged by creating files
+  rather than by writing XML. Two fault-injection markers in a file's *name* provoke
+  server behaviour that is otherwise hard to stage: `*.fail-once` (the first `PUT`
+  answers 500) and `*.no-etag*` (`PUT`/`MOVE` answer without an `ETag`). Start it
+  with `mise run mock` (`--root DIR`), point a mount at it, or let the integration
+  tests under `crates/wusel-mock/tests/` drive the real client against it — that is
+  where every server-facing engine test lives.
+
+All three tiers run under `mise run test` — they are ordinary `cargo test` cases
+(the standalone mock via an integration test; `wusel-mock` is also a library, so
+tests can drive it in-process).
+
+[NOTE]
+====
+On Linux `mise run test` is not a bare `cargo test`: `scripts/test.sh` wraps the
+run in a private D-Bus session with an empty, unlocked keyring
+(`dbus-run-session` + `gnome-keyring-daemon`, files under a temporary
+`XDG_DATA_HOME`). Install those two on a fresh machine — Fedora
+`sudo dnf install gnome-keyring dbus-daemon`, Debian/Ubuntu
+`sudo apt-get install gnome-keyring dbus-bin`; without them the suite stops and
+says so rather than testing less than it claims.
+
+It buys two things. The credential tests answer the same on an unlocked GNOME
+desktop and in a bare container, instead of depending on whether the machine
+happens to have a Secret Service. And no test can touch your own login keyring —
+the same account key the product uses. See _Credential storage_ in
+xref:explanation/architecture.adoc[Architecture] for how the keyring's failure modes are
+covered without a keyring at all.
+====
+
+* *Real FUSE mount (Linux, `/dev/fuse`).* `mise run fuse-test` mounts the full
+  stack — engine + FUSE — against the in-process `wusel-mock` and drives it through
+  the kernel: `ls`, `cat`, `stat`, `statfs`, then unmount. It needs a Linux
+  container, so it is not part of the native `mise run test`; run it via podman
+  (see below). This is the automated counterpart to the manual mount check.
+* *Real Nextcloud — automated, nightly.* `scripts/e2e-nextcloud.sh` drives a
+  FUSE-mounted `wusel` against a *real* Nextcloud container: read/hydration,
+  write/upload, pin, and the opt-in 3-way merge on a genuine 412 conflict. This
+  is the tier a mock cannot stand in for (ETag propagation, chunked-upload NG,
+  the server's own conditional-request behaviour). Run it locally with
+  `mise run e2e-local` (podman); in CI it is the *E2E* workflow, see below. The
+  local run uses one server — override it with
+  `NC_IMAGE=nextcloud:33-apache mise run e2e-local` to reproduce a matrix leg.
++
+The responsiveness checks throttle the link with `tc`, which needs NET_ADMIN and
+an interface whose root qdisc can be displaced. The dev container has both; a CI
+runner has neither, so there those steps are *skipped* — announced as loudly as a
+failure would be, and counted in the closing line. They are a local tier by
+design, not a gap that crept in.
+  Anything the script still cannot cover — live `notify_push`, the desktop
+  integration in a real session — stays a manual check against our own instance
+  (see xref:tutorials/on-gnome.adoc[the GNOME tutorial]).
+
+== The rule underneath all of it
+
+A test that only runs when someone remembers to ask for it does not run. Nothing
+is `#[ignore]`, and nothing is skipped-when-absent either: a green run has to
+mean the thing was checked, so when a tier's tooling is missing the suite stops
+and names the package to install.
+
+The one exception is announced as loudly as a failure would be. The
+responsiveness checks need to throttle the link, which requires privileges a CI
+runner does not have; there those steps are *skipped*, said out loud, and
+counted in the closing line. They are a local tier by design, not a gap that
+crept in.
+
+The same reasoning drives the adverse conditions the concurrency tests inject
+rather than hope for — see
+xref:explanation/concurrency.adoc[Concurrency].
+
+== What no test covers
+
+Live `notify_push` against a real server, and the desktop integration in a real
+session. Both stay manual checks against our own instance. There is no honest
+way to automate a notification appearing on somebody's screen.

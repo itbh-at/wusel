@@ -1,0 +1,58 @@
+////
+  // SPDX-License-Identifier: Apache-2.0
+  // Copyright 2026 IT Beratung Hermann GmbH
+////
+
+= Add another account
+:description: Connect a second Nextcloud — its own login, its own mount folder, its own service instance.
+
+Accounts are optional named profiles. The account you already have is the
+implicit `default` one and needs no flag; every additional one is named, and
+fully isolated — separate credentials, separate state, separate cache, separate
+mountpoint.
+
+For an account called `work`:
+
+[source,sh]
+----
+wusel login --account work https://cloud.work.example
+sudo wusel desktop install-provider --account work
+systemctl --user enable --now wusel@work
+----
+
+That is: log in, register the sidebar entry, mount. The account appears at
+`~/Wusel-work`.
+
+Log out and back in so the new sidebar entry shows up.
+
+== Why `sudo` for the middle step
+
+The file manager's provider collector scans only *system* data directories — it
+never looks in your home — so the registration has to be written to one. The
+packages do this for the default account already; every named account needs it
+once.
+
+Skipping it costs you the sidebar entry for that account and nothing else. The
+mount, the emblems and the notifications work regardless.
+
+== Managing them
+
+[source,sh]
+----
+wusel accounts                  # list them
+wusel account remove work       # delete a named profile
+----
+
+`remove` deletes that account's credentials, state and cache. The Nextcloud
+server is untouched.
+
+== Two rules
+
+Two accounts may not share or nest a mountpoint — Linux would over-mount and
+hide the first — so `mount` refuses to start where its target equals, contains,
+or sits inside another active mount.
+
+Mounting the *same* server and user under two accounts is allowed but warned
+about: two read-write mounts of one account edit the same server files through
+two independent caches and write buffers, so they can conflict with each other
+exactly as two different machines would.

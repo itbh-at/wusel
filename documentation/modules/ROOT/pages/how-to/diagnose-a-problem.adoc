@@ -3,12 +3,15 @@
   // Copyright 2026 IT Beratung Hermann GmbH
 ////
 
-= Troubleshooting
-:description: Symptom-oriented checks for the mount, the desktop integration and the cache.
+= Diagnose a problem
+:description: Two commands that answer most questions, then a symptom-ordered checklist for the mount, the desktop integration, uploads and the cache.
 
-Symptom-oriented checklist, ordered by how often each case has bitten in
-practice. For the architecture behind these parts see
-xref:architecture.adoc[Architecture].
+Work down this page: the two commands first, then the symptom that matches
+yours. The cases are ordered by how often each has actually bitten.
+
+Before anything else, check that your setup is one Wusel is tested on —
+xref:reference/platform-support.adoc[Platform support] lists which
+distributions, desktops and Nextcloud versions those are.
 
 == First stop: `wusel doctor`
 
@@ -95,32 +98,6 @@ is a range being served live to whoever asked for it, `caching` is a whole-file
 hydration running in the background with nobody waiting for it. Individual reads
 last milliseconds, so a single run only catches a sample of them —
 `wusel status --watch` redraws once a second.
-
-== Where things have been tested
-
-[cols="1,1,2"]
-|===
-|Environment |File manager |Status
-
-|Fedora, GNOME (local session)
-|Nautilus
-|Reference setup: mount, notifications and cloud-provider status verified.
-
-|Fedora, GNOME via RDP, daemon started over SSH
-|Nautilus
-|Mount works; desktop integration depends on the daemon's environment — see
-<<ssh-session>>.
-
-|Debian (podman container, headless)
-|—
-|FUSE end-to-end tests (`mise run fuse-test`); no desktop.
-
-|Other distributions, KDE/Dolphin, Nemo, Thunar
-|—
-|Untested so far. Dolphin/Nemo/Thunar have no `libcloudproviders` consumer, so
-the file-manager status is expected to be absent there (per-file-manager
-plugins are a roadmap item).
-|===
 
 == The desktop integration is two independent channels
 
@@ -251,7 +228,7 @@ wusel cache clear Photos     # one subtree, recursively
 
 Run it while the account is not mounted — including for a single path, where
 that requirement is a
-xref:known-limitations.adoc#cache-clear-needs-unmount[known limitation] rather
+xref:reference/limitations.adoc#cache-clear-needs-unmount[known limitation] rather
 than a technical necessity. If a problem survives `cache clear`, it is not a
 caching problem.
 

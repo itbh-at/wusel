@@ -1,0 +1,255 @@
+////
+  // SPDX-License-Identifier: Apache-2.0
+  // Copyright 2026 IT Beratung Hermann GmbH
+////
+
+= Command-line reference
+:description: Every wusel command, argument and flag, with its default.
+
+....
+wusel [--account NAME] <command> [args]
+....
+
+`wusel` with no command prints its help and exits.
+
+== Global options
+
+[cols="1,3",options="header"]
+|===
+| Option | Meaning
+
+| `--account NAME`
+| Which account profile to act on. Omitted, every command uses the implicit
+  `default` account, whose files sit directly in the base directories. Available
+  on every subcommand.
+
+| `--version`
+| Print the version and exit.
+
+| `--help`
+| Print help. Also available per subcommand.
+|===
+
+== Connecting
+
+=== `wusel login <SERVER_URL>`
+
+Log in through Nextcloud's Login Flow v2 and store the credentials. Prints a URL
+to confirm in a browser; your real account password is never seen or stored.
+Nothing is mounted.
+
+[cols="1,3",options="header"]
+|===
+| Argument / option | Meaning
+
+| `<SERVER_URL>`
+| The Nextcloud base URL, for example `https://cloud.example.org`.
+
+| `--keyring [true\|false]`
+| Where to keep the app password. Unset, `[auth] keyring` from the configuration
+  decides (default: the OS keyring). `--keyring false` forces the `0600` file.
+  Either way it is fail-soft — an unusable keyring falls back to the file.
+|===
+
+=== `wusel mount [MOUNTPOINT]`
+
+Mount the filesystem in the foreground. Requires a binary built with the `fuse`
+feature; the distribution packages are.
+
+[cols="1,3",options="header"]
+|===
+| Argument | Meaning
+
+| `[MOUNTPOINT]`
+| Where to attach. Omitted, `[mount] point` from the configuration is used, and
+  failing that `~/Wusel` (or `~/Wusel-<account>` for a named account).
+|===
+
+Two accounts may not share or nest a mountpoint; `mount` refuses to start where
+its target equals, contains, or sits inside another active mount.
+
+=== `wusel service <enable|disable|status>`
+
+Manage the systemd *user* service for this account. Linux only.
+
+[cols="1,3",options="header"]
+|===
+| Subcommand | Meaning
+
+| `enable`
+| Mount now and at every login, in the background.
+
+| `disable`
+| Stop the mount and stop it starting at login.
+
+| `status`
+| Show the service status — the equivalent of `systemctl --user status`.
+|===
+
+On a machine where the package installed the unit template, `systemctl --user
+enable --now wusel@<account>` does the same thing.
+
+== Keeping files offline
+
+=== `wusel pin [PATH]`
+
+Keep a file or directory offline permanently. Downloads it now — a directory
+recursively — and exempts it from cache eviction.
+
+[cols="1,3",options="header"]
+|===
+| Argument | Meaning
+
+| `[PATH]`
+| The remote path to pin, for example `Photos`. Omitted, the *whole account* is
+  pinned: the old desktop client's "download everything".
+|===
+
+A directory pin covers its whole subtree, including entries not yet listed.
+Needs no running mount.
+
+=== `wusel unpin [PATH]`
+
+Remove a pin. The files become ordinary, evictable cache again; nothing is
+deleted from the server. Omitting `PATH` removes the whole-account pin.
+
+=== `wusel update [PATH]`
+
+Fetch the current version of pinned files whose local copy has gone out of date,
+in place. Omitting `PATH` updates every pin in the account.
+
+Deliberately not the same as unpinning and pinning again, which would drop the
+eviction marker first — a re-download that then failed would leave the file both
+outdated and unprotected.
+
+=== `wusel pins`
+
+List the account's pins.
+
+== Accounts
+
+=== `wusel accounts`
+
+List the configured accounts. Identical to `wusel account list`.
+
+=== `wusel account <list|remove NAME>`
+
+[cols="1,3",options="header"]
+|===
+| Subcommand | Meaning
+
+| `list`
+| List the configured accounts.
+
+| `remove NAME` (alias `rm`)
+| Delete a named account: its credentials, state database and cache. The
+  Nextcloud server is untouched.
+|===
+
+== Finding out what is going on
+
+=== `wusel status`
+
+Show what the mount is doing right now, *by file name*: uploads still owed to
+the server — including any parked after a permanent failure — files coming down,
+and the rest of the work in flight.
+
+[cols="1,3",options="header"]
+|===
+| Option | Meaning
+
+| `--watch`
+| Keep redrawing until interrupted. Individual reads are far too short to be
+  caught by a single print.
+|===
+
+This is for the person whose files these are. `doctor` is the other half: name-free,
+and made to be shared.
+
+=== `wusel doctor`
+
+Collect diagnostics for a support case: system, daemon, mount, the FUSE
+connection's waiting count, the daemon's internal state, and a redacted journal
+tail. Redacted by default, so the output is safe to attach to a ticket.
+
+[cols="1,3",options="header"]
+|===
+| Option | Meaning
+
+| `-o PREFIX`, `--output PREFIX`
+| Also write `<PREFIX>.txt` and `<PREFIX>.json` beside the printed report.
+
+| `--include-listing`
+| Include full paths and file names — turns redaction off, for a consenting deep
+  dive.
+
+| `--no-logs`
+| Omit the journal tail from the report.
+|===
+
+== Cache
+
+=== `wusel cache clear [PATH]`
+
+Drop cached data so the next access loads fresh from the server. Stop a running
+mount first.
+
+[cols="1,3",options="header"]
+|===
+| Argument | Meaning
+
+| `[PATH]`
+| A remote path, for example `Photos`, clearing that subtree. Omitted, the whole
+  account is cleared — metadata, content *and* pins, like a fresh connection.
+  Credentials and configuration are kept.
+|===
+
+Separates a stale-cache problem from a server-side one. It refuses to run while
+the account is mounted; see xref:reference/limitations.adoc[Known limitations]
+for why.
+
+== Desktop integration
+
+=== `wusel desktop notify [SEVERITY]`
+
+Send a test notification through the real backend, to verify the desktop's
+notification channel works independently of any sync event.
+
+[cols="1,3",options="header"]
+|===
+| Argument | Meaning
+
+| `[SEVERITY]`
+| `info`, `warning`, `error`, or `all`. Default `all`.
+|===
+
+=== `wusel desktop install-provider`
+
+Install this account's file-manager cloud-provider registration, so a file
+manager shows the mount in its sidebar. Writes into a *system* directory, so it
+needs root — the file manager's collector only scans system data directories,
+never the user's home.
+
+[cols="1,3",options="header"]
+|===
+| Option | Meaning
+
+| `--dir DIR`
+| Target directory. Default: the system applications directory.
+|===
+
+The packages do this for the default account already. Named accounts need it
+run once each.
+
+=== `wusel desktop uninstall-provider`
+
+Remove this account's registration. Takes the same `--dir DIR`.
+
+== Services
+
+=== `wusel search-provider`
+
+Run the GNOME Shell search provider — a D-Bus service that GNOME Shell activates
+on demand and that answers from the server's Unified Search. Not something to
+start by hand; it is listed here because it is a real subcommand and will appear
+in process listings.

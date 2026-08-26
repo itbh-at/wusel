@@ -4,6 +4,7 @@
 ////
 
 = Changelog
+:description: What changed in each release.
 
 User-facing changes, newest first. This page and the RPM's `%changelog`
 (`packaging/rpm/wusel.spec`) describe the same releases and must stay in step —
@@ -83,13 +84,13 @@ Fedora/GNOME desktop.
   ticket: the engine view is name-free, no directory is listed, no secret is
   read, and the home path and username are masked. Prints to stdout; `-o PREFIX`
   also writes `PREFIX.txt` and `PREFIX.json`. See
-  xref:troubleshooting.adoc[Troubleshooting].
+  xref:how-to/diagnose-a-problem.adoc[Diagnose a problem].
 
 * **Concurrency.** Every FUSE callback is now an intent handed to a state
   machine that decides and performs no I/O, with database readers, a single
   writer, and network and file pools underneath. 0.1.0 served one request at a
   time; a slow operation no longer blocks unrelated ones. Configurable with
-  `[mount] dispatch_threads`. See xref:concurrency.adoc[Concurrency].
+  `[mount] dispatch_threads`. See xref:explanation/concurrency.adoc[Concurrency].
 * **Choose what a stale pinned file does.** `[sync] refresh_pinned =
   manual | ask | auto` controls whether an out-of-date offline file is fetched
   *unasked*, where `auto` fetches only on an unmetered connection (NetworkManager

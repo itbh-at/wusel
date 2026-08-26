@@ -1,0 +1,211 @@
+////
+  // SPDX-License-Identifier: Apache-2.0
+  // Copyright 2026 IT Beratung Hermann GmbH
+////
+
+= Your Nextcloud files as a folder — on GNOME
+:description: Set up the Wusel client on a GNOME desktop so the files in your Nextcloud appear as an ordinary folder, with sidebar entry, per-file emblems and Shell search.
+
+Wusel is a *client*. You install it on the machine that should see the files,
+and it makes what lives in your Nextcloud appear there as an ordinary folder —
+fetching each file only when something opens it. It installs nothing on the
+Nextcloud server and changes nothing there; you need an account on a Nextcloud
+that somebody is already running.
+
+By the end of this your entire Nextcloud will be sitting in `~/Wusel`, you will
+have opened a file from it, and you will have kept one available offline. About
+twenty minutes, most of it waiting.
+
+Follow it top to bottom. It makes choices for you on purpose; once it works, the
+xref:how-to/install-a-package.adoc[how-to guides] cover the variations.
+
+[TIP]
+.Not on GNOME?
+====
+This is one of three versions of the same tutorial, because what you *see* at
+the end differs. GNOME gets the full integration, which is what this page walks
+you through.
+
+* Another desktop — KDE Plasma, Xfce, Cinnamon, Sway:
+  xref:tutorials/on-another-desktop.adoc[on any Linux desktop]
+* No desktop at all — a server or a box you only reach over SSH:
+  xref:tutorials/on-a-server.adoc[on a server]
+
+Steps 1 to 3 are the same in all three. Only what you do with it afterwards
+changes.
+====
+
+.What you need
+****
+* A Linux machine running *GNOME* — Files (Nautilus) as the file manager.
+* A Nextcloud account you can log into in a browser.
+* Permission to install a package (`sudo`).
+****
+
+== Step 1 — Install the package
+
+Download the file for your distribution and architecture from the
+https://github.com/itbh-at/wusel/releases/latest[latest release]. Then, for an
+RPM-based distribution such as Fedora:
+
+[source,sh]
+----
+sudo dnf install ./wusel-*.rpm
+----
+
+For a Debian-based one such as Debian or Ubuntu:
+
+[source,sh]
+----
+sudo apt install ./wusel_*.deb
+----
+
+On Arch, build the recipe from the repository — `cd wusel/packaging/aur && makepkg -si`.
+
+That is the only step where your distribution matters. Everything below is the
+same everywhere.
+
+Now *log out and log back in*. The file-manager extension and the search
+provider are loaded when a session starts, so the session you are in has not
+picked them up yet.
+
+== Step 2 — Log in to your Nextcloud
+
+[source,sh]
+----
+wusel login https://cloud.example.org
+----
+
+It prints a URL. Open it, confirm in the browser, and come back to the terminal.
+You should see:
+
+----
+✓ Logged in as <you> on <server>
+----
+
+Your real account password is never sent to Wusel. What it received is a
+separate *app password* that you can revoke at any time in Nextcloud under
+*Settings → Security*. It is stored in your desktop keyring.
+
+Nothing is mounted yet.
+
+== Step 3 — Switch the mount on
+
+[source,sh]
+----
+systemctl --user enable --now wusel@default
+----
+
+One line, two things: `--now` mounts your cloud at `~/Wusel` immediately, and
+`enable` makes it come back at every login from now on. There is no terminal to
+keep open and nothing running in the foreground.
+
+Check that it started:
+
+[source,sh]
+----
+systemctl --user status wusel@default
+----
+
+You are looking for `active (running)`.
+
+== Step 4 — Look at your files
+
+[source,sh]
+----
+ls ~/Wusel
+----
+
+Your whole Nextcloud tree is there. Note what did *not* happen: nothing was
+downloaded. The listing came from the server's metadata, and the files are
+online-only.
+
+Open the *Files* application. There is now a *Wusel (Nextcloud)* entry in the
+sidebar, and every file carries a small cloud emblem — that emblem means "lives
+on the server, not here".
+
+Now open one. A text file is easiest:
+
+[source,sh]
+----
+cat ~/Wusel/Some.txt
+----
+
+The content is served straight from the server as you read it. Look at the file
+in Files again: the emblem has changed to a cloud with a check. That means the
+whole file has been pulled into a local cache in the background, so opening it
+again costs nothing. It is still evictable — the cache has a size budget.
+
+== Step 5 — Write something
+
+[source,sh]
+----
+echo "a new line" >> ~/Wusel/Some.txt
+----
+
+Check your Nextcloud in a browser: the line is there. The folder is read-write —
+create, edit, rename, delete, `mkdir`, all of it goes to the server.
+
+A read-only share rejects writes with a permission error, as it should. And if
+somebody else edited the same file while you did, your version is saved beside
+theirs as `Some (conflicted copy …).txt` rather than either one being lost.
+
+Editor and office scratch files — vim swap files, LibreOffice lock files,
+`*.tmp` — are kept purely local and never appear in your cloud.
+
+== Step 6 — Keep a file when the network is gone
+
+Caching is automatic, but temporary — the cache evicts. To make a file stay:
+
+[source,sh]
+----
+wusel pin Some.txt
+----
+
+Its emblem turns into a green check. That file is now downloaded and exempt from
+eviction — it is readable with the network off. `wusel pin Documents` does the
+same for a whole folder, recursively, and `wusel unpin` releases it.
+
+In Files, the same thing is the right-click action *Make Available Offline*.
+
+== Step 7 — Watch it update itself
+
+Change a file in Nextcloud's web interface — or from your phone — and watch the
+open Files window. If your server has the
+https://apps.nextcloud.com/apps/notify_push[`notify_push`] app, the change
+appears within moments, with no refresh. Without it, Wusel catches up within
+half a minute or so.
+
+== That is the whole thing
+
+You now have a Nextcloud folder that is always there, costs no disk until you
+use it, and updates itself. Nothing needs starting; the service comes back at
+every login.
+
+Try the Activities overview as well: start typing a filename and your Nextcloud
+results appear under *Wusel (Nextcloud)*. That search runs on the server, so it
+finds files you have never downloaded.
+
+.Where to go next
+****
+* xref:how-to/keep-files-offline.adoc[Keep files offline] — pinning in full,
+  including what happens when a pinned file changes on the server.
+* xref:how-to/add-another-account.adoc[Add another account] — a second
+  Nextcloud, in its own folder.
+* xref:reference/configuration.adoc[Configuration reference] — everything you
+  can change. You need none of it to use Wusel.
+* xref:explanation/vfs-first.adoc[Why nothing is downloaded up front] — what
+  you just watched happen, and why it was built that way.
+* Something not working? xref:how-to/diagnose-a-problem.adoc[Diagnose a problem]
+  starts with the two commands that answer most questions.
+****
+
+== If you want to stop
+
+[source,sh]
+----
+systemctl --user disable --now wusel@default
+----
+
+`~/Wusel` goes empty; your files live only in the cloud again. Removing Wusel
+altogether is xref:how-to/uninstall.adoc[Uninstall].

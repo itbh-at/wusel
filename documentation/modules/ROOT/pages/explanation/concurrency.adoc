@@ -4,17 +4,18 @@
 ////
 
 = Concurrency: getting off the single dispatch thread
+:description: Why one thread deciding everything was a ceiling, and how a dependency-free state machine over a pool substrate replaced it.
 
 NOTE: Wusel 0.1.0 served FUSE requests one at a time. This page is how that
 changed in 0.2.0, why it is shaped the way it is, and how each step is proven.
-See <<_status>> for what is in and what is not, and the xref:roadmap.adoc[Roadmap]
+See <<_status>> for what is in and what is not, and the xref:project/roadmap.adoc[Roadmap]
 for where the whole sits.
 
 == The ceiling
 
 `fuser`'s session loop reads and dispatches one request at a time. The engine
 mitigates that — reads serve only their range, revalidation runs off-thread (see
-xref:architecture.adoc[_FUSE ↔ async bridge_]) — but the thread itself stays a
+xref:explanation/architecture.adoc[Architecture]) — but the thread itself stays a
 hard serialisation point. Two effects survive the mitigations:
 
 * A hydration is chunked, but every chunk is still a network round-trip on the
@@ -106,7 +107,7 @@ machine entirely.
 
 The machine says *object*, not *inode*, on purpose: an inode is what one kernel
 interface happens to call an identity, and the machine may not depend on that.
-Under FUSE it is the inode; xref:frontends.adoc[Frontends and portability] has
+Under FUSE it is the inode; xref:explanation/portability.adoc[Portability] has
 the reasoning and what it costs to get wrong.
 
 === A script, not a graph
@@ -142,7 +143,7 @@ can stand for minutes. As a script it is seven named steps, each one separately
 readable and testable.
 
 Every implemented callback is drawn this way — step by step, with the executing
-thread colour-coded — in xref:fsm-scripts.adoc[The operation scripts]. That page
+thread colour-coded — in xref:reference/operation-scripts.adoc[the operation scripts]. That page
 is the reference; this one is the argument.
 
 === The three functions
@@ -347,7 +348,7 @@ open — does exactly the wrong thing.
 === Make staleness visible, and let the user spend the bandwidth
 
 The engine already surfaces per-file state through the `user.wusel.state` xattr
-(xref:file-manager.adoc[File-manager integration]), and the design principle
+(xref:reference/file-states.adoc[File states]), and the design principle
 there is that every state is *always visible*. Staleness gets the same treatment:
 
 * **A fifth state, for pinned files only.** An unpinned cached file that goes
@@ -625,88 +626,40 @@ type names, and inherit the policy unchanged.
 * **The blocking that remains.** Workers block — that is their job. The claim is
   not "nothing blocks", it is "nothing blocks where a decision is made".
 
-== Implementation in stages, with gates
+== How we know it works
 
-Each stage ends with a gate on three levels: static (compiles, lints, formats,
-licence headers), mock (the deterministic suites), and **a real Nextcloud** via
-`mise run e2e-local`. A gate that fails is not carried into the next stage.
-
-All seven were built in this order, and each gate was made to fail before it
-was made to pass — a gate nobody has seen red proves nothing.
-
-[cols="1,3,2,1"]
-|===
-|Stage |What it does |Gate proves |State
-
-|1 Offload reads |`read` hands its reply to a worker and returns. No shared
-state; `ContentSource` is already `Send + Sync`. Works on today's `fuser`.
-|An unrelated `stat` is served while a large read is in flight |done
-
-|2 `fuser` 0.14 → 0.18 |Overdue maintenance; brings `Config::n_threads`, so the
-worker pool is no longer our code |Behaviour identical to stage 1 |done
-
-|3 The machine |Per-object occupancy, the collision table, `advance`; database readers alongside one writer
-|One test per policy row; no operation stalls the FSM |done
-
-|4 Event-driven writes |Every network step split into start and completion; the
-per-object queue carries ordering |The 3-way merge on a real 412 still works;
-three consecutive green runs |done
-
-|5 Streamed hydration |One request instead of one per chunk |The Nextcloud access
-log shows 1 GET where it showed 32 |done
-
-|6 Turn concurrency on |`n_threads`, frontend state behind its own lock |Parallel
-transfers measurably overlap |done
-
-|7 Cancellation |Shutdown first, then the collision-driven aborts |An interrupted
-read leaves no in-flight slot behind |done
-|===
-
-Because a fast machine hides every one of these problems, the gates **inject**
+A fast machine hides every problem this page is about. So the tests **inject**
 the adverse condition rather than hoping for it:
 
-* **Network:** `tc netem` throttling (about 3 Mbit with added latency). Without
-  it the responsiveness test is not reliably red beforehand, and then it proves
+* *Network:* `tc netem` throttling (about 3 Mbit with added latency). Without it
+  the responsiveness test is not reliably red beforehand, and then it proves
   nothing afterwards.
-* **Database:** a helper holding `BEGIN IMMEDIATE` — a deterministic write-lock
+* *Database:* a helper holding `BEGIN IMMEDIATE` — a deterministic write-lock
   stall, no timing luck required.
-* **File I/O:** a test-only delay in the blob and scratch paths, to stand in for
-  a virus scanner.
-* **Network home:** a Samba container in the same podman network, mounted as the
+* *File I/O:* a test-only delay in the blob and scratch paths, to stand in for a
+  virus scanner.
+* *Network home:* a Samba container in the same podman network, mounted as the
   home directory, to exercise the relocation.
 
-== Status
+Every claim above was made to fail before it was made to pass. A gate nobody has
+seen red proves nothing.
 
-**Built and released in 0.2.0.** Wusel 0.1.0 served one request at a time;
-stages 1 to 6 are in place and the machine is what serves every callback.
+Against a real Nextcloud (`mise run e2e-local`): the mount stays responsive
+during both a large download and a large upload over a throttled 3 Mbit link,
+writes to one file keep their order, a hydration costs one GET where it used to
+cost thirty-two, and two concurrent transfers overlap — 7.6 s against 8.7 s
+sequential. Deterministically, without a server: `concurrent_read_e2e.rs`,
+`concurrent_reads_overlap_e2e.rs`, and one test per row of the collision table,
+each named after its row.
 
-`wusel-fsm` holds the decider: per-object occupancy with a FIFO queue, the
-collision policy below, and every operation as a script over a pure `advance`.
-It has **no dependencies at all** — `cargo tree -p wusel-fsm` is one line — so
-the rule this page turns on is enforced by the compiler rather than by review.
-`wusel-core::runtime` is the substrate underneath it: a deciding thread, N
-database readers each with its own connection, one writer, and network and file
-pools.
-
-What that replaced is worth naming, because it looked finished and was not. A
-single owner thread used to hold the whole engine and run each operation to
-completion. It removed a mutex without removing the serialisation — a `getattr`
-still read SQLite on that thread, so one slow filesystem stalled every other
-callback — and coordination was hand-written per operation, with `FlushCoord`
-providing Join and Queue for uploads and nothing else.
-
-Proven where it can fail. Against a real Nextcloud
-(`mise run e2e-local`): the mount stays responsive during both a large download
-and a large upload over a throttled 3 Mbit link, writes to one file keep their
-order, a hydration costs one GET, and two concurrent transfers overlap —
-7.6 s against 8.7 s sequential. Deterministically, without a server:
-`concurrent_read_e2e.rs`, `concurrent_reads_overlap_e2e.rs`, and one test per
-row of the collision table named after its row.
-
-**Stage 7, cancellation, is built too.** `open` hands out real file handles —
+Cancellation is checkable the same way. `open` hands out real file handles —
 without them there is no telling one reader's outstanding work from another's —
 and the frontend remembers which reads each handle has in flight. A `flush` on a
 handle that still has reads open means the reader is gone, so those flows are
 given up at their next step boundary. Turning the abort off makes
 `crates/wusel-fsm/tests/occupancy.rs` fail, which is the only convincing form of
 that claim.
+
+`wusel-fsm` has **no dependencies at all** — `cargo tree -p wusel-fsm` is one
+line — so the rule this whole page turns on, that the decider performs no I/O,
+is enforced by the compiler rather than by review.

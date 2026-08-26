@@ -4,7 +4,7 @@
 ////
 
 = Known limitations
-:description: Behaviour that is understood, reproducible and not yet fixed — what you see, why it is so, and what removing it would take.
+:description: Behaviour that is deliberate but surprising: what it looks like, why it is that way, and what to do about it.
 
 Behaviour that is understood, reproducible and *not* fixed yet. Every entry says
 what you see, why the software behaves that way, and what removing the
@@ -12,8 +12,8 @@ limitation would take — including the cases where the desktop offers no
 cooperative way out and the answer has to come from the filesystem itself.
 
 This page is deliberately separate from its neighbours: the
-xref:roadmap.adoc[Roadmap] says what is *planned*, and
-xref:troubleshooting.adoc[Troubleshooting] answers "my mount is broken, what
+xref:project/roadmap.adoc[Roadmap] says what is *planned*, and
+xref:how-to/diagnose-a-problem.adoc[Diagnose a problem] answers "my mount is broken, what
 now?". Nothing here is broken — it is the current shape of the product, stated
 plainly so nobody has to rediscover it.
 
@@ -38,7 +38,7 @@ under it.
 For a *single path* there is no such reason. Dropping the cached content of one
 file, or forgetting one subtree's metadata, is an ordinary write to structures
 the daemon writes to all day; it has one writer and a collision policy for
-exactly this (xref:concurrency.adoc[Concurrency]). The command refuses because
+exactly this (xref:explanation/concurrency.adoc[Concurrency]). The command refuses because
 of *where* the work happens, not what it is: `cache clear` does it itself, in
 the CLI process, opening the account's database from a second process. The blunt
 guard is what keeps that second writer out of the daemon's way.
@@ -103,7 +103,7 @@ record is cleared (`rm -rf ~/.cache/thumbnails/fail/gnome-thumbnail-factory`).
 Today, only the indexer half has an answer: `[desktop]
 exclude_from_indexers` (on by default) makes the mount serve synthetic
 `.trackerignore` / `.nomedia` markers that GNOME Tracker/LocalSearch honour —
-see xref:file-manager.adoc[File-manager integration]. Previews are not covered
+see xref:reference/file-states.adoc[File states]. Previews are not covered
 by it. Turning thumbnails off in the file manager works, but it is a global
 setting; there is no per-folder scope for it.
 
@@ -115,7 +115,7 @@ still carries a Wusel emblem — and its context menu still offers *Make Availab
 Offline* — on a plain ext4 file that has nothing to do with Nextcloud any more.
 
 *Why it happens.* Per-file state travels as the extended attribute
-xref:file-manager.adoc#xattr[`user.wusel.state`], a deliberate contract that any
+xref:reference/file-states.adoc[`user.wusel.state`], a deliberate contract that any
 file manager's plugin can read with one local, network-free call. The copy is
 faithful to it: GIO declares the *entire* extended-attribute namespace as "copy
 the value when the file is copied", and `cp -a`, `rsync -X` and `tar --xattrs`

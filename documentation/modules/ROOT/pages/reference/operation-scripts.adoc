@@ -3,11 +3,12 @@
   // Copyright 2026 IT Beratung Hermann GmbH
 ////
 
-= The operation scripts
+= Operation scripts
+:description: Which filesystem callback becomes which intent, and the state-machine script each intent runs.
 
 NOTE: These scripts are **built and running**, released in 0.2.0. Wusel 0.1.0
 ran every callback as a straight blocking function on one dispatch thread. This
-page belongs to xref:concurrency.adoc[Concurrency], which argues for the shape;
+page belongs to xref:explanation/concurrency.adoc[Concurrency], which argues for the shape;
 here it is, step by step.
 
 The scripts are `crates/wusel-fsm/src/script.rs`, and the diagrams are drawn from
@@ -18,7 +19,7 @@ diagram is wrong.
 are one script because they are one operation; `unlink` and `rmdir` likewise. A
 frontend maps its platform's callbacks onto the intent, and the machine never
 learns their names — which is what makes a second frontend a port rather than a
-rewrite (xref:frontends.adoc[Frontends and portability]).
+rewrite (xref:explanation/portability.adoc[Portability]).
 
 == How to read them
 
@@ -32,7 +33,7 @@ The frame says *object* where the scripts say *inode*, and that difference is
 deliberate. The frame is the machine — a mechanism that must not know what one
 kernel interface calls an identity. The scripts below are FUSE, because FUSE is
 what we ship. Where that line runs, and why it is worth holding, is
-xref:frontends.adoc[Frontends and portability].
+xref:explanation/portability.adoc[Portability].
 
 Two more things are worth holding on to while reading the rest:
 
@@ -211,13 +212,13 @@ right, including the rule that a failed upload must not fail the rename.
   the point of the shape, not an omission — but it means the pictures say
   nothing about which operations are actually slow.
 * **The collision table in full.** It lives in
-  xref:concurrency.adoc#_the_collision_policy[Concurrency]; only the rows that
+  xref:explanation/concurrency.adoc#_the_collision_policy[Concurrency]; only the rows that
   matter for a given script appear beside it here.
 * **The syncer.** Server-side changes arrive as invalidations and start the same
   scripts from a different trigger.
 * **That the scripts are spelled in FUSE.** They are, and deliberately so — this
   is the platform we ship. What that costs a second frontend, and which two
   changes keep it from becoming a rewrite, is
-  xref:frontends.adoc[Frontends and portability].
+  xref:explanation/portability.adoc[Portability].
 * **Failure of the machine itself** — a worker dying, a channel closing. That
   belongs to the implementation stages, not to the scripts.

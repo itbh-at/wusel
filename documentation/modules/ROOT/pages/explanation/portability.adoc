@@ -3,13 +3,14 @@
   // Copyright 2026 IT Beratung Hermann GmbH
 ////
 
-= Frontends and portability
+= Portability
+:description: What a port to another platform actually is here, which knowledge is allowed to live in a frontend, and the two gates that keep the answer checkable.
 
 NOTE: This page records an **intention**, not shipped behaviour. Only the Linux
 FUSE frontend exists — but the groundwork it argues for is now built, and the
-sections below say which parts. It belongs next to xref:architecture.adoc[Architecture],
-which names the three frontends, and xref:concurrency.adoc[Concurrency], which
-designs the state machine they would share.
+sections below say which parts. It belongs next to xref:explanation/architecture.adoc[Architecture],
+which names the three frontends, and xref:explanation/concurrency.adoc[Concurrency],
+which designs the state machine they would share.
 
 == Why this page exists at all
 
@@ -125,7 +126,7 @@ argument of this page in miniature.
 
 == The alphabet: intents, not callbacks
 
-Today the scripts in xref:fsm-scripts.adoc[The operation scripts] *are* the FUSE
+Today the scripts in xref:reference/operation-scripts.adoc[the operation scripts] *are* the FUSE
 callbacks. That is the coupling to break, and it is the single change with the
 most leverage: the machine's vocabulary should be what the **engine** does, not
 what one kernel interface happens to call it.
@@ -384,7 +385,7 @@ to hold them to.
 
 == Two gates that make this checkable
 
-In the spirit of the staged gates in xref:concurrency.adoc[Concurrency], the
+In the spirit of the staged gates in xref:explanation/concurrency.adoc[Concurrency], the
 layering has to be mechanically verifiable, or it will erode:
 
 . **`wusel-fsm` builds and its tests pass with no frontend present**, and the
@@ -431,4 +432,4 @@ belongs to whoever picks the work up, with this trade-off visible.
 * **Building either frontend.** It commits us to not making them impossible.
 * **A FUSE-compatible shim elsewhere.** If Wusel ships on another platform, it
   rides the native framework; that decision stands unchanged.
-* **A timeline.** This sits behind everything in xref:roadmap.adoc[Roadmap].
+* **A timeline.** This sits behind everything in xref:project/roadmap.adoc[Roadmap].

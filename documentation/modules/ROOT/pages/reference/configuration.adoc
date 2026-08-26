@@ -1,0 +1,284 @@
+////
+  // SPDX-License-Identifier: Apache-2.0
+  // Copyright 2026 IT Beratung Hermann GmbH
+////
+
+= Configuration reference
+:description: Every key in config.toml — section, type, default and meaning — plus the environment variables that control logging.
+
+Configuration is entirely optional: Wusel runs with no `config.toml` at all.
+This page lists every key it will read if one exists.
+
+The file lives at `~/.config/wusel/config.toml` for the default account, and at
+`~/.config/wusel/accounts/<name>/config.toml` for a named one
+(xref:reference/files-and-directories.adoc[Files and directories] has the full
+list of paths). It is read at start; changing it takes effect on the next
+mount.
+
+A malformed file is *not* fatal. Wusel logs a warning and falls back to the
+built-in defaults, so a typo cannot lock you out of your own files. An
+unrecognised value for a key with a fixed set of choices is warned about
+individually and that key falls back to its default; the rest of the file still
+applies.
+
+== `[cache]`
+
+[cols="1,1,1,3",options="header"]
+|===
+| Key | Type | Default | Meaning
+
+| `max_size`
+| size
+| `5GiB`
+| How much disk the blob cache may use. Eviction is least-recently-used. Pinned
+  files are exempt: they are never evicted and never counted against this
+  budget, so a pin can take the cache past it. `0` or `unlimited` removes the
+  budget.
+
+| `max_age`
+| duration
+| unset
+| Evict a cached blob once it is older than this, regardless of the size
+  budget. Unset means age alone never evicts.
+|===
+
+*Size* accepts a plain byte count or a suffix: `B`, `KB`, `MB`, `GB`, `TB`,
+`KiB`, `MiB`, `GiB`, `TiB`. The two families are the same here — `GB` is
+1&nbsp;073&nbsp;741&nbsp;824 bytes, not 10^9^.
+
+*Duration* accepts a plain second count or a suffix: `s`, `m`, `h`, `d`.
+
+== `[sync]`
+
+[cols="1,1,1,3",options="header"]
+|===
+| Key | Type | Default | Meaning
+
+| `revalidate_secs`
+| integer (seconds)
+| `30`
+| How old a directory listing may be before it is revalidated against the
+  server. This is the fallback path; with `notify_push` available, changes
+  usually arrive sooner than this.
+
+| `push_floor_secs`
+| integer (seconds)
+| `5`
+| Rate limit for push-triggered revalidation. A directory a push invalidated is
+  re-listed on next access only if its last listing is older than this, so a
+  burst of events collapses into at most one PROPFIND per window.
+
+| `text_merge`
+| boolean
+| `false`
+| On an upload conflict, attempt a three-way text merge before falling back to
+  a conflicted copy. Off by default because the official client always makes a
+  copy. See xref:explanation/keeping-in-sync.adoc[Keeping in sync].
+
+| `refresh_pinned`
+| `manual` \| `ask` \| `auto`
+| `ask`
+| What happens when a pinned file's server copy has moved on. `manual` shows the
+  emblem and nothing else; `ask` sends one aggregated notification with an
+  action; `auto` fetches by itself, but only over a connection known to be
+  unmetered — otherwise it behaves as `ask`.
+
+| `open_pinned`
+| `newest` \| `newest-unmetered` \| `offline`
+| `newest`
+| What to serve when an out-of-date pinned file is *opened*. `newest` always
+  fetches the current version; `newest-unmetered` fetches unless the connection
+  is metered; `offline` always serves the local copy. A stale copy handed out is
+  never handed out silently — the user is told, because saving it produces a
+  conflict otherwise nobody expects.
+
+| `upload`
+| `async` \| `sync`
+| `async`
+| Whether `flush` returns as soon as the change is durable locally and uploads
+  in the background (`async`), or waits for the upload to finish (`sync`).
+
+| `ignore_patterns`
+| list of globs
+| see below
+| Basename globs for ephemeral editor and OS files that stay local and are never
+  uploaded. Setting this *replaces* the default list rather than adding to it.
+|===
+
+Both `refresh_pinned = auto` and `open_pinned = newest-unmetered` treat an
+*unknown* connection cost as metered. An unknown cost is not a licence to spend.
+
+The default `ignore_patterns`:
+
+[source,toml]
+----
+ignore_patterns = [
+  ".*.sw?",            # vim swap files
+  "4913",              # vim's writability probe
+  "*~",                # backup files (vim, emacs, gedit)
+  ".~lock.*#",         # LibreOffice lock files
+  "~$*",               # MS Office owner/lock files
+  ".#*",               # emacs lock files
+  "*.tmp",             # generic temporary files
+  ".goutputstream-*",  # GNOME/gvfs atomic-save temporaries
+  ".DS_Store",         # macOS directory metadata
+  "Thumbs.db",         # Windows thumbnail cache
+]
+----
+
+Only `*` and `?` are supported, and only against the basename — not against the
+path.
+
+== `[mount]`
+
+[cols="1,1,1,3",options="header"]
+|===
+| Key | Type | Default | Meaning
+
+| `point`
+| path
+| `~/Wusel`, or `~/Wusel-<account>`
+| Where `wusel mount` attaches when given no path of its own.
+
+| `dispatch_threads`
+| integer
+| the machine's parallelism, clamped to 4–8
+| How many FUSE dispatch threads serve kernel requests, and how many worker
+  threads the engine uses for concurrent network I/O. Independent reads,
+  uploads and listings run in parallel up to this many. Any value is clamped to
+  1–16 on load. Setting it to `1` restores the pre-0.2.0 behaviour, in which one
+  slow read stalls every other operation behind it.
+|===
+
+== `[tls]`
+
+[cols="1,1,1,3",options="header"]
+|===
+| Key | Type | Default | Meaning
+
+| `ca_cert`
+| path to a PEM file
+| unset
+| An additional CA (or a self-signed server certificate) to trust, *in addition
+  to* the operating system's trust store. The clean path for a self-hosted
+  server; see
+  xref:how-to/connect-to-a-self-signed-server.adoc[Connect to a server with a
+  private certificate].
+
+| `insecure`
+| boolean
+| `false`
+| Disable certificate verification entirely. Testing only. The daemon logs a
+  prominent warning at every start. A failed handshake never falls back to this
+  by itself.
+
+| `http1_only`
+| boolean
+| `false`
+| Force HTTP/1.1 instead of negotiating HTTP/2. An escape hatch for reverse
+  proxies that mishandle HTTP/2 request bodies on chunked uploads — the symptom
+  is Nextcloud logging "expected N bytes, got 0".
+|===
+
+== `[auth]`
+
+[cols="1,1,1,3",options="header"]
+|===
+| Key | Type | Default | Meaning
+
+| `keyring`
+| boolean
+| `true`
+| Keep the app password in the OS keyring rather than in the `0600` file. On by
+  default and fail-soft: if the keyring cannot be written and read back at
+  login, the secret stays in the file and Wusel says so. Set `false` on a
+  headless machine where no Secret Service is ever unlocked.
+|===
+
+`wusel login --keyring false` overrides this for one login.
+
+== `[desktop]`
+
+[cols="1,1,1,3",options="header"]
+|===
+| Key | Type | Default | Meaning
+
+| `exclude_from_indexers`
+| boolean
+| `true`
+| Hide the mount from desktop file indexers. When on, the mount root serves
+  synthetic, local-only `.trackerignore` and `.nomedia` markers — never uploaded
+  — that GNOME Tracker honours to skip the whole tree. On by default because
+  opening a file caches it, so an indexer walking the mount would hydrate
+  everything it touches. KDE Baloo ignores such markers and needs its own
+  exclude.
+|===
+
+== `[state]`
+
+[cols="1,1,1,3",options="header"]
+|===
+| Key | Type | Default | Meaning
+
+| `db_path`
+| path
+| `~/.local/state/wusel/state.sqlite`
+| Where the state database goes. An explicit value is always honoured, including
+  over the automatic relocation Wusel performs when the default location turns
+  out to be on a network filesystem.
+|===
+
+== A complete example
+
+Every key below is set to a *non-default* value, so this file is a menu rather
+than something to copy wholesale:
+
+[source,toml]
+----
+[cache]
+max_size = "20GiB"        # default 5GiB
+max_age  = "30d"          # default: age alone never evicts
+
+[sync]
+revalidate_secs = 60      # default 30
+push_floor_secs = 10      # default 5
+text_merge      = true    # default false
+refresh_pinned  = "auto"  # default "ask"
+open_pinned     = "offline"  # default "newest"
+upload          = "sync"  # default "async"
+
+[mount]
+point            = "/home/you/Nextcloud"   # default ~/Wusel
+dispatch_threads = 8                        # default: 4-8 by machine
+
+[tls]
+ca_cert = "/etc/pki/tls/certs/my-ca.pem"   # default: OS trust store only
+
+[auth]
+keyring = false           # default true
+
+[desktop]
+exclude_from_indexers = false   # default true
+
+[state]
+db_path = "/var/tmp/wusel/state.sqlite"
+----
+
+== Logging
+
+Logging is controlled by the environment, not by `config.toml`, because it has
+to be changeable without a config edit when something is already wrong.
+
+[cols="1,1,3",options="header"]
+|===
+| Variable | Default | Meaning
+
+| `RUST_LOG`
+| `wusel=info,wusel_core=info,wusel_fuse=info,wusel_desktop=info`
+| Standard `tracing` filter syntax. `debug` adds every HTTP request and the FUSE
+  narrative; `trace` adds per-read cache hits and is very loud. Scope it to one
+  crate — `RUST_LOG=wusel_core=debug` — rather than turning everything up.
+|===
+
+For a running systemd service, set it in a drop-in rather than in the shell; see
+xref:how-to/diagnose-a-problem.adoc[Diagnose a problem].

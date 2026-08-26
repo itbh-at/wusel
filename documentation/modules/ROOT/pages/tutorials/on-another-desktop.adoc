@@ -1,0 +1,266 @@
+////
+  // SPDX-License-Identifier: Apache-2.0
+  // Copyright 2026 IT Beratung Hermann GmbH
+////
+
+= Your Nextcloud files as a folder — on any Linux desktop
+:description: Set up the Wusel client on KDE Plasma, Xfce, Cinnamon or Sway so the files in your Nextcloud appear as an ordinary folder your file manager and terminal both see.
+
+Wusel is a *client*. You install it on the machine that should see the files,
+and it makes what lives in your Nextcloud appear there as an ordinary folder —
+fetching each file only when something opens it. It installs nothing on the
+Nextcloud server and changes nothing there; you need an account on a Nextcloud
+that somebody is already running.
+
+By the end of this your entire Nextcloud will be sitting in `~/Wusel`, your file
+manager will open it like any other folder, and you will have kept one file
+available offline. About twenty minutes, most of it waiting.
+
+This is the version for a desktop that is *not* GNOME. Everything Wusel actually
+does is the same; what differs is how much of it your desktop shows you, and
+this page is honest about that rather than describing a sidebar you will not
+get.
+
+[TIP]
+.The other two
+====
+* GNOME, with the sidebar entry, per-file emblems and Shell search:
+  xref:tutorials/on-gnome.adoc[on GNOME]
+* No desktop at all — a server or a box you only reach over SSH:
+  xref:tutorials/on-a-server.adoc[on a server]
+====
+
+.What you need
+****
+* A Linux machine with a graphical session — KDE Plasma, Xfce, Cinnamon, MATE,
+  Sway, anything.
+* A Nextcloud account you can log into in a browser.
+* Permission to install a package (`sudo`).
+****
+
+== Step 1 — Install the package
+
+Download the file for your distribution and architecture from the
+https://github.com/itbh-at/wusel/releases/latest[latest release]. Then, for an
+RPM-based distribution:
+
+[source,sh]
+----
+sudo dnf install ./wusel-*.rpm
+----
+
+For a Debian-based one:
+
+[source,sh]
+----
+sudo apt install ./wusel_*.deb
+----
+
+On Arch, build the recipe from the repository — `cd wusel/packaging/aur && makepkg -si`.
+
+That is the only step where your distribution matters. Everything below is the
+same everywhere.
+
+Nothing GNOME is pulled in. The Nautilus extension and the Shell search provider
+are *suggested*, not required, so your package manager leaves them out — you get
+the mount and about five packages.
+
+== Step 2 — Log in to your Nextcloud
+
+[source,sh]
+----
+wusel login https://cloud.example.org
+----
+
+It prints a URL. Open it, confirm in the browser, and come back to the terminal.
+You should see:
+
+----
+✓ Logged in as <you> on <server>
+----
+
+Your real account password is never sent to Wusel. What it received is a
+separate *app password* that you can revoke at any time in Nextcloud under
+*Settings → Security*.
+
+The password goes into your desktop's keyring. KWallet works, so does KeePassXC,
+and so does anything else that speaks the freedesktop Secret Service — Wusel
+talks to the protocol, not to a particular desktop. If nothing usable is running,
+it falls back to a `0600` file and says so; nothing breaks either way.
+
+Nothing is mounted yet.
+
+== Step 3 — Switch the mount on
+
+[source,sh]
+----
+systemctl --user enable --now wusel@default
+----
+
+One line, two things: `--now` mounts your cloud at `~/Wusel` immediately, and
+`enable` makes it come back at every login from now on. There is no terminal to
+keep open.
+
+Check that it started:
+
+[source,sh]
+----
+systemctl --user status wusel@default
+----
+
+You are looking for `active (running)`.
+
+== Step 4 — Look at your files
+
+[source,sh]
+----
+ls ~/Wusel
+----
+
+Your whole Nextcloud tree is there. Note what did *not* happen: nothing was
+downloaded. The listing came from the server's metadata, and the files are
+online-only.
+
+Open `~/Wusel` in your file manager — Dolphin, Thunar, Nemo, whichever. It is an
+ordinary folder and behaves like one: browse it, open files, drag things in.
+
+Now read one from the terminal:
+
+[source,sh]
+----
+cat ~/Wusel/Some.txt
+----
+
+The content was served straight from the server as you read it, and the whole
+file has been pulled into a local cache in the background — so opening it again
+costs nothing.
+
+Your file manager does not draw an emblem for that, but the state is not hidden
+from you. Ask for it directly:
+
+[source,sh]
+----
+getfattr -n user.wusel.state ~/Wusel/Some.txt
+----
+
+It answers `cached`. Before you read the file it would have said `online-only`.
+xref:reference/file-states.adoc[File states] lists all five values — this
+attribute is the same thing GNOME's emblems are drawn from, and it is what a
+Dolphin or Thunar plugin would read.
+
+== Step 5 — Write something
+
+[source,sh]
+----
+echo "a new line" >> ~/Wusel/Some.txt
+----
+
+Check your Nextcloud in a browser: the line is there. The folder is read-write —
+create, edit, rename, delete, `mkdir`, all of it goes to the server.
+
+A read-only share rejects writes with a permission error, as it should. And if
+somebody else edited the same file while you did, your version is saved beside
+theirs as `Some (conflicted copy …).txt` rather than either one being lost.
+
+Editor and office scratch files — vim swap files, LibreOffice lock files,
+`*.tmp` — are kept purely local and never appear in your cloud.
+
+== Step 6 — Keep a file when the network is gone
+
+Caching is automatic, but temporary — the cache evicts. To make a file stay:
+
+[source,sh]
+----
+wusel pin Some.txt
+----
+
+That file is now downloaded and exempt from eviction: readable with the network
+off. `wusel pin Documents` does the same for a whole folder, recursively, and
+`wusel unpin` releases it. `wusel pins` lists what you have pinned.
+
+On GNOME this is a right-click action. Here it is the command, and the command
+is the same thing the menu calls.
+
+== Step 7 — Watch what it is doing
+
+GNOME users get emblems that change as files move between states. The equivalent
+that works everywhere is:
+
+[source,sh]
+----
+wusel status --watch
+----
+
+It names the uploads still owed to the server, the files coming down, and the
+rest of the work in flight, redrawing once a second. Change a file in Nextcloud's
+web interface — or from your phone — and watch it react.
+
+If your server has the
+https://apps.nextcloud.com/apps/notify_push[`notify_push`] app, remote changes
+arrive within moments; without it, Wusel catches up within half a minute or so.
+Either way `ls ~/Wusel` shows the new state immediately.
+
+== Step 8 — If you are on KDE, exclude the mount from Baloo
+
+Opening a file caches it, so a file indexer walking the mount would download
+everything it touches. Wusel defends against this by default — the mount root
+serves `.trackerignore` and `.nomedia` markers, which GNOME Tracker honours.
+
+*KDE's Baloo ignores those markers*, so it needs telling separately. In *System
+Settings → Search → File Search*, add `~/Wusel` to the excluded folders.
+
+Xfce, Cinnamon, MATE and Sway ship no file indexer by default, so there is
+nothing to do there. If you installed one, exclude `~/Wusel` in its own settings.
+
+== That is the whole thing
+
+You now have a Nextcloud folder that is always there, costs no disk until you
+use it, and updates itself. Nothing needs starting; the service comes back at
+every login.
+
+Notifications do work here, by the way — they are freedesktop, not GNOME. If an
+upload fails for good or the connection drops, your desktop tells you. Confirm
+it end to end:
+
+[source,sh]
+----
+wusel desktop notify
+----
+
+== What you do not get, and what would be needed
+
+The sidebar entry, the per-file emblems and the desktop search are the pieces
+that are GNOME-only today.
+
+* *The sidebar entry* needs the file manager to consume `libcloudproviders`.
+  Dolphin uses KIO instead and does not.
+* *The emblems* need a per-file-manager extension. Dolphin would take a C++
+  `KOverlayIconPlugin`; Nemo and Thunar have their own interfaces. All three
+  would read the same `user.wusel.state` attribute you queried in step 4 — the
+  contract is already there, the plugins are not.
+* *The desktop search* is a GNOME Shell search provider. KDE's equivalent would
+  be a KRunner plugin.
+
+All three are on the xref:project/roadmap.adoc[roadmap]. None of them affects
+whether your files work.
+
+.Where to go next
+****
+* xref:how-to/keep-files-offline.adoc[Keep files offline] — pinning in full,
+  including what happens when a pinned file changes on the server.
+* xref:reference/file-states.adoc[File states] — the attribute your file manager
+  would read, and what each value means.
+* xref:reference/configuration.adoc[Configuration reference] — everything you
+  can change. You need none of it to use Wusel.
+* Something not working? xref:how-to/diagnose-a-problem.adoc[Diagnose a problem].
+****
+
+== If you want to stop
+
+[source,sh]
+----
+systemctl --user disable --now wusel@default
+----
+
+`~/Wusel` goes empty; your files live only in the cloud again. Removing Wusel
+altogether is xref:how-to/uninstall.adoc[Uninstall].

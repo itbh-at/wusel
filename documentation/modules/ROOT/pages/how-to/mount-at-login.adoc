@@ -1,0 +1,61 @@
+////
+  // SPDX-License-Identifier: Apache-2.0
+  // Copyright 2026 IT Beratung Hermann GmbH
+////
+
+= Mount at login
+:description: Run the mount as a systemd user service, so your Nextcloud folder is simply there at every login.
+
+Wusel runs as a systemd *user* service — no `sudo`, tied to your login session,
+one instance per account. Log in first
+(xref:reference/cli.adoc[`wusel login`]) — without credentials the service has
+nothing to mount and would only fail on start.
+
+== If you installed a package
+
+The package ships the unit template at `/usr/lib/systemd/user/wusel@.service`,
+so `systemctl` finds it with no per-user setup. For the default account:
+
+[source,sh]
+----
+systemctl --user enable --now wusel@default
+----
+
+`--now` mounts at `~/Wusel` immediately; `enable` makes it come back at every
+login. For a named account, substitute its name: `wusel@work`.
+
+== If you built from source
+
+[source,sh]
+----
+wusel service enable
+----
+
+This writes the unit and enables it, so nobody has to touch `systemctl`. It does
+the same thing as the command above.
+
+== Check on it
+
+[source,sh]
+----
+systemctl --user status wusel@default
+journalctl --user -u wusel@default -f
+----
+
+That one service *is* the whole running Wusel: it serves the filesystem, drives
+the sidebar entry and the per-file emblems, and pushes live emblem updates.
+
+== Turn it off again
+
+[source,sh]
+----
+systemctl --user disable --now wusel@default
+----
+
+`--now` unmounts straight away; `disable` stops it starting at the next login.
+
+NOTE: The unit carries none of the systemd hardening directives one would
+normally reach for. That is deliberate, not an oversight — every one of them
+implies `NoNewPrivileges=yes`, under which the setuid `fusermount3` helper
+cannot run and the mount dies. The unit file says so in a comment, so nobody
+"fixes" it later.

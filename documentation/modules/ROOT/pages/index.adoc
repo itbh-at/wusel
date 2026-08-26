@@ -4,58 +4,74 @@
 ////
 
 = Wusel
-:description: Virtual Nextcloud file system in Rust — VFS-first.
+:description: Wusel is a virtual file system for Nextcloud on Linux — your files appear in a folder, and are fetched only when you open them.
 
 image::wusel-logo.png[Wusel,140,role="right"]
 
 _Nextcloud, woven into your desktop._
 
-*Wusel* is a virtual file system for Nextcloud, written in Rust (referred to
-technically as `wusel`).
+Wusel makes your Nextcloud appear as an ordinary folder on your Linux desktop.
+Nothing is downloaded until you open it, so the folder can be far larger than
+your disk, and it is ready the moment you log in rather than after a long first
+sync.
 
-*VFS-first:* Files are "online only" by default and are only loaded on
-access (on-demand hydration), instead of mirroring everything locally. This
-lets `wusel` offer on Linux what the official client still does not deliver.
+It needs Linux. The mount works on any desktop, and on a server with none at
+all; the parts that make it feel native — the sidebar entry, the per-file
+emblems, the search — are GNOME and Nautilus for now.
+xref:reference/platform-support.adoc[Platform support] says exactly what is
+tested where.
 
-`wusel` is deliberately *more than just FUSE*. FUSE only makes the files appear;
-on top of that engine Wusel is a *full GNOME desktop integration*, so your
-Nextcloud behaves like a native part of the desktop rather than a mounted drive:
+== Where do you want to start?
 
-* *Files (Nautilus)* — a *Wusel (Nextcloud)* entry in the sidebar
-  (`libcloudproviders`), a per-file status emblem (online-only, cached,
-  pinned/always-offline, pending upload) and a right-click *Make Available
-  Offline* / *Free Up Space* toggle. Emblems refresh live as files hydrate.
-* *GNOME Shell search* — start typing in the Activities overview and your
-  Nextcloud files appear (Unified Search), opening straight from `~/Wusel`.
-* *Notifications* — sync events surface as native, localized desktop
-  notifications (the one place Wusel speaks the user's language).
-* *Runs like a system component* — a systemd *user* service mounts at login, it
-  stays out of desktop indexers, and the whole thing installs from an
-  xref:installation.adoc[RPM].
-
-FUSE is thus only the first of several frontends on the same engine. Native
-frontends without any FUSE dependency — a macOS *File Provider* and a Windows
-one — remain planned; see xref:roadmap.adoc[the roadmap].
-
-*Wusel is opinionated.* It prefers to use what the OS and desktop environment
-already provide — the file manager's sidebar and emblems, the shell's search,
-the system's notifications, the OS keyring — rather than reinventing them inside
-a bespoke app window or a tray icon. That means fewer moving parts to maintain,
-and an experience that feels native because it *is* native. Where the desktop
-offers a good home for something, Wusel lives there instead of building its own.
-
-== At a glance
-
-[cols="1,3",options="header"]
+[cols="1,2",grid=none,frame=none]
 |===
-| Crate | Role
-| `wusel-core` | Engine: Login Flow v2, WebDAV, sync, state (platform-independent)
-| `wusel-fuse` | FUSE frontend as a library (Linux)
-| `wusel-desktop` | Linux/GNOME integration behind `desktop::Desktop`: cloud-provider sidebar, Nautilus emblems + menu, GNOME Shell search provider, localized notifications
-| `wusel` | Daemon/CLI — the product
+| *I have never used it* +
+Your Nextcloud files as a folder — +
+xref:tutorials/on-gnome.adoc[on GNOME] ·
+xref:tutorials/on-another-desktop.adoc[on another desktop] ·
+xref:tutorials/on-a-server.adoc[on a server]
+| Twenty minutes, from an empty machine to files you can open. Three versions of
+  the same walkthrough — the steps are the same, what you see at the end is not.
+  Follow one top to bottom and it works.
+
+| *I want to do one particular thing* +
+xref:how-to/install-a-package.adoc[Install] ·
+xref:how-to/mount-at-login.adoc[mount at login] ·
+xref:how-to/keep-files-offline.adoc[keep files offline] ·
+xref:how-to/diagnose-a-problem.adoc[something is wrong]
+| Short recipes for a task you already have in mind. They assume you know your
+  way around a terminal.
+
+| *I need to look something up* +
+xref:reference/cli.adoc[Commands] ·
+xref:reference/configuration.adoc[configuration] ·
+xref:reference/packages.adoc[packages] ·
+xref:reference/files-and-directories.adoc[files and directories]
+| Complete lists, no prose. Every command, every setting, every path.
+
+| *I want to understand how it works* +
+xref:explanation/vfs-first.adoc[Why nothing is downloaded up front]
+| The reasoning behind the design, for anyone deciding whether to rely on it —
+  or thinking about contributing.
 |===
 
-Next: xref:installation.adoc[Installation] · xref:file-manager.adoc[File-manager
-integration] · xref:architecture.adoc[Architecture] ·
-xref:roadmap.adoc[Roadmap] · xref:known-limitations.adoc[Known limitations] ·
-xref:development.adoc[Development & Testing].
+== What it is
+
+Wusel is written in Rust and is *VFS-first*: files are online-only by default
+and are fetched on access. That is what the official Nextcloud client still does
+not offer on Linux, where it can only mirror everything to disk.
+
+It is also deliberately *more than a FUSE mount*. FUSE only makes the files
+appear; on top of it Wusel behaves like a part of the desktop rather than a
+mounted drive — a *Wusel (Nextcloud)* entry in the Files sidebar, an emblem on
+every file saying whether it is online-only, cached or pinned, a right-click
+*Make Available Offline*, your Nextcloud in the Activities search, and native
+notifications when something needs your attention.
+
+That is a stance, not an accident. Wusel prefers what the desktop already
+provides — the file manager's sidebar, the shell's search, the system's
+notifications, the OS keyring — over reinventing them in an app window or a tray
+icon. Fewer moving parts, and an experience that feels native because it is.
+
+Native frontends for macOS (File Provider) and Windows (Cloud Filter) are
+planned but not built; see the xref:project/roadmap.adoc[roadmap].
