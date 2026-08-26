@@ -1,0 +1,251 @@
+////
+  // SPDX-License-Identifier: Apache-2.0
+  // Copyright 2026 IT Beratung Hermann GmbH
+////
+
+= Your Nextcloud files as a folder — on a server
+:description: Set up the Wusel client on a headless Linux machine so the files in your Nextcloud appear as a folder there — no desktop, no keyring, and a mount that survives logout.
+
+Wusel is a *client*. You install it on the machine that should see the files,
+and it makes what lives in your Nextcloud appear there as an ordinary folder —
+fetching each file only when something opens it. It installs nothing on the
+Nextcloud server and changes nothing there; you need an account on a Nextcloud
+that somebody is already running.
+
+IMPORTANT: This page is about running that client *on* a server. It is not about
+installing Nextcloud itself — if you are looking to set up a Nextcloud server,
+this is the wrong project entirely.
+
+By the end of this a machine with no graphical session will have your Nextcloud
+mounted at `~/Wusel`, the mount will survive you logging out, and you will have
+verified it from the terminal alone. About fifteen minutes.
+
+Two things differ from a desktop, and both are the reason this page exists
+rather than a note on another one: there is no keyring to store the password in,
+and there is no login session to hang the service off.
+
+[TIP]
+.The other two
+====
+* GNOME, with the sidebar entry, per-file emblems and Shell search:
+  xref:tutorials/on-gnome.adoc[on GNOME]
+* Another desktop — KDE Plasma, Xfce, Cinnamon, Sway:
+  xref:tutorials/on-another-desktop.adoc[on any Linux desktop]
+====
+
+.What you need
+****
+* A Linux machine with systemd, reached over SSH. No desktop needed.
+* A Nextcloud account, and a browser *somewhere* — the login is confirmed in a
+  browser, but not necessarily on this machine.
+* `sudo` on the machine.
+****
+
+.What this is good for
+****
+Serving a Nextcloud share to something that expects a filesystem: a backup job,
+a build that pulls assets, a Samba or NFS re-export, a script that drops reports
+somewhere colleagues can see them. Wusel fetches on access, so the box needs
+disk for what it actually touches, not for the whole cloud.
+****
+
+== Step 1 — Install the package
+
+Copy the file for your distribution and architecture onto the machine from the
+https://github.com/itbh-at/wusel/releases/latest[latest release]. RPM-based:
+
+[source,sh]
+----
+sudo dnf install ./wusel-*.rpm
+----
+
+Debian-based:
+
+[source,sh]
+----
+sudo apt install ./wusel_*.deb
+----
+
+You get the binary, the systemd unit and `fuse3` — about five packages. The
+GNOME pieces are *suggested*, not required, so nothing graphical is pulled onto
+your server.
+
+== Step 2 — Log in, keeping the password in a file
+
+On a desktop the app password goes into the keyring. A server has no unlocked
+keyring — nothing ran PAM to unlock one, and a background service cannot prompt
+anybody — so tell Wusel to use its file instead:
+
+[source,sh]
+----
+wusel login --keyring false https://cloud.example.org
+----
+
+It prints a URL. Open that URL in a browser on *any* machine, confirm, and come
+back to the SSH session. You should see:
+
+----
+✓ Logged in as <you> on <server>
+----
+
+The password lands in `~/.config/wusel/credentials.json`, mode `0600`.
+
+[NOTE]
+====
+`--keyring false` is not a workaround, it is the documented path for this case.
+Wusel would fall back to the file on its own — the keyring is fail-soft — but
+saying so explicitly means you know where the secret is, rather than discovering
+it later.
+
+The secret is a *revocable app password*, not your account password. If the
+machine is ever compromised, revoke it in Nextcloud under *Settings → Security*
+and the exposure ends there.
+====
+
+== Step 3 — Let your services run without you
+
+A systemd *user* service normally starts at graphical login and stops when your
+last session ends. On a server there is no such login, and you want the mount to
+keep going after you close SSH. That is what lingering is for:
+
+[source,sh]
+----
+loginctl enable-linger "$USER"
+----
+
+Confirm it took:
+
+[source,sh]
+----
+loginctl show-user "$USER" --property=Linger
+----
+
+You want `Linger=yes`. This is a systemd feature, not a Wusel one — it tells
+systemd to start your user manager at boot and keep it running whether or not
+you are logged in.
+
+== Step 4 — Switch the mount on
+
+[source,sh]
+----
+systemctl --user enable --now wusel@default
+systemctl --user status wusel@default
+----
+
+You are looking for `active (running)`. The mount is at `~/Wusel`.
+
+== Step 5 — Verify it, from the terminal alone
+
+[source,sh]
+----
+ls ~/Wusel
+----
+
+Your whole Nextcloud tree, and nothing downloaded — the listing came from the
+server's metadata.
+
+[source,sh]
+----
+cat ~/Wusel/Some.txt
+echo "written from the server" >> ~/Wusel/Some.txt
+----
+
+Check the file in Nextcloud's web interface: the line is there.
+
+Ask what the mount thinks it is doing:
+
+[source,sh]
+----
+wusel status
+----
+
+It names the uploads still owed to the server, anything coming down, and the
+rest of the work in flight. `--watch` redraws once a second.
+
+And check any file's state directly, which is what a desktop would draw an
+emblem from:
+
+[source,sh]
+----
+getfattr -n user.wusel.state ~/Wusel/Some.txt
+----
+
+xref:reference/file-states.adoc[File states] lists the five values.
+
+== Step 6 — Prove it survives logout
+
+This is the step worth actually doing, because it is the one that is easy to
+assume:
+
+[source,sh]
+----
+exit                                     # close the SSH session
+ssh you@the-server                        # come back
+systemctl --user status wusel@default     # still active (running)
+ls ~/Wusel
+----
+
+If the service is gone instead, lingering did not take — go back to step 3.
+
+== Step 7 — Keep what has to be there without the network
+
+A server that re-exports or backs up a folder usually needs the bytes present,
+not fetched on demand:
+
+[source,sh]
+----
+wusel pin Documents      # a folder, recursively
+wusel pins               # what is pinned
+----
+
+Pinned files are downloaded now and never evicted. Pinning the whole account —
+`wusel pin` with no path — is the old "download everything" behaviour, and on a
+server it is sometimes exactly right. Mind the disk: a pin overrides the cache
+size budget on purpose.
+
+If the server copy of a pinned file moves on, it is marked stale rather than
+silently refetched. `wusel update` brings pins up to date; for an unattended
+box, `[sync] refresh_pinned = "auto"` in `config.toml` does it without asking.
+See xref:how-to/keep-files-offline.adoc[Keep files offline].
+
+== That is the whole thing
+
+The mount comes back at boot, survives your logout, and costs disk only for what
+it touches.
+
+.Things to know on a headless box
+****
+* *No desktop integration, by design.* No session bus means no notifications and
+  no sidebar — and Wusel treats that as normal rather than as an error. The
+  filesystem never depends on it.
+* *The journal is your feedback channel.* `journalctl --user -u wusel@default -f`.
+  What would have been a desktop notification — a failed upload, a lost
+  connection — is a `WARN` line there.
+* *Watch for parked uploads.* `wusel status` marks an upload `PARKED` when it
+  failed permanently, for instance on a full quota. Nothing retries a parked
+  upload on its own, and on an unattended machine nobody sees an emblem. Worth a
+  cron check if the box writes to Nextcloud unsupervised.
+* *Two mounts of one account conflict.* If this server and your laptop both
+  mount the same account read-write, they can conflict with each other exactly
+  as two people would.
+****
+
+.Where to go next
+****
+* xref:how-to/diagnose-a-problem.adoc[Diagnose a problem] — `wusel doctor`
+  produces a redacted report you can attach to a ticket.
+* xref:reference/configuration.adoc[Configuration reference] — the cache budget
+  and `refresh_pinned` are the two worth reading for an unattended machine.
+* xref:reference/files-and-directories.adoc[Files and directories] — every path
+  Wusel reads or writes, which is what a backup of the machine should know.
+****
+
+== If you want to stop
+
+[source,sh]
+----
+systemctl --user disable --now wusel@default
+loginctl disable-linger "$USER"     # if nothing else on the box needs it
+----
+
+Removing Wusel altogether is xref:how-to/uninstall.adoc[Uninstall].

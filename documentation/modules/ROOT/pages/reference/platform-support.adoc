@@ -1,0 +1,147 @@
+////
+  // SPDX-License-Identifier: Apache-2.0
+  // Copyright 2026 IT Beratung Hermann GmbH
+////
+
+= Platform support
+:description: What runs where — operating systems, distributions, desktops and the Nextcloud versions Wusel is tested against.
+
+This page is the authoritative answer. Where another page mentions a platform,
+it links here rather than restating it.
+
+== Operating systems
+
+[cols="1,1,3",options="header"]
+|===
+| System | Status | Notes
+
+| Linux
+| supported
+| The mount is a FUSE filesystem (libfuse3). This is the only platform where
+  Wusel is a usable drive.
+
+| macOS
+| not supported
+| No FUSE, so the FUSE frontend is compiled out and the daemon returns a clear
+  error rather than a broken mount. The engine and CLI do build and test
+  natively, which is what makes development from a Mac possible — see
+  xref:how-to/develop-on-macos.adoc[Develop on macOS].
+
+| Windows
+| not supported
+| As macOS.
+|===
+
+Native frontends for macOS (File Provider Extension) and Windows (Cloud Filter)
+are far-future, experimental work — each an adapter over the same facade, and
+deliberately *not* a FUSE-compatibility shim. If Wusel ever ships there, it
+rides the native framework. See xref:project/roadmap.adoc[the roadmap] for the
+order, and xref:explanation/portability.adoc[Portability] for what has to be
+true now for that to stay affordable.
+
+IMPORTANT: Running the mount inside a podman container on macOS or Windows is a
+*development and test* path, not a product. The mount then lives inside podman's
+Linux VM; it is not a drive on the host.
+
+== Desktops
+
+The mount itself does not care which desktop you use, or whether you use one at
+all — it works the same on GNOME, on KDE and on a server with no graphical
+session.
+
+The desktop integration is a different matter. It is GNOME and Nautilus today,
+and nothing else. On any other desktop you get the mount plus notifications, and
+none of the rest.
+
+[cols="1,1,3",options="header"]
+|===
+| Desktop | Status | What you get
+
+| GNOME / Nautilus
+| supported
+| Everything: the *Wusel (Nextcloud)* sidebar entry with live sync status,
+  per-file emblems, the *Make Available Offline* / *Free Up Space* menu,
+  Nextcloud results in the Activities search, and native notifications.
+
+| KDE Plasma / Dolphin
+| partial
+| Notifications work — they are freedesktop, not GNOME. Dolphin consumes no
+  `libcloudproviders`, so there is no sidebar entry, and there is no Dolphin
+  plugin yet, so there are no emblems. A `KOverlayIconPlugin` is a roadmap item.
+
+| Nemo, Thunar, others
+| partial
+| As KDE: notifications only. Each would need its own extension reading the same
+  xref:reference/file-states.adoc[file-state attribute].
+
+| No desktop (server, SSH)
+| supported
+| The mount and the CLI. The integration disables itself silently. Note that a
+  headless machine usually has no unlocked keyring either — see
+  xref:explanation/credentials-and-trust.adoc[Credentials and trust].
+|===
+
+== Distributions
+
+[cols="1,1,3",options="header"]
+|===
+| Distribution | Status | Notes
+
+| Fedora 44
+| reference setup
+| Where development happens and where the desktop integration is verified by
+  hand. A published RPM.
+
+| Debian 13 (trixie)
+| tested
+| A published `.deb`. Also used headless in the containerised FUSE test suite.
+
+| Ubuntu
+| expected to work
+| Releases close to Debian 13. On 24.04 LTS and older, expect the published
+  `.deb` not to run — build from source instead.
+
+| Arch Linux
+| recipe only
+| A `PKGBUILD` in the repository, not yet on the AUR, not built in CI.
+
+| Everything else
+| build from source
+| Nothing distribution-specific stands in the way; there is simply no package.
+|===
+
+== Nextcloud versions
+
+Every night, Wusel is tested against *three real Nextcloud servers*, one per
+maintained major — each a full run of mount, read, write, upload and three-way
+merge, not a mocked API. Which three those are is not written down anywhere,
+including here: the workflow asks Docker Hub which majors are current and takes
+the newest three, so a new Nextcloud release enters the matrix by itself.
+
+The run is nightly but gated: it only actually executes when our own code or one
+of the three server images has changed since the last successful run, so a
+docs-only day costs nothing while a Nextcloud patch release re-arms it.
+
+[cols="1,2",options="header"]
+|===
+| Version | Status
+
+| the newest maintained major
+| Binding. If it breaks, the build goes red.
+
+| the two before it
+| Tested, and the result is written into the run summary — but a failure there
+  never turns the build red and never opens an issue. A red build has to mean
+  "we are broken", not "somebody still runs an old server".
+
+| anything older
+| Outside Nextcloud's own maintenance, and not tested.
+|===
+
+Which majors ran, and how each fared, is in the summary of the latest
+https://github.com/itbh-at/wusel/actions/workflows/e2e.yml[E2E run].
+
+Wusel targets Nextcloud specifically, not "any WebDAV server". Which parts of
+that conversation are standards and which are Nextcloud's own — and what happens
+when one of the latter is absent — is in
+xref:explanation/compatibility.adoc[Compatibility and stability].

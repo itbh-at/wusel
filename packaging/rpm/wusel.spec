@@ -1,17 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 IT Beratung Hermann GmbH
 #
-# RPM spec for Wusel. This packages *prebuilt* artefacts: the release binary and
-# the native Nautilus extension are compiled by packaging/rpm/build-rpm.sh (with
-# the mise-pinned toolchain), staged into a source tarball, and installed here.
-# Building the Rust code inside rpmbuild's sandbox is deliberately avoided so the
-# pinned toolchain and the packaging stay decoupled and reproducible.
+# RPM spec for Wusel. Builds from source, in the buildroot, with no network
+# access — the only thing a chroot-based build service (COPR, OBS, `mock`)
+# will ever run. Source0 is the source tree (packaging/rpm/build-rpm.sh
+# produces it with `git archive`); Source1 is `cargo vendor`'s output for the
+# same Cargo.lock, so `%build` can pass `--offline` and mean it.
+#
+# build-rpm.sh remains the entry point for a local/CI build: it generates both
+# sources, builds the SRPM, and rebuilds it with `rpmbuild --rebuild` — the
+# same two steps a build service performs, so a spec regression is caught
+# here rather than first on a submission to COPR/OBS.
 
 # Version is injected by build-rpm.sh: rpmbuild --define "wusel_version X.Y.Z".
 %global wusel_version %{?wusel_version}%{!?wusel_version:0.0.0}
 
-# No debuginfo/-source subpackage: the tarball ships a stripped binary, there are
-# no source files in the buildroot for the debug extractor to work with.
+# No debuginfo/-source subpackage: rpmbuild's debug extractor wants build-id
+# links this project's plain `cargo build` does not produce, and a from-source
+# build's debug story is a separate piece of work, not a byproduct of getting
+# `dnf install` to work.
 %global debug_package %{nil}
 
 Name:           wusel
@@ -22,10 +29,18 @@ Summary:        Virtual Nextcloud filesystem — Nextcloud, woven into your desk
 License:        Apache-2.0
 URL:            https://itbh.at/
 Source0:        %{name}-%{version}.tar.gz
+Source1:        %{name}-%{version}-vendor.tar.gz
 
-# Prebuilt binary + .so, so no compiler/toolchain BuildRequires. The tarball is
-# already architecture-specific.
 ExclusiveArch:  x86_64 aarch64
+
+BuildRequires:  rust >= 1.85
+BuildRequires:  cargo
+BuildRequires:  gcc
+BuildRequires:  make
+BuildRequires:  pkgconf-pkg-config
+BuildRequires:  nautilus-devel
+BuildRequires:  glib2-devel
+BuildRequires:  fuse3-devel
 
 # fusermount3 (unprivileged mount) at runtime. libfuse3 / libnautilus-extension
 # come in automatically as auto-generated soname dependencies of the binary/.so.
@@ -54,14 +69,67 @@ Then log out and back in so Nautilus loads the extension and GNOME Shell picks
 up the search provider. See the Installation page in the documentation.
 
 %prep
+# Source0 unpacks to %{name}-%{version} (built with `git archive
+# --prefix=%{name}-%{version}/`); Source1 is `cargo vendor`'s own `vendor/`
+# directory, added into that same tree with `-T -D -a 1` (skip the default
+# unpack-and-cd, keep the directory %setup already created, just extract
+# Source1 into it).
 %setup -q
+%setup -q -T -D -a 1
+
+mkdir -p .cargo
+cat > .cargo/config.toml <<'EOF'
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor"
+EOF
 
 %build
-# Nothing to build: artefacts are prebuilt and staged into the tarball.
+# A relative target dir, regardless of what the caller's shell has set
+# ($CARGO_TARGET_DIR is a convenience in the dev containers, to keep the
+# macOS/Linux/RPM builds from sharing one target dir over the same bind
+# mount) — %install below relies on this exact, buildroot-relative path.
+export CARGO_TARGET_DIR=target
+cargo build --release --offline --features fuse -p wusel
+make -C integration/nautilus %{?_smp_mflags}
 
 %install
-mkdir -p %{buildroot}
-cp -a usr %{buildroot}/
+LIBDIR=%{_libdir}
+install -Dm755 target/release/wusel %{buildroot}%{_bindir}/wusel
+install -Dm644 packaging/rpm/wusel@.service %{buildroot}/usr/lib/systemd/user/wusel@.service
+install -Dm755 integration/nautilus/libwusel-nautilus.so %{buildroot}${LIBDIR}/nautilus/extensions-4/libwusel-nautilus.so
+
+install -d %{buildroot}%{_datadir}/icons/hicolor/scalable/emblems
+install -m644 integration/nautilus/emblems/wusel-emblem-*.svg %{buildroot}%{_datadir}/icons/hicolor/scalable/emblems/
+
+install -d %{buildroot}%{_datadir}/icons/hicolor/scalable/apps
+install -m644 integration/icons/at.itbh.Wusel.svg %{buildroot}%{_datadir}/icons/hicolor/scalable/apps/
+
+install -d %{buildroot}%{_datadir}/applications
+install -d %{buildroot}%{_datadir}/dbus-1/services
+install -d %{buildroot}%{_datadir}/gnome-shell/search-providers
+
+# Search-provider launcher app + registration; the .service Exec is rewritten
+# from the source default (/usr/local/bin) to the packaged path.
+install -m644 integration/gnome-search/at.itbh.Wusel.desktop %{buildroot}%{_datadir}/applications/
+install -m644 integration/gnome-search/wusel-search-provider.desktop %{buildroot}%{_datadir}/gnome-shell/search-providers/
+sed 's#Exec=.*/wusel search-provider#Exec=%{_bindir}/wusel search-provider#' \
+    integration/gnome-search/at.itbh.Wusel.SearchProvider.service \
+    > %{buildroot}%{_datadir}/dbus-1/services/at.itbh.Wusel.SearchProvider.service
+
+# Cloud-provider (Nautilus sidebar) registration for the default account —
+# generated by the freshly built binary so it never drifts from the code.
+# Runs the buildroot copy directly: %install is an ordinary build-machine
+# shell script, not a chroot into the buildroot, so this is no different from
+# running any other freshly built tool during packaging.
+%{buildroot}%{_bindir}/wusel desktop install-provider --account default --dir %{buildroot}%{_datadir}/applications >/dev/null
+# install-provider runs update-desktop-database, which drops a mimeinfo.cache
+# in the applications dir. That is not ours to ship (Fedora's
+# desktop-file-utils trigger regenerates it on install), and rpmbuild rejects
+# unpackaged files — so remove it from the buildroot.
+rm -f %{buildroot}%{_datadir}/applications/mimeinfo.cache
 
 %postun
 # On a real uninstall ($1 == 0, not an upgrade) remove the cloud-provider
@@ -85,9 +153,14 @@ fi
 %{_datadir}/icons/hicolor/scalable/emblems/wusel-emblem-*.svg
 # App icon — resolved by the .desktop file and the cloud-provider sidebar entry.
 %{_datadir}/icons/hicolor/scalable/apps/at.itbh.Wusel.svg
-# GNOME Shell search provider registration + its launcher app.
+# GNOME Shell search provider registration + its launcher app. gnome-shell
+# is only Suggested (see above), so this package must own the directory
+# itself rather than assume gnome-shell's own package created it — openSUSE's
+# build validation (unlike Fedora's) rejects an unowned directory outright.
 %{_datadir}/applications/at.itbh.Wusel.desktop
 %{_datadir}/dbus-1/services/at.itbh.Wusel.SearchProvider.service
+%dir %{_datadir}/gnome-shell
+%dir %{_datadir}/gnome-shell/search-providers
 %{_datadir}/gnome-shell/search-providers/wusel-search-provider.desktop
 # Cloud-provider (Nautilus sidebar) registration for the default account.
 %{_datadir}/applications/org.freedesktop.CloudProviders.wusel.default.desktop
@@ -98,6 +171,11 @@ fi
 # with no system-wide preset to apply; each user enables their own instance.
 
 %changelog
+* Tue Aug 25 2026 Christoph D. Hermann <christoph.hermann@itbh.at> - 0.3.0-1
+- Debian/Ubuntu and Arch packages join the Fedora RPM, built from the same
+  recipes and published through the Open Build Service.
+- The documentation is restructured onto the Diataxis framework.
+
 * Mon Aug 24 2026 Christoph D. Hermann <christoph.hermann@itbh.at> - 0.2.2-1
 - The GNOME hosts are suggested rather than recommended, so installing on a
   machine without GNOME no longer pulls in the whole desktop stack.

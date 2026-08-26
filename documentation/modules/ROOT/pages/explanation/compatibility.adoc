@@ -1,0 +1,50 @@
+////
+  // SPDX-License-Identifier: Apache-2.0
+  // Copyright 2026 IT Beratung Hermann GmbH
+////
+
+= Compatibility and stability
+:description: Which parts of the Nextcloud conversation are standards, which are extensions, and how Wusel degrades when one is absent.
+
+Wusel talks to Nextcloud, not to "any WebDAV server". That is a deliberate
+narrowing, and it comes with an obligation: to say exactly which parts of the
+conversation are standards, which are Nextcloud's own, and what happens when one
+of the latter is missing.
+
+`wusel` targets Nextcloud specifically, not "any WebDAV server". The read/data
+plane is close to standard WebDAV and is the most stable; several load-bearing
+pieces are Nextcloud extensions. What holds it together is not "it's all
+standard" — it is that these are the *same* APIs the official desktop/mobile
+clients use, so Nextcloud keeps them backward-compatible, plus we **degrade
+gracefully** when an extension is absent or changes (losing convenience, not
+correctness).
+
+[cols="2,2,1",options="header"]
+|===
+| Touchpoint | Origin | Stability
+| PROPFIND + multistatus, GET + `Range`, ETag compare, Basic auth | WebDAV / HTTP standard | very stable
+| Standard props (`getcontentlength`, `getlastmodified`, `getetag`, `resourcetype`) | WebDAV standard | very stable
+| DAV path `+/remote.php/dav/files/{user}+` | Nextcloud / ownCloud | stable (long-standing)
+| Login Flow v2 (`/index.php/login/v2`) | Nextcloud API | stable, but not WebDAV
+| `oc:fileid`, `oc:permissions` (`owncloud.org/ns`) | ownCloud / Nextcloud extension | stable convention
+| OCS capabilities (`/ocs/v2.php/cloud/capabilities`) | Nextcloud API | stable
+| notify_push WebSocket | Nextcloud app | most fluid; optional
+|===
+
+Graceful degradation, by design:
+
+* no `oc:fileid` → the file is served live, uncached (no crash);
+* no `oc:permissions` → assumed writable, so the mount does not lock the user out
+  of a file the server would in fact accept; a write the server does not allow is
+  still rejected by the server itself;
+* no notify_push / no OCS answer → TTL revalidation;
+* an unparsable date → `mtime` 0.
+
+Diagnostics: `login` probes the OCS capabilities and reports the server version
+(or warns "is this a Nextcloud instance?"); the mount logs the version on
+connect (`wusel_core::capabilities::fetch`). The PROPFIND parser matches on the
+**local** element name, so namespace-prefix changes do not break it.
+
+The *write* path adds the most Nextcloud-specific and change-prone surface —
+chunked upload NG (`/remote.php/dav/uploads/…`) — so it is
+inherently less "standard" than reading.

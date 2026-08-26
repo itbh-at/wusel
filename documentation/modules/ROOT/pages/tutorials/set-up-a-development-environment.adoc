@@ -1,0 +1,200 @@
+////
+  // SPDX-License-Identifier: Apache-2.0
+  // Copyright 2026 IT Beratung Hermann GmbH
+////
+
+= Set up a Wusel development environment
+:description: Work on the Wusel client itself: from a fresh clone to a running build, a passing test suite and a live FUSE mount against the mock server — on Linux.
+
+This one is for people who want to *change Wusel's own code*. If you only want
+to use it — to get your Nextcloud files as a folder — you want
+xref:tutorials/on-gnome.adoc[one of the three user tutorials] instead.
+
+By the end of this you will have built Wusel, run the whole test suite green,
+and mounted a working filesystem against a local mock server — no Nextcloud
+account needed.
+
+This is the Linux path, and Linux is where Wusel is developed: it is the only
+platform where the mount runs. Everything below assumes a Linux machine.
+
+NOTE: Working from a Mac? Everything except the mount builds and tests natively
+there, and the mount runs in a container.
+xref:how-to/develop-on-macos.adoc[Develop on macOS] covers it. You can stop
+reading this page.
+
+== Step 1 — Build tools
+
+Rust uses the system linker, and the mount needs the FUSE library. The test
+suite additionally wants a keyring daemon and a D-Bus launcher — the reason is
+in step 4.
+
+RPM-based:
+
+[source,sh]
+----
+sudo dnf group install development-tools
+sudo dnf install pkgconf-pkg-config fuse3-devel fuse3 gnome-keyring dbus-daemon
+----
+
+Debian-based:
+
+[source,sh]
+----
+sudo apt update
+sudo apt install build-essential pkg-config libfuse3-dev fuse3 gnome-keyring dbus-bin
+----
+
+If you plan to touch the file-manager extension, add its development files too:
+`nautilus-devel glib2-devel make` (RPM-based) or
+`libnautilus-extension-dev libglib2.0-dev make` (Debian-based).
+
+== Step 2 — The toolchain, via mise
+
+Every binary this project uses is pinned in `mise.toml` — the Rust version, Node
+for the documentation, all of it. You never install Rust yourself.
+
+[source,sh]
+----
+curl https://mise.run | sh
+echo 'eval "$(~/.local/bin/mise activate bash)"' >> ~/.bashrc   # zsh: activate zsh, ~/.zshrc
+----
+
+Open a new terminal, then confirm:
+
+[source,sh]
+----
+mise --version
+----
+
+IMPORTANT: Activation is the step people miss. Installing mise only puts the
+program on disk — it does not yet manage your `PATH`. Until you activate it,
+`cargo` is "command not found" even though Rust is installed, and you have to
+prefix everything with `mise exec --`.
+
+== Step 3 — Clone and build
+
+[source,sh]
+----
+git clone https://github.com/itbh-at/wusel.git
+cd wusel
+mise install
+mise run check
+----
+
+`mise install` fetches the pinned toolchain; the first run takes a few minutes.
+`mise run check` is a `cargo check` over the engine and the CLI. When it comes
+back clean, your environment is correct.
+
+== Step 4 — Run the test suite
+
+[source,sh]
+----
+mise run test
+----
+
+Everything should pass. If it stops immediately complaining about a missing
+program, that is step 1's `gnome-keyring` or `dbus-daemon`.
+
+That is not a bare `cargo test`. On Linux it runs inside a private D-Bus session
+with an empty, unlocked keyring under a temporary data directory. Two reasons,
+and both matter the first time you touch credential code:
+
+* The credential tests answer the same on your unlocked GNOME desktop as in a
+  bare container, instead of quietly depending on what your machine happens to
+  have.
+* No test can reach *your* login keyring. The product and the tests naturally
+  pick the same account key, and the tests used to overwrite the real one.
+
+The suite refuses to run rather than testing less than it claims. That is
+deliberate: a green run has to mean the thing was checked.
+
+== Step 5 — Mount against the mock server
+
+You do not need a Nextcloud to run a mount. `wusel-mock` serves an ordinary
+directory as a Nextcloud-style user root.
+
+In one terminal, make a directory with something in it and serve it:
+
+[source,sh]
+----
+mkdir -p /tmp/fake-cloud && echo hello > /tmp/fake-cloud/Some.txt
+mise run mock -- --root /tmp/fake-cloud
+----
+
+In a second terminal, build with the mount compiled in, log in against the mock,
+and mount it:
+
+[source,sh]
+----
+mise run build-fuse
+cargo run -p wusel -- login http://127.0.0.1:8080
+cargo run -p wusel --features fuse -- mount /tmp/mnt
+----
+
+`--features fuse` is a *build* switch: the mount is not compiled in by default,
+which is what keeps the project buildable where there is no FUSE. Everything
+after `--` is handed to Wusel rather than to cargo.
+
+In a third terminal:
+
+[source,sh]
+----
+ls -l /tmp/mnt
+cat /tmp/mnt/Some.txt
+echo "written through the mount" >> /tmp/mnt/Some.txt
+cat /tmp/fake-cloud/Some.txt
+----
+
+The last line proves the round trip: your write went through FUSE, through the
+engine, over WebDAV, and landed in the directory the mock serves.
+
+Press kbd:[Ctrl+C] in the mount's terminal to unmount. If it is ever left stale,
+`fusermount3 -u /tmp/mnt`.
+
+Because the mock mirrors a real directory, staging a test case is `echo` and
+`rm` in `/tmp/fake-cloud` rather than writing XML. Two markers in a *filename*
+provoke behaviour that is otherwise hard to arrange: `*.fail-once` makes the
+first `PUT` answer 500, and `*.no-etag*` makes `PUT` and `MOVE` answer without
+an `ETag`.
+
+== Step 6 — The full mount test
+
+[source,sh]
+----
+mise run fuse-test
+----
+
+This mounts the whole stack against the in-process mock and drives it through
+the kernel — `ls`, `cat`, `stat`, `statfs`, unmount. It runs in a container,
+which is why it is not part of `mise run test`.
+
+== What to run before you push
+
+[source,sh]
+----
+mise run fmt-check
+mise run clippy
+mise run check
+mise run test
+----
+
+These four are exactly what CI runs, through the same mise tasks and the same
+pinned toolchain — there is no separate CI script that can drift.
+
+Two more exist for when they are relevant: `mise run e2e-local` drives the whole
+thing against a *real* Nextcloud in a container, and `mise run docs-diagrams`
+re-renders the documentation diagrams (their SVGs are committed, and the build
+checks their hashes, so forgetting this is caught rather than silently shipping
+a stale picture).
+
+.Where to go next
+****
+* xref:explanation/architecture.adoc[Architecture] — the crates, and the seam
+  between engine and frontend.
+* xref:explanation/concurrency.adoc[Concurrency] — how a callback becomes an
+  intent, and why the deciding thread performs no I/O.
+* xref:reference/operation-scripts.adoc[Operation scripts] — which callback
+  becomes which intent, one diagram per operation.
+* xref:project/contributing.adoc[Contributing] — branches, commit messages, and
+  what a merge request needs.
+****

@@ -4,99 +4,22 @@
 ////
 
 = Roadmap
+:description: What is planned but not built: near-term refinements first, then the larger pieces.
+
+What Wusel already does is described throughout this site — start at
+xref:index.adoc[the overview], or at
+xref:reference/platform-support.adoc[Platform support] for what is tested where.
+This page is only about what is *not* done yet, and in which order.
+
+The licence question is settled and lives on its own page:
+xref:project/licence.adoc[Licence and what it means for you].
 
 Where Wusel stands, and where it is going. It is built incrementally — each step
 ends with something runnable. Today it is a working, VFS-first Nextcloud client
 on Linux with a full GNOME desktop integration, installable from a
-xref:installation.adoc[Fedora RPM].
+xref:how-to/install-a-package.adoc[Install a package].
 
 Legend: ✅ done · ◐ works, refinement pending · ⬜ planned
-
-== What works today
-
-=== Engine & CLI
-
-* ✅ Cargo workspace (`wusel-core` · `wusel-fuse` · `wusel-desktop` · `wusel` ·
-  `wusel-mock`); mise-pinned toolchain (Rust 1.97.1); the Linux/FUSE build and
-  real-mount tests run in a podman container. `wusel-core` tests run natively on
-  Linux and macOS.
-* ✅ `wusel` CLI: `login`, `mount`, `service`, `pin` / `unpin` / `pins`,
-  `accounts` / `account`, `desktop`, `cache`, `search-provider`, `doctor`.
-* ✅ `wusel doctor` — a support-diagnostics command that collects system, daemon
-  (per-thread kernel wait-channels), mount (`/sys/fs/fuse` `waiting` count),
-  configuration and connectivity, and asks the running daemon for its internal
-  state over a per-user socket. Redacted by default (name-free engine view, no
-  secrets, home/username masked); writes a `.txt` and `.json` bundle with `-o`.
-  Built because talking a non-technical user through `cat /sys/fs/fuse/…` is not
-  viable, and commercial support needs a one-command bundle. See
-  xref:troubleshooting.adoc[Troubleshooting].
-* ✅ Per-account configuration (`config.toml`) and multiple named accounts, each
-  with its own credentials, state, cache and mountpoint. Scoped logging via
-  `RUST_LOG`.
-
-=== Authentication
-
-* ✅ Nextcloud Login Flow v2 (browser-based, no plaintext password); the app
-  password persists and is reused across restarts.
-* ✅ Credentials in the OS keyring by default (freedesktop Secret Service — works
-  with gnome-keyring, KWallet, KeePassXC), fail-soft to a `0600` file; opt out
-  with `[auth] keyring = false`. See xref:architecture.adoc[_Credential storage_].
-
-=== Concurrency (released in 0.2.0)
-
-* ✅ *The mount runs on a state machine*: every callback becomes an engine
-  intent; a deciding thread that performs no I/O hands steps to database
-  readers, one writer, and network and file pools. One collision policy replaces
-  the coordination that used to be written per operation. See
-  xref:concurrency.adoc[Concurrency].
-* ✅ *Proven against a real Nextcloud* (`mise run e2e-local`): responsive during
-  both a large download and a large upload over a throttled 3 Mbit link, write
-  ordering preserved, one GET per hydration, and concurrent transfers
-  overlapping.
-* ✅ *Cancellation*: a reader that dies mid-transfer is noticed through the
-  `flush` the kernel delivers for it, and the transfer is given up rather than
-  run out. Measured behaviour, not an assumption — `interrupt_probe.rs` stays in
-  the tree as the regression guard.
-
-=== The virtual filesystem (VFS-first)
-
-* ✅ Directory tree from WebDAV PROPFIND into SQLite state; `getattr` / `lookup` /
-  `readdir` answered from state, with real mtimes and read-only permissions
-  reflected. Subdirectories load lazily; not a byte of content loads until read.
-* ✅ Live reads: `open` / `read` stream from the server per range through the
-  `ContentSource` seam; a reverse proxy that strips `Range` is handled
-  transparently (the requested window is sliced from the full body).
-* ✅ Caching: whole-file blob cache, keyed by file id and ETag-validated, bounded
-  by an LRU size budget + max age; concurrent reads coalesce; oversized and
-  id-less files stay live.
-* ✅ Pinning ("always keep offline"): path-based pins, hydrated proactively and
-  exempt from eviction; driven from the CLI or straight from the file manager.
-* ✅ Writing (write-back): a read-write mount — create / write / flush / unlink /
-  rename / mkdir / truncate — with chunked upload for large files, conflict
-  detection via `If-Match` (a conflicted copy by default, opt-in 3-way text
-  merge), read-only entries rejected, and mtime propagated.
-* ✅ *Asynchronous* write-back (the default): `close` returns once the change is
-  durable locally and the upload runs in the background, so a slow server never
-  blocks a save and a file manager copying many files does not stall. Durable
-  and resumable across a crash; transient failures retry with backoff, permanent
-  ones are parked and reported; an *uploading* / *sync-error* emblem shows where
-  each change is. `[sync] upload = sync` keeps the synchronous behaviour.
-* ✅ Change detection: `notify_push` (WebSocket) for instant invalidation, with
-  TTL + ETag revalidation as the fallback.
-
-=== Linux desktop integration (GNOME) — confirmed on Fedora/Nautilus
-
-* ✅ Cloud-provider sidebar entry with live sync status (`libcloudproviders`).
-* ✅ Per-file status emblems and a pin/unpin context menu — a native
-  `libnautilus-extension` module reading the `user.wusel.state` xattr — with live
-  emblem refresh via a daemon → extension D-Bus push.
-* ✅ Localized desktop notifications for conflicts and upload failures.
-* ✅ GNOME Shell search over Nextcloud Unified Search, opening results from the
-  local mount.
-* ✅ The mount is excluded from desktop indexers by default (synthetic marker
-  files), so a crawler cannot trigger a hydrate-everything storm.
-* ✅ Runs as a systemd *user* service (mounts at login, logs to the journal, no
-  root); installable from a Fedora RPM (`packaging/rpm/`).
 
 == Refinements (near-term)
 
@@ -127,7 +50,7 @@ fresh app password is in place.
 * ⬜ **Restructure the documentation by audience — high priority, right after the
   current release.** Testers report the docs are hard to navigate and, in
   particular, that it is not clear what to do after installing the RPM (the
-  content exists — xref:installation.adoc[Installation] covers login, the
+  content exists — xref:how-to/install-a-package.adoc[Install a package] covers login, the
   systemd service and, in _More than one Nextcloud account_, per-account
   `desktop install-provider` — but testers do not find it). The fix is
   structural, not just more content: split into an end-user section (install,
@@ -174,14 +97,14 @@ fresh app password is in place.
   clear "not metered" degrades to `ask`. Refreshing *on open* is the one moment
   avoided: that is when someone is waiting and a poor connection hurts most.
   Whole files either way — Nextcloud has no delta transfer. Design in
-  xref:concurrency.adoc[Concurrency], where the invalidation simply starts the
+  xref:explanation/concurrency.adoc[Concurrency], where the invalidation simply starts the
   same hydration flow a read would.
 * ⬜ **Concurrent FUSE dispatch** — the fix for interactive *stalls*, not for
   transfer speed. Today a blocking call serialises the whole mount: a running
   hydration delays the file manager's emblem lookups behind it. The design — an
   I/O-free decision thread, a per-inode state machine, and the environment
   assumptions it refuses to make — has its own page:
-  xref:concurrency.adoc[Concurrency]. Not implemented; stages 1 and 2 there are
+  xref:explanation/concurrency.adoc[Concurrency]. Not implemented; stages 1 and 2 there are
   worth doing on their own.
 * ⬜ **Stream hydration in one response.** A whole-file fetch currently issues one
   range GET per chunk; `reqwest` can stream a single response to disk with the
@@ -231,7 +154,7 @@ anything. What is achievable is dependable reloading *on request*.
 
 Under `[sync] open_pinned = offline` (and `newest-unmetered` on a metered
 connection) an outdated offline copy is served, and it is **read-only** — see
-xref:concurrency.adoc[Concurrency]. Allowing the edit instead would let somebody
+xref:explanation/concurrency.adoc[Concurrency]. Allowing the edit instead would let somebody
 work on a train, and the conflict machinery to land it already exists. What is
 missing is the part that makes it correct.
 
@@ -301,13 +224,13 @@ editing, which is genuinely hard to get natively (Collabora's desktop build neve
 became a first-class citizen, and where native desktop co-editing is heading is
 unclear). A chrome-less editor emulates a "local office" that can still co-edit
 with colleagues — enough for Office files, for now. For plain text, the opt-in
-xref:architecture.adoc[3-way merge] already gives a familiar, git-style middle
+xref:explanation/keeping-in-sync.adoc[3-way merge] already gives a familiar, git-style middle
 ground.
 * ⬜ *A second platform (far-future experiment)*. The order is deliberate: the
   Linux frontend is finished first and completely — a half-built frontend proves
   nothing about portability — and only then does a second one start. What has to
   be true *now* so that second frontend costs a port rather than a rewrite is
-  recorded in xref:frontends.adoc[Frontends and portability], together with the
+  recorded in xref:explanation/portability.adoc[Portability], together with the
   reasoning that makes **Windows the structurally easier candidate**.
 +
 ** ⬜ *Windows*: the Cloud Filter API via `windows-rs` — native placeholders +
@@ -367,18 +290,7 @@ reload we already ship is exactly this pattern — so all that is left to send i
 thin "wake up and re-read" signal, and only *that* signal is platform-specific.
 
 Strictly after a mobile *frontend* exists (see the second-platform item and
-xref:frontends.adoc[Frontends and portability]); a management UI with no VFS host
+xref:explanation/portability.adoc[Portability]); a management UI with no VFS host
 under it manages nothing.
 
 [#licensing]
-== Licensing
-
-Wusel is licensed under *Apache-2.0*. It lets the free sources also ship as
-signed, commercial store builds (the distribution model), carries an explicit
-patent grant, and cleanly covers outside contributions (inbound = outbound). A
-copyleft licence would conflict with the Apple App Store / Microsoft Store terms
-and force direct-sale signed binaries only — so Apache-2.0 is what keeps the
-store path open. Wusel is an independent client and shares no code with
-Nextcloud's own server (AGPL-3.0) or desktop client (GPL-2.0-or-later). Who
-develops, distributes and sells it is in xref:distribution.adoc[Project, licence
-& distribution].

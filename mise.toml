@@ -74,7 +74,7 @@ fi
 # shellcheck follow the `. podman-lib.sh` source so it sees WORK/MIRRORED.
 [tasks.shellcheck]
 description = "Lint the shell scripts (shellcheck, all findings are errors)"
-run = "shellcheck -S style -x scripts/*.sh packaging/rpm/*.sh documentation/build.sh"
+run = "shellcheck -S style -x scripts/*.sh packaging/rpm/*.sh packaging/deb/*.sh documentation/build.sh"
 
 [tasks.mock]
 description = "Run the WebDAV mock server (wusel-mock); pass --root DIR etc."
@@ -122,6 +122,10 @@ run = "./scripts/podman-e2e.sh"
 [tasks.rpm]
 description = "Build the Fedora RPM in a container (output in ./dist)"
 run = "./scripts/podman-rpm.sh"
+
+[tasks.deb]
+description = "Build the Debian/Ubuntu .deb in a container (output in ./dist)"
+run = "./scripts/podman-deb.sh"
 
 # --- Documentation diagrams -------------------------------------------------
 # Render the D2 sources under documentation/diagrams/ to the committed SVGs the

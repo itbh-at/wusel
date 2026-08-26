@@ -1,0 +1,75 @@
+////
+  // SPDX-License-Identifier: Apache-2.0
+  // Copyright 2026 IT Beratung Hermann GmbH
+////
+
+= Install a package
+:description: Install Wusel from an RPM, a .deb or the Arch PKGBUILD — one command per package family.
+
+Get the file for your architecture from the
+https://github.com/itbh-at/wusel/releases/latest[latest release].
+xref:reference/packages.adoc[Packages] says which file is built for what; if
+none of them fits your distribution, see
+xref:how-to/install-from-source.adoc[Install from source] instead.
+
+Installing does not switch Wusel on. Do
+xref:how-to/mount-at-login.adoc[Mount at login] afterwards — or follow a
+tutorial, which walks the whole way:
+xref:tutorials/on-gnome.adoc[on GNOME],
+xref:tutorials/on-another-desktop.adoc[on another desktop] or
+xref:tutorials/on-a-server.adoc[on a server].
+
+== RPM-based (Fedora, and relatives)
+
+[source,sh]
+----
+sudo dnf install ./wusel-*.rpm
+----
+
+== Debian-based (Debian, Ubuntu)
+
+[source,sh]
+----
+sudo apt install ./wusel_*.deb
+----
+
+Use `apt`, not `dpkg -i`. `apt` resolves the dependencies; `dpkg` only reports
+that they are missing.
+
+== Arch Linux
+
+Not on the AUR yet, but the `PKGBUILD` is in the repository and builds the way
+any AUR package does — there is nothing AUR-specific about running it from a
+local checkout:
+
+[source,sh]
+----
+git clone https://github.com/itbh-at/wusel.git
+cd wusel/packaging/aur
+makepkg -si
+----
+
+`-s` installs the build dependencies through `pacman` first; `-i` installs the
+result.
+
+== Then log out and back in
+
+The Nautilus extension and the GNOME Shell search provider are loaded by their
+host processes when a session starts, so they are not picked up by the running
+one. Log out and back in once.
+
+Faster, if you would rather not: restart Nautilus with `nautilus -q` (it
+relaunches on next use), and restart GNOME Shell — on X11 press kbd:[Alt+F2],
+type `r`, press kbd:[Enter]; on Wayland only a re-login does it. A full re-login
+always works.
+
+== What is installed, and what is not
+
+The one required dependency is `fuse3`. The GNOME pieces are *suggested*, so
+neither package manager installs them by default: on a server or a KDE machine
+you get the mount and about five packages rather than a desktop stack. What is
+then missing is the sidebar entry, the emblems and the Shell search — not the
+filesystem. See xref:reference/platform-support.adoc[Platform support].
+
+These are unsigned community packages with no repository behind them, so your
+package manager will not update them. Fetch the next release the same way.

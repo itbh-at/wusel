@@ -1,0 +1,144 @@
+////
+  // SPDX-License-Identifier: Apache-2.0
+  // Copyright 2026 IT Beratung Hermann GmbH
+////
+
+= VFS-first: why nothing is downloaded up front
+:description: Why Wusel serves files on demand instead of mirroring your Nextcloud onto your disk — and what had to be built to make that feel ordinary.
+
+Wusel does not copy your Nextcloud onto your disk. Files are *online-only*
+until something opens them, and only then does anything travel. This page
+explains why that choice was made, what it costs, and what had to be built to
+make it feel ordinary.
+
+The short version: a mirror has to be smaller than your disk and has to finish
+before it is useful. A virtual filesystem has to do neither.
+
+== VFS-first / on-demand hydration
+
+Under FUSE the "virtual" behavior comes for free: the kernel routes every
+`open`/`read` through our handler, so "online-only" is just "we don't have the
+bytes until a read asks for them" — no placeholder API. The native frontends
+must build the same effect explicitly (macOS File Provider materializing dataless
+items, Windows Cloud Filter placeholders + hydration callbacks):
+
+[cols="1,3",options="header"]
+|===
+| State (`provider::FileState`) | Meaning
+| `online-only` | No local copy; metadata only (from PROPFIND). The default.
+| `cached`      | A whole, ETag-fresh copy sits in the blob cache — evictable.
+| `pinned`      | Kept offline on purpose (the file, an ancestor directory, or the root is pinned); exempt from eviction. The pin list lives in `<config>/pins.json`, not in the cache database — it is intent, and survives `cache clear`.
+| `pinned-stale`| Pinned, but the copy we keep no longer matches the server's. Still served when the server is unreachable — an outdated copy beats an error.
+| `modified`    | A local edit not yet uploaded (an open write buffer, or a deferred create).
+|===
+
+This is the *only* per-file state model, and it is **derived, not stored**:
+`Provider::file_state` answers from the write buffers, the `pins` table and the
+blob cache's ETag sidecars — SQLite holds no state column. The same four values
+are what the OS integrations see, as the `user.wusel.state` xattr
+(xref:reference/file-states.adoc[File states] documents the contract).
+
+Flow: we answer `getattr`/`readdir` from the SQLite state (without content).
+Only `open`/`read` triggers the hydration (a range GET for the bytes asked for,
+plus background hydration of the whole file).
+
+== Hydration: serve the range live, cache the whole file in the background
+
+Opening a file caches it — the classic on-demand cache, bounded by an LRU size
+budget. But the *download* is decoupled from the *read*, on two axes:
+
+* **The read is served live, per range, and never blocks.** A `read(offset, len)`
+  returns exactly that range (a WebDAV range GET, escalating to chunked readahead
+  for a sequential run). The FUSE session loop is single-threaded — it processes
+  one request at a time — so a read must never do a whole-file download inline: a
+  4 KiB peek at a 2 GiB file would freeze `stat`/tab-completion for everyone for
+  the length of the transfer. That was a real regression. Reads now cost only the
+  bytes asked for, immediately.
++
+This holds even when the server never answers with `206`. `Range` is only an
+optional optimisation (RFC 9110 §14.2): a reverse proxy or cache sitting between
+us and Nextcloud may strip the header, and the server then returns `200` with the
+*whole* body. We detect the non-`206` status, slice the requested window out of
+the full response locally, and warn once. The OS still sees an ordinary partial
+read succeed — the only cost is bandwidth: until the proxy is fixed, each partial
+read transfers the whole file.
+* **The whole file is hydrated into the cache in the background.** A read of an
+  uncached file also *requests* hydration; a dedicated worker — with its own
+  client and runtime, so it never contends with the FUSE thread — pulls the rest
+  and publishes an evictable blob. The file then reads local and its per-file
+  emblem flips online-only → **cached**. Hydration is deduplicated (the storm of
+  reads that opening a file produces enqueues one) and bounded by the LRU budget.
+
+**Pinning** is the stronger, explicit promise: keep the file offline permanently,
+exempt from eviction (the green-check emblem). A **local write** keeps the
+just-uploaded copy hot too. So the per-file states the OS backends surface are
+online-only → cached (used, evictable) → pinned (kept) — see
+xref:reference/file-states.adoc[File states].
+
+NOTE: because opening caches, a desktop indexer or thumbnailer (Tracker, Baloo,
+Spotlight) that reads files would trigger background hydration of everything it
+touches — a traffic storm (the LRU budget bounds *disk*, not *network*). So
+`exclude_from_indexers` is *on by default*: the FUSE root exposes synthetic,
+local-only `.trackerignore`/`.nomedia` markers (never uploaded) that GNOME
+Tracker honours to skip the whole tree. Opt back in with `[desktop]
+exclude_from_indexers = false`. KDE Baloo ignores markers (needs a config
+exclude); the native Cloud Filter / File Provider backends can signal "don't
+hydrate for indexing", FUSE cannot. The long-term answer is a desktop *search
+provider* that queries Nextcloud directly — no local indexing at all.
+
+== Content delivery: `ContentSource` + cache decorator
+
+File contents flow through *a single encapsulated abstraction*, so that caching
+can be added later transparently, without touching the FUSE layer:
+
+....
+FUSE read()  ──►  dyn ContentSource
+                     ├── LiveWebDav      (reads live via range GET)
+                     └── CachingSource    (decorator: cache hit? otherwise to Live)
+....
+
+`CachingSource` implements the same trait and wraps `LiveWebDav`
+(classic decorator pattern) — the caller notices nothing of it.
+
+== Pinning ("always keep offline")
+
+Pins are **path-based** and live in each account's state DB (`pins` table), not
+per-inode — so a pin survives reconciliation, a *directory* pin covers its whole
+subtree (including entries not yet listed), and pinning the **root** (`""`) is
+the legacy "download everything" of the old desktop client.
+
+Pinning a path hydrates it now (a directory recursively) and marks each blob with
+a `.pin` sidecar next to the cached file. Eviction skips `.pin`-marked blobs
+entirely — they neither get evicted nor count against the size budget — and a pin
+overrides the oversized-bypass, so even a file larger than the budget is kept.
+`wusel pin | unpin | pins` drive this and need no mount (they write straight
+into the cache); each account is independent.
+
+== Performance principles
+
+WebDAV is the same protocol Nextcloud's official client uses for transfer
+(including chunked upload for large files). The sluggishness people feel with a
+GVfs / `davfs2` WebDAV mount is *not* the protocol — it is metadata chattiness
+(a PROPFIND per `stat`), no caching, and per-request PHP overhead. `wusel`
+avoids exactly that:
+
+* *No PROPFIND in the FUSE hot path.* `getattr`/`readdir`/`lookup` are answered
+  from the SQLite metadata cache. PROPFIND runs only to fill or revalidate the
+  cache (see xref:explanation/keeping-in-sync.adoc[Keeping in sync]), never per file operation.
+* *Read only what is asked for.* A read serves just its byte range live; it never
+  downloads the whole file (see _Hydration: serve the range live, cache the
+  whole file in the background_). A pinned, cached or just-written file is served
+  whole from the blob cache instead — but the blob is only used while its ETag
+  sidecar still matches the ETag in SQLite. Once the sync walk learns the server
+  copy changed, the blob counts as stale and the next read goes to the network
+  again (re-hydrating as it goes); proactive re-hydration of *pinned* paths is an
+  open roadmap item, see xref:project/roadmap.adoc[_Refinements_].
+* *Reuse connections.* The `reqwest` client keeps a persistent connection pool
+  with HTTP keep-alive and HTTP/2 multiplexing — no TLS handshake per operation.
+* *Stream and prefetch.* Range GET for partial/streaming reads; read-ahead for
+  sequential access.
+* *Push over poll.* `notify_push` (WebSocket) drives change detection instead of
+  repeated PROPFIND polling.
+
+The bottleneck isn't the bytes of a single GET (which saturates the link); it is
+round-trip latency on metadata. The cache-first VFS removes it.

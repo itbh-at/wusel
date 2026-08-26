@@ -1,0 +1,122 @@
+////
+  // SPDX-License-Identifier: Apache-2.0
+  // Copyright 2026 IT Beratung Hermann GmbH
+////
+
+= Files and directories
+:description: Every path Wusel reads or writes — configuration, credentials, state database, cache, mountpoint, unit file and desktop registrations.
+
+Wusel follows the XDG base directory specification, so `XDG_CONFIG_HOME`,
+`XDG_STATE_HOME`, `XDG_CACHE_HOME` and `XDG_DATA_DIRS` are honoured where they
+are set. The paths below assume the usual defaults.
+
+== Per user
+
+The implicit `default` account uses the base directories directly. A named
+account is fully isolated under an `accounts/<name>/` subdirectory, so a
+single-account user never sees the profile machinery at all.
+
+[cols="2,2,2",options="header"]
+|===
+| Path (default account) | Named account `work` | What it is
+
+| `~/.config/wusel/config.toml`
+| `~/.config/wusel/accounts/work/config.toml`
+| Optional settings. See
+  xref:reference/configuration.adoc[Configuration reference].
+
+| `~/.config/wusel/credentials.json`
+| `~/.config/wusel/accounts/work/credentials.json`
+| Server URL, login name and — only when the keyring is unavailable or opted out
+  of — the app password. Mode `0600`.
+
+| `~/.config/wusel/pins.json`
+| `~/.config/wusel/accounts/work/pins.json`
+| The pinned paths. Deliberately configuration rather than cache: a pin is
+  intent, and survives `wusel cache clear`.
+
+| `~/.local/state/wusel/state.sqlite`
+| `~/.local/state/wusel/accounts/work/state.sqlite`
+| The metadata cache: the file tree, ETags, sizes and mtimes. Rebuildable from
+  the server. Overridable with `[state] db_path`.
+
+| `~/.cache/wusel/blobs/`
+| `~/.cache/wusel/accounts/work/blobs/`
+| Cached file contents, one blob per file, each with an ETag sidecar and — when
+  pinned — a `.pin` marker that exempts it from eviction.
+
+| `~/Wusel`
+| `~/Wusel-work`
+| The mountpoint. Created if missing. Overridable with `[mount] point` or an
+  argument to `wusel mount`.
+|===
+
+The state database is relocated automatically if its default location turns out
+to be on a network filesystem, where SQLite locking is unreliable. An explicit
+`[state] db_path` is always honoured instead.
+
+== The keyring
+
+By default the app password is not in any file. It goes to the freedesktop
+Secret Service — GNOME Keyring, KWallet, KeePassXC — under the service name
+`wusel`, keyed by account. To inspect or drop it:
+
+[source,sh]
+----
+secret-tool search service wusel
+secret-tool clear service wusel
+----
+
+Why this can fail on a headless machine, and what happens then, is in
+xref:explanation/credentials-and-trust.adoc[Credentials and trust].
+
+== Installed by a package
+
+These are system paths; a source build does not create them. The full list, with
+what each one is for, is in xref:reference/packages.adoc[Packages].
+
+* `/usr/bin/wusel`
+* `/usr/lib/systemd/user/wusel@.service`
+* the Nautilus extension and its emblem icons
+* the GNOME Shell search provider registration
+* the Files sidebar registration for the default account
+
+== Written by systemd, not by Wusel
+
+[cols="2,3",options="header"]
+|===
+| Path | What it is
+
+| `~/.config/systemd/user/default.target.wants/wusel@<account>.service`
+| The enable symlink `systemctl --user enable` creates. `disable` removes it.
+  Removing the package without disabling the service first leaves this behind as
+  a dangling link.
+|===
+
+Service output goes to the journal, not to a log file:
+`journalctl --user -u wusel@default`.
+
+== Inside the mount
+
+[cols="2,3",options="header"]
+|===
+| Name | What it is
+
+| `.trackerignore`, `.nomedia`
+| Synthetic, local-only markers served at the mount root so desktop indexers
+  skip the tree. They exist only inside the mount and are never uploaded to
+  Nextcloud. Turned off with `[desktop] exclude_from_indexers = false`.
+
+| `<name> (conflicted copy <unix>).<ext>`
+| A real file on the server. Created when your edit and a server-side edit
+  collided; your version is in the copy, the server's is at the original name.
+|===
+
+Every file in the mount also carries the `user.wusel.state` extended attribute;
+see xref:reference/file-states.adoc[File states].
+
+== Removing everything
+
+`dnf remove` or `apt remove` deletes only the system paths. The per-user data
+above is deliberately left behind, so a reinstall picks up where you left off.
+To clear it too, see xref:how-to/uninstall.adoc[Uninstall].

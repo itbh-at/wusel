@@ -1,0 +1,114 @@
+////
+  // SPDX-License-Identifier: Apache-2.0
+  // Copyright 2026 IT Beratung Hermann GmbH
+////
+
+= Develop on macOS
+:description: Work on Wusel from a Mac — engine and CLI natively, the Linux mount inside a podman container.
+
+This page is for people writing code for Wusel from a Mac. If that is not you,
+you can skip it entirely: Wusel does not run on macOS, and nothing here will
+make it.
+
+The mount is a FUSE filesystem, and macOS has no FUSE. A native macOS frontend
+would be a File Provider Extension, which is far-future work — see
+xref:reference/platform-support.adoc[Platform support]. What macOS *can* do
+today is build and test everything that is not the mount, which is most of the
+code.
+
+On Linux none of this applies; follow
+xref:tutorials/set-up-a-development-environment.adoc[Set up a development
+environment] instead.
+
+== What works natively
+
+The engine and the CLI build and test on macOS with no container:
+
+[source,sh]
+----
+mise run check
+mise run test
+mise run clippy
+----
+
+That covers `wusel-core` — authentication, WebDAV, the cache, the state
+database, the sync logic — and the CLI around it. The FUSE frontend is compiled
+out.
+
+== The mount, in a container
+
+Anything touching the mount needs a Linux kernel with `/dev/fuse`, which podman
+provides through its Linux VM:
+
+[source,sh]
+----
+mise run fuse-build     # build the container image
+mise run fuse-shell     # a Linux shell with /dev/fuse
+----
+
+Inside that shell:
+
+[source,sh]
+----
+cargo run -p wusel --features fuse -- mount /mnt/nc
+mise run fuse-test      # the containerised FUSE suite
+----
+
+IMPORTANT: The mount then lives *inside* podman's Linux VM. It is not a drive on
+your Mac and cannot be made into one this way.
+
+== If your checkout is on an external disk
+
+The `podman-*.sh` scripts have to find where the VM can see your repository, and
+`scripts/podman-lib.sh` probes three possibilities in order:
+
+. *The repository path itself* — always true under podman's standard macOS
+  shares (`/Users`, `/private`, `/var/folders`).
+. *A disk share* — a repository under `/Volumes/<disk>` that the VM mounts at
+  `/var/mnt/<disk>`. The build then runs in place, and its cache
+  (`target-linux/`, gitignored) lives with the repository and stays incremental,
+  off the boot disk. This needs the one-time setup below.
+. *An rsync mirror* at `/private/tmp/wusel-linux`, as a fallback. Always works,
+  but container-side changes never reach the original tree, and it copies —
+  `podman-build.sh` deletes the mirror's build cache after each build so it
+  cannot fill the boot disk.
+
+=== Sharing the disk into the VM
+
+To let the VM see a repo on an external disk (e.g. `/Volumes/<disk>`),
+share the disk into the podman machine — two steps, surviving VM restarts:
+
+. Add the disk to the `Mounts` array of
+  `~/.config/containers/podman/machine/libkrun/podman-machine-default.json`
+  (copy an existing entry; `Source`/`Target` = `/Volumes/<disk>`, a unique
+  `Tag`), then `podman machine stop && podman machine start`.
+. Mount it inside the guest (Fedora CoreOS: `/` is immutable, so the target is
+  `/var/mnt`; the SELinux context matches podman's own shares — without it,
+  containers get `Permission denied`):
++
+[source,sh]
+----
+podman machine ssh "sudo mkdir -p /var/mnt/<disk> && \
+  echo '<tag> /var/mnt/<disk> virtiofs rw,nofail,context=system_u:object_r:nfs_t:s0 0 0' \
+  | sudo tee -a /etc/fstab && sudo systemctl daemon-reload && sudo mount /var/mnt/<disk>"
+----
+
+TIP: The VM's disk is a *sparse* file: it grows as data is written and does not
+shrink when files inside are deleted, so `podman system prune` alone leaves the
+host file at its high-water mark. To hand the space back, trim inside the guest:
+`podman machine ssh "sudo fstrim -av"`. If a container build ever fails, check
+`/var/tmp` in the guest too — podman leaves the unpacked build context behind
+and nothing collects it.
+
+`podman machine init` recreates the VM from scratch — redo both steps then. The
+scripts fall back to mirroring automatically until you do, so nothing breaks in
+the meantime; it is only slower.
+
+== What you cannot check from a Mac
+
+The desktop integration. The sidebar entry, the emblems, the Shell search and
+the notifications are GNOME on a session bus, and a container has neither. Those
+need a Linux desktop — in practice the reference setup, Fedora with GNOME.
+
+The nightly end-to-end run against a real Nextcloud covers the engine side of
+that on Linux; the desktop half is verified by hand.

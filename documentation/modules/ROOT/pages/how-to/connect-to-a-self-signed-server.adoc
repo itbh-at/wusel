@@ -1,0 +1,76 @@
+////
+  // SPDX-License-Identifier: Apache-2.0
+  // Copyright 2026 IT Beratung Hermann GmbH
+////
+
+= Connect to a server with a private certificate
+:description: Point Wusel at your own CA so a self-signed or internally issued Nextcloud is trusted — without turning verification off.
+
+By default Wusel trusts the operating system's certificate store, the same one a
+browser or `curl` uses. A private CA's certificate is not in that store, so a
+Nextcloud issued by one fails to log in with a certificate error.
+
+There are two clean fixes and one escape hatch.
+
+== Add the CA to the system store
+
+The best option, because everything else on the machine benefits too. On an
+RPM-based system:
+
+[source,sh]
+----
+sudo cp my-ca.pem /etc/pki/ca-trust/source/anchors/
+sudo update-ca-trust
+----
+
+On a Debian-based one:
+
+[source,sh]
+----
+sudo cp my-ca.crt /usr/local/share/ca-certificates/
+sudo update-ca-certificates
+----
+
+Nothing needs configuring in Wusel afterwards.
+
+== Tell Wusel alone about it
+
+When you cannot or would rather not touch the system store, point Wusel at the
+PEM file. It is trusted *in addition to* the OS store, not instead of it:
+
+[source,toml]
+----
+# ~/.config/wusel/config.toml
+[tls]
+ca_cert = "/home/you/certs/my-ca.pem"
+----
+
+The file may hold the CA certificate or the server's own self-signed
+certificate. Restart the mount for it to take effect.
+
+== The escape hatch
+
+[source,toml]
+----
+[tls]
+insecure = true
+----
+
+This turns certificate verification off entirely. It is for testing, it logs a
+prominent warning at every start, and it is never reached by accident — a failed
+handshake does not fall back to it.
+
+Anyone who can get between you and your server can now read and alter
+everything, including your app password on its way through. Use it to confirm
+that TLS *is* the problem, then fix the certificate and take it out again.
+
+== Checking
+
+[source,sh]
+----
+wusel login https://cloud.example.org
+----
+
+A certificate problem surfaces here, before anything is mounted. If it still
+fails, the journal names the full cause chain; see
+xref:how-to/diagnose-a-problem.adoc[Diagnose a problem].

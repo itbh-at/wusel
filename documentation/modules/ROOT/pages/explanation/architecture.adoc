@@ -1,0 +1,203 @@
+////
+  // SPDX-License-Identifier: Apache-2.0
+  // Copyright 2026 IT Beratung Hermann GmbH
+////
+
+= Architecture
+:description: A platform-independent engine plus thin, interchangeable frontends — where the seam runs, and why the mount is the replaceable part.
+
+Nextcloud's official client avoids a Linux VFS because a single Qt/C++ code base
+is maintained for Windows/macOS/Linux, and Linux would need its own,
+platform-specific path (FUSE). `wusel` turns this around: a platform-independent
+engine plus interchangeable, thin frontends.
+
+. `wusel-core` — engine, no kernel. Tests natively on Linux and macOS.
+. `wusel-fuse` — thin FUSE frontend (library), Linux (libfuse3).
+. `wusel-desktop` — Linux/GNOME integration behind `desktop::Desktop`: localized
+  freedesktop notifications, the Nautilus cloud-provider sidebar plus per-file
+  emblems and a pin/unpin menu (`libcloudproviders` + a native
+  `libnautilus-extension` module), and a GNOME Shell search provider. A no-op
+  elsewhere; macOS/Windows would be their own crates.
+. `wusel` — daemon/CLI binary, ties engine + frontends together (the product).
+
+Each OS gets its matching frontend (Linux → FUSE + libcloudproviders;
+macOS → later File Provider Extension), while the engine stays unchanged.
+That is the strategic advantage over the monolith.
+
+// Rendered from documentation/diagrams/arch-overview.d2 (mise run docs-diagrams).
+// Explicit width: d2's outer <svg> carries only a viewBox (no width/height), so
+// without this an <img> would collapse to 0. max-width:100% keeps it responsive.
+image::arch-overview.svg[Architecture overview,600]
+
+== Frontend adapters and the `Provider` facade
+
+Every OS gets its own thin frontend, and they all reach the engine the same way:
+by naming an **intent** and letting the machine decide what that costs.
+
+....
+wusel-fsm                    the decider: occupancy, collision policy, scripts
+   Fetch · Write · Stat · Lookup · Enumerate · Materialise
+   Publish · Remove · Move · SetAttr · State · Refresh · Relist
+
+wusel-core::runtime          the substrate that carries the steps out
+   N database readers · 1 writer · network pool · file pool
+
+wusel-fuse          (Linux)   — FUSE callbacks       → intents   [exists]
+wusel-fileprovider  (macOS)   — File Provider ext.   → intents   [planned]
+wusel-cfapi         (Windows) — Cloud Filter API     → intents   [planned]
+....
+
+Two words carry this, so they are worth stating plainly. An **intent** is what a
+call is meant to *achieve*, independent of the name an operating system gives it
+— which is why `flush`, `fsync` and `release` are one intent and not three. The
+**substrate** is what carries its steps out: the deciding thread, the database
+readers and writer, and the network and file pools.
+
+The alphabet is what the *engine* does, not what one kernel interface calls it:
+`flush`, `fsync` and `release` are one intent because they are one operation, and
+`unlink` and `rmdir` likewise. A frontend maps its platform's callbacks onto
+these and formats the replies; it carries no engine logic of its own.
+
+That matters for more than tidiness. `wusel-fsm` depends on nothing — not on the
+engine, not on a database, not on an HTTP client, not on a FUSE binding — so
+"the deciding thread performs no I/O" is enforced by the compiler rather than by
+review, and a second frontend is a port rather than a rewrite. The reasoning is
+in xref:explanation/portability.adoc[Portability]; the scripts themselves are in
+xref:reference/operation-scripts.adoc[the operation scripts].
+
+`wusel-core` keeps what was never per-request: the WebDAV client, the SQLite
+state, pins, the background syncer, and the conflict and reconcile logic the
+substrate calls. The macOS and Windows frontends remain separate, additive
+projects with their own OS glue (Swift + a C ABI on macOS; `windows-rs` on
+Windows) — neither changes the engine, which is the whole point of the split.
+
+== FUSE ↔ async bridge
+
+FUSE callbacks are synchronous/blocking, network I/O is async (tokio). The
+`fuser` session loop processes one request at a time on a single thread, so any
+call that blocks it — a PROPFIND, a content fetch — stalls *every* other
+operation queued behind it (tab-completion, `stat`). Two rules keep that from
+happening:
+
+* *Reads serve only their range* (see xref:explanation/vfs-first.adoc[VFS-first]) — never a whole multi-second download on
+  the FUSE thread.
+* *Revalidation is off-thread.* A stale-but-listed directory is refreshed by a
+  **background revalidator**: a dedicated thread does only the slow PROPFIND and
+  hands the listing back through a channel; the provider applies it (a fast local
+  SQLite reconcile) on the FUSE thread at the next call. So a directory listing —
+  or a background indexer walking the tree — never blocks interactive work. All
+  SQLite access stays on the one thread (single connection, no locks); the worker
+  touches only the network. A pending revalidation per directory is de-duplicated,
+  so a burst of accesses collapses to one PROPFIND.
+
+Only the *first* listing of a directory is synchronous, because there is nothing
+cached to serve yet.
+
+=== The single dispatch thread was a ceiling, and it has been lifted
+
+Both rules above were *mitigations*: they kept the known slow operations off the
+one thread, while the thread itself stayed a hard serialisation point. Anything
+that did block it blocked everything behind it — a hydration delayed the file
+manager's per-file emblem lookups, and a `cp` from the mount and an `ls`
+elsewhere took turns for no reason.
+
+That ceiling is gone as of 0.2.0. Every callback is now an intent handed to a
+state machine that decides and performs no I/O, with database readers, a writer,
+and network and file pools underneath it: see xref:explanation/concurrency.adoc[Concurrency]
+for the design and xref:reference/operation-scripts.adoc[the operation scripts] for what each
+operation does. The paragraph above describes 0.1.0, the mitigated
+single-threaded loop.
+
+=== Directory streams see a stable listing
+
+Answering `readdir` straight from SQLite per chunk would collide with exactly
+that background revalidation. A directory is not delivered in one reply: the
+kernel asks for it in chunks identified by an *offset* into the listing. If a
+revalidation lands between two chunks and the second chunk is computed from the
+new listing, the offsets no longer mean the same thing — entries get skipped or
+duplicated, and `ls` silently lies.
+
+The FUSE frontend therefore takes a **snapshot per traversal**: the listing is
+built when a stream starts and every continuation chunk is served from that same
+snapshot, so one `ls` is always internally consistent. The snapshot is not taken
+at `opendir` but at the stream's start, which is also where POSIX `rewinddir`
+lands (glibc implements it as a seek to offset 0 on the same descriptor, with no
+second `opendir`). That keeps the other half of the contract: a rewound stream
+must see the directory's *current* state, so a long-lived directory handle — a
+file manager, a watcher, an indexer — is never stuck with a listing from the
+moment it opened.
+
+A snapshot is a copy of the directory's names, and a process may hold arbitrarily
+many directory handles, so the number kept at once is capped. Beyond the cap a
+stream simply re-lists per chunk again — still correct, just without the
+intra-stream stability — rather than letting memory grow unbounded.
+
+== Running as a service, and multiple accounts
+
+Simple users should not have to babysit a terminal. The daemon runs as a
+**systemd _user_ service** — not system-wide: it lives in the user's session,
+reads credentials from `~/.config`, needs no root, and its FUSE mount is
+naturally bound to login. Logs go to the journal (`journalctl --user -u
+wusel`); `tracing` writes to stderr, which systemd captures. The daemon owns
+the mountpoint (creates it if missing) and unmounts cleanly on `SIGTERM`, so the
+unit stays minimal.
+
+*Multiple accounts.* Many users have more than one Nextcloud — personal plus
+work, or one per client. Accounts are **optional named profiles**: the implicit
+`default` account uses the base dirs directly (a single-account user sees no
+profile machinery at all), while each named account is opt-in and fully isolated
+under an `accounts/<name>/` subdirectory:
+
+* default: `~/.config/wusel/` · `~/.local/state/wusel/state.sqlite` · `~/.cache/wusel/blobs`
+* named `work`: `~/.config/wusel/accounts/work/` · `…/state/wusel/accounts/work/…` · `…/cache/wusel/accounts/work/…`
+
+The CLI carries an optional `--account <name>` (default `default`, so the
+single-account case is unchanged); `wusel accounts` lists them and `wusel
+account remove <name>` deletes a named profile (credentials, state, cache — the
+server is untouched). Named accounts map directly onto a **templated** systemd
+unit so N instances run side by side:
+
+[source,ini]
+----
+# /usr/lib/systemd/user/wusel@.service  (shipped by the package)
+[Unit]
+Description=Wusel — virtual Nextcloud filesystem (%i)
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/wusel mount --account %i
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+----
+
+*The absent sandboxing is deliberate.* The unit carries none of the systemd
+hardening directives one would normally reach for — `ProtectSystem`,
+`LockPersonality`, `RestrictRealtime`, `ProtectKernelModules` and friends —
+because every one of them implies `NoNewPrivileges=yes`, and an unprivileged FUSE
+mount goes through the **setuid** `fusermount3` helper. Under `NoNewPrivileges`
+the setuid bit is ignored and the mount dies with `fusermount3: Operation not
+permitted`. So the hardening is not missing by oversight; it is incompatible with
+the one thing the service exists to do. What limits the blast radius instead is
+that this is a *user* service holding a revocable app password, not a root
+daemon. Both shipped unit files carry this rationale as a comment, so nobody
+"fixes" it later.
+
+Two accounts must never share or nest a mountpoint (Linux would over-mount and
+hide the first), so `mount` refuses to start where its target equals, contains,
+or sits inside another active mount (`wusel_core::mount::find_conflict` against
+`/proc/self/mountinfo`). Mounting the *same* server + user under two accounts is
+allowed but warned: two read-write mounts of one account edit the same server
+files through two independent caches and write buffers, so they can conflict with
+each other exactly as two different machines would.
+
+Flow for a plain user: install the package (pulls `fuse3`), `wusel login
+--account work <url>` (confirm in the browser), then `wusel --account work
+service enable` — a convenience subcommand that writes/enables the unit so no
+one touches `systemctl`. The account then mounts at every login. The service is enabled only
+after a successful login, so it never crash-loops without credentials. (The
+template unit also serves the single `default` account, as `wusel@default`.)

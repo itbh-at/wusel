@@ -1,0 +1,14 @@
+wusel (0.3.0) unstable; urgency=medium
+
+  * Packages for Debian/Ubuntu and Arch alongside the Fedora RPM, built from
+    the same recipes and published through the Open Build Service.
+  * Documentation restructured onto the Diátaxis framework.
+
+ -- Christoph D. Hermann <christoph.hermann@itbh.at>  Tue, 25 Aug 2026 21:40:00 +0200
+
+wusel (0.2.2) unstable; urgency=medium
+
+  * Debian/Ubuntu packaging: from-source build via debhelper, offline
+    (vendored dependencies), mirroring the Fedora RPM's approach.
+
+ -- Christoph D. Hermann <christoph.hermann@itbh.at>  Tue, 25 Aug 2026 11:52:20 +0200

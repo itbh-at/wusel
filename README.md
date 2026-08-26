@@ -29,8 +29,8 @@ held together by the daemon **`wusel`**. This separation makes it possible to
 develop and test the bulk of the work natively on macOS — only the mount needs
 a FUSE driver.
 
-Details: [Architecture](documentation/modules/ROOT/pages/architecture.adoc) ·
-Order of work: [Roadmap](documentation/modules/ROOT/pages/roadmap.adoc). The
+Details: [Architecture](documentation/modules/ROOT/pages/explanation/architecture.adoc) ·
+Order of work: [Roadmap](documentation/modules/ROOT/pages/project/roadmap.adoc). The
 docs are an [Antora](https://antora.org) component under
 [`documentation/`](documentation/), published to
 <https://itbh-at.github.io/wusel/> on every push to `main` (build locally:
@@ -47,10 +47,11 @@ sudo dnf install ./wusel-*.rpm
 systemctl --user enable --now wusel@default
 ```
 
-Full walkthrough:
-[Installation](documentation/modules/ROOT/pages/installation.adoc). To build from
-source instead, see [Trying it
-out](documentation/modules/ROOT/pages/trying-it-out.adoc).
+Full walkthrough — your Nextcloud files as a folder, from an empty machine to
+open files: [on GNOME](documentation/modules/ROOT/pages/tutorials/on-gnome.adoc), [on another
+desktop](documentation/modules/ROOT/pages/tutorials/on-another-desktop.adoc), or [on a
+server](documentation/modules/ROOT/pages/tutorials/on-a-server.adoc). To build it yourself instead, see
+[Install from source](documentation/modules/ROOT/pages/how-to/install-from-source.adoc).
 
 ### Which Nextcloud versions
 
@@ -101,8 +102,8 @@ Files appear *online-only* and are streamed from the server as you read them
   diagnostics bundle you can attach to a ticket.
 - **Configuration** (optional): `~/.config/wusel/config.toml` — cache
   budget/age, revalidation TTL, TLS trust (`ca_cert` / `insecure` for
-  self-signed servers), mountpoint. Step-by-step: [Trying it
-  out](documentation/modules/ROOT/pages/trying-it-out.adoc).
+  self-signed servers), mountpoint. Every key: [Configuration
+  reference](documentation/modules/ROOT/pages/reference/configuration.adoc).
 
 ## Toolchain
 
@@ -125,7 +126,7 @@ mise run clippy
 ### Mounting
 
 The FUSE mount runs on **Linux**. On macOS, test it inside the podman container.
-Step-by-step: [Trying it out](documentation/modules/ROOT/pages/trying-it-out.adoc).
+Step-by-step: [Develop on macOS](documentation/modules/ROOT/pages/how-to/develop-on-macos.adoc).
 
 ```sh
 mise run fuse-shell   # Linux shell with /dev/fuse (works on macOS too, via podman)
@@ -142,12 +143,12 @@ a Mac, test the mount inside the podman container.
 GitHub Actions runs the same `mise run …` tasks on every push and pull request
 (format, licence headers, clippy, check, tests, plus a Linux FUSE build), builds
 the docs, runs a nightly end-to-end test against a real Nextcloud, and publishes
-the RPMs on a `v*` tag. Details:
-[Development & Testing](documentation/modules/ROOT/pages/development.adoc).
+the RPMs on a `v*` tag. Details: [How Wusel is
+tested](documentation/modules/ROOT/pages/explanation/testing.adoc).
 
 ## Status
 
-See the [Roadmap](documentation/modules/ROOT/pages/roadmap.adoc). Working today:
+See the [Roadmap](documentation/modules/ROOT/pages/project/roadmap.adoc). Working today:
 
 - **Engine** — authentication (Login Flow v2), the live tree (listing +
   on-demand content with real mtimes/permissions), whole-file caching with
@@ -179,4 +180,4 @@ Found a vulnerability? Please report it privately — see [SECURITY.md](SECURITY
 
 [Apache-2.0](LICENSE). Chosen so the free sources can also be shipped as signed,
 commercial store builds — see _Licensing_ in the
-[Roadmap](documentation/modules/ROOT/pages/roadmap.adoc).
+[Licence](documentation/modules/ROOT/pages/project/licence.adoc).

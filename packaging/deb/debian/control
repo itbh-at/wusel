@@ -1,0 +1,27 @@
+Source: wusel
+Section: net
+Priority: optional
+Maintainer: Christoph D. Hermann <christoph.hermann@itbh.at>
+Build-Depends: debhelper-compat (= 13),
+               cargo,
+               rustc (>= 1.85~),
+               libnautilus-extension-dev,
+               libglib2.0-dev,
+               libfuse3-dev,
+               pkgconf
+Standards-Version: 4.6.2
+Homepage: https://github.com/itbh-at/wusel
+Rules-Requires-Root: no
+
+Package: wusel
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, fuse3
+Suggests: nautilus, gnome-shell
+Description: Virtual Nextcloud filesystem — Nextcloud, woven into your desktop
+ Wusel makes a Nextcloud appear as an ordinary folder on Linux — VFS-first:
+ files are online-only by default and are fetched on access (on-demand
+ hydration), instead of mirroring everything locally.
+ .
+ This package also ships the GNOME/Nautilus integration (per-file emblems, a
+ pin/unpin context menu, sidebar cloud-provider status) and a GNOME Shell
+ search provider backed by Nextcloud Unified Search.

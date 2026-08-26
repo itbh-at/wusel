@@ -7,7 +7,7 @@ in **wusel**. It takes precedence over default behaviour.
 
 `wusel` is a virtual Nextcloud filesystem written in Rust (**VFS-first**:
 online-only, on-demand hydration) — more than just FUSE. See the
-[Architecture](documentation/modules/ROOT/pages/architecture.adoc).
+[Architecture](documentation/modules/ROOT/pages/explanation/architecture.adoc).
 
 ## Language
 
@@ -75,7 +75,7 @@ XDG paths by hand instead of adding the `dirs` crate.)
 - `wusel-mock` — mock Nextcloud server for the tests.
 - `wusel` — daemon/CLI binary (the product); FUSE behind the `fuse` Cargo feature.
 - Design and rationale live in the
-  [Architecture](documentation/modules/ROOT/pages/architecture.adoc) docs, not
+  [Architecture](documentation/modules/ROOT/pages/explanation/architecture.adoc) docs, not
   here.
 
 ## Build & test
@@ -95,9 +95,10 @@ XDG paths by hand instead of adding the `dirs` crate.)
 
 What is *planned* — priorities, roadmap, design, and decisions — lives
 **only in the docs**, never here. Start at the
-[Roadmap](documentation/modules/ROOT/pages/roadmap.adoc) and
-[Architecture](documentation/modules/ROOT/pages/architecture.adoc).
-(The licence is decided: Apache-2.0 — see the roadmap's _Licensing_ section.)
+[Roadmap](documentation/modules/ROOT/pages/project/roadmap.adoc) and
+[Architecture](documentation/modules/ROOT/pages/explanation/architecture.adoc).
+(The licence is decided: Apache-2.0 — see
+[Licence](documentation/modules/ROOT/pages/project/licence.adoc).)
 
 ## Documentation
 
@@ -107,6 +108,14 @@ What is *planned* — priorities, roadmap, design, and decisions — lives
   (pinned via the npm backend in `mise.toml`) on PATH.
 - UI bundle under `documentation/ui-bundle` (adapted from the Antora Default
   UI; MPL-2.0 — see its `LICENSE` and `NOTICE`).
-- As a Rust learning project: **didactic comments** (the *why* plus the Rust
-  concepts), maintained page
-  [rust-learning-path.adoc](documentation/modules/ROOT/pages/rust-learning-path.adoc).
+- The docs follow **Diátaxis** (https://diataxis.fr/): `tutorials/`, `how-to/`,
+  `reference/`, `explanation/` and `project/` under
+  `documentation/modules/ROOT/pages/`. Put a page in the quadrant that matches
+  what it *does*, and do not mix modes on one page — a how-to explains nothing,
+  an explanation instructs nobody.
+- **No platform is the default.** Name a distribution only where it actually
+  differs (the install command), and prefer the package family — RPM-based,
+  Debian-based, Arch — to a single release. Linux is the subject; macOS is a
+  deviation that lives on its own page for people developing from a Mac.
+- As a Rust learning project: **didactic comments** — the *why* plus the Rust
+  concepts — in the code itself.

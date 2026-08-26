@@ -4,6 +4,7 @@
 ////
 
 = Changelog
+:description: What changed in each release.
 
 User-facing changes, newest first. This page and the RPM's `%changelog`
 (`packaging/rpm/wusel.spec`) describe the same releases and must stay in step —
@@ -11,6 +12,47 @@ the RPM is terse because a package changelog is, this page has room to say why.
 
 The format follows https://keepachangelog.com/en/1.1.0/[Keep a Changelog]; the
 project uses https://semver.org/[Semantic Versioning].
+
+== 0.3.0 — 2026-08-25
+
+=== Added
+
+* **Packages for more than Fedora.** A Debian/Ubuntu `.deb` and an Arch
+  `PKGBUILD` join the Fedora RPM, all three built from hand-written recipes in
+  the repository that compile the same two things and stage the same file
+  layout. RPM and DEB vendor their dependencies and build offline, so they work
+  in the network-less chroot a real build service uses. See
+  xref:how-to/build-a-package.adoc[Build a package].
+
+* **The nightly end-to-end run covers three Nextcloud majors, not one.** The
+  workflow asks Docker Hub which majors are current and tests the newest three.
+  Only the newest is binding; the older two are reported without turning the
+  build red, so an old server cannot cry wolf. A Nextcloud patch release re-arms
+  the run on its own. See
+  xref:reference/platform-support.adoc[Platform support].
+
+=== Changed
+
+* **The documentation is rebuilt on the Diátaxis framework.** Sixteen pages that
+  mixed instruction and explanation became thirty-four that each do one thing:
+  tutorials, how-to guides, reference and explanation. Two consequences worth
+  naming — "how do I install this" now has a single answer instead of three
+  partial ones, and there is at last a reference quadrant, with every CLI
+  command and every `config.toml` key listed.
+
+* **Published documentation URLs have moved** into their quadrant, so
+  `…/architecture.html` is now `…/explanation/architecture.html`. Older
+  versions in the selector keep their own paths.
+
+=== Fixed
+
+* **The `.deb` says which distribution it was built for.** A `.deb` filename
+  carries no distribution of its own, so the release asset is now
+  `wusel_<version>_<arch>_debian13.deb` rather than leaving the reader to guess.
+
+* Several fixes to the end-to-end test's link shaping, which needed privileges
+  the CI runner does not have; those steps now skip loudly and are counted,
+  rather than failing or passing quietly.
 
 == 0.2.2 — 2026-08-24
 
@@ -83,13 +125,13 @@ Fedora/GNOME desktop.
   ticket: the engine view is name-free, no directory is listed, no secret is
   read, and the home path and username are masked. Prints to stdout; `-o PREFIX`
   also writes `PREFIX.txt` and `PREFIX.json`. See
-  xref:troubleshooting.adoc[Troubleshooting].
+  xref:how-to/diagnose-a-problem.adoc[Diagnose a problem].
 
 * **Concurrency.** Every FUSE callback is now an intent handed to a state
   machine that decides and performs no I/O, with database readers, a single
   writer, and network and file pools underneath. 0.1.0 served one request at a
   time; a slow operation no longer blocks unrelated ones. Configurable with
-  `[mount] dispatch_threads`. See xref:concurrency.adoc[Concurrency].
+  `[mount] dispatch_threads`. See xref:explanation/concurrency.adoc[Concurrency].
 * **Choose what a stale pinned file does.** `[sync] refresh_pinned =
   manual | ask | auto` controls whether an out-of-date offline file is fetched
   *unasked*, where `auto` fetches only on an unmetered connection (NetworkManager

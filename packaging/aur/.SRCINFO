@@ -1,0 +1,19 @@
+pkgbase = wusel
+	pkgdesc = Virtual Nextcloud filesystem — Nextcloud, woven into your desktop
+	pkgver = 0.2.2
+	pkgrel = 1
+	url = https://github.com/itbh-at/wusel
+	arch = x86_64
+	arch = aarch64
+	license = Apache-2.0
+	makedepends = rust
+	makedepends = git
+	makedepends = pkgconf
+	makedepends = nautilus
+	depends = fuse3
+	optdepends = nautilus: file-manager integration — sidebar entry, per-file emblems, pin/unpin menu
+	optdepends = gnome-shell: search provider over Nextcloud Unified Search
+	source = wusel-0.2.2.tar.gz::https://github.com/itbh-at/wusel/archive/refs/tags/v0.2.2.tar.gz
+	sha256sums = 3dfb8473be5d08b24cad70e9c435ca9c66f7bad38b88f2afd37d1492c109eac8
+
+pkgname = wusel

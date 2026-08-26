@@ -1,16 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 IT Beratung Hermann GmbH
 
-# Build the Fedora RPM for x86_64 and aarch64 and attach both to a GitHub
-# Release. Triggered by a version tag:
+# Build the Fedora RPM and the Debian/Ubuntu .deb, for x86_64 and aarch64, and
+# attach all four to a GitHub Release. Triggered by a version tag:
 #   git tag v0.1.0 && git push github v0.1.0
 # Or run from the Actions tab to build the packages without releasing them.
-# The RPM version comes from the workspace manifest, the release page's name from
-# the tag. Those are two independent sources, so the rpm job asserts they agree
-# (EXPECT_VERSION -> build-rpm.sh) before anything is built or published;
-# otherwise tagging v0.2.0 without bumping Cargo.toml would publish a page titled
-# v0.2.0 carrying wusel-0.1.0-*.rpm, and succeed while doing it.
-# These are the unsigned community RPMs; signed store builds are separate.
+# The package version comes from the workspace manifest, the release page's
+# name from the tag. Those are two independent sources, so each build job
+# asserts they agree (EXPECT_VERSION -> build-{rpm,deb}.sh --check-version)
+# before anything is built or published; otherwise tagging v0.2.0 without
+# bumping Cargo.toml would publish a page titled v0.2.0 carrying
+# wusel-0.1.0-*.rpm, and succeed while doing it.
+# These are the unsigned community packages; signed store builds are separate.
 name: Release
 
 on:
@@ -30,12 +31,6 @@ on:
 # (actions/upload-artifact uses the runtime token, not GITHUB_TOKEN.)
 permissions:
   contents: read
-
-env:
-  # See ci.yml for both of these; build-rpm.sh calls `mise exec` itself, outside
-  # mise-action's control, which is why the trust path is declared explicitly.
-  MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
-  MISE_AUTO_INSTALL: "false"
 
 defaults:
   run:
@@ -64,11 +59,18 @@ jobs:
       # down — build-rpm.sh skips the comparison when this is empty.
       EXPECT_VERSION: ${{ github.event_name == 'push' && github.ref_name || '' }}
     steps:
-      # Native Fedora build deps (git for checkout; the rest for build-rpm.sh).
+      # Native Fedora build deps (git for checkout; the rest for build-rpm.sh
+      # and wusel.spec's own BuildRequires). rust/cargo come from dnf, not
+      # mise: wusel.spec's %build runs inside rpmbuild's own sandbox via
+      # `rpmbuild --rebuild`, which checks BuildRequires against installed RPM
+      # packages — the same thing COPR/OBS/`mock` do, and exactly why this is
+      # the toolchain to build the *package* with, mise-pinned elsewhere or
+      # not. See the Containerfile comment for the same reasoning.
       - name: Install build dependencies
         run: >
           dnf -y install
-          git gcc make pkgconf-pkg-config
+          git rust cargo
+          gcc make pkgconf-pkg-config
           nautilus-devel glib2-devel fuse3-devel
           rpm-build curl ca-certificates
       # Pinned to a commit SHA — see the note in ci.yml.
@@ -76,22 +78,19 @@ jobs:
         with:
           # Nothing here pushes, and everything here compiles third-party code.
           persist-credentials: false
-      - name: Cache the cargo registry and build artefacts
+      # Only the registry needs caching: the actual compile happens inside
+      # rpmbuild's own isolated build tree (a fresh mktemp per run), not under
+      # $REPO/target — `cargo vendor` is the one step this cache speeds up.
+      - name: Cache the cargo registry
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-            target
           key: ${{ runner.os }}-${{ matrix.arch }}-cargo-rpm-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-${{ matrix.arch }}-cargo-rpm-
-      - uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518 # v4.2.5
-        with:
-          install: false
-      - name: Install the pinned Rust toolchain
-        run: mise install rust
       # Earliest point at which the manifest version can be read the robust way
       # (cargo has to exist first). Runs before the ~30-minute build so a
       # mismatch is reported in seconds, not after a full compile.
@@ -106,28 +105,95 @@ jobs:
           path: dist/*.rpm
           if-no-files-found: error
 
+  deb:
+    name: build DEB (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, arch: x86_64 }
+          - { runner: ubuntu-24.04-arm, arch: aarch64 }
+    runs-on: ${{ matrix.runner }}
+    # Debian, not the runner's own Ubuntu 24.04 (system rustc there is 1.75,
+    # below our MSRV) — see packaging/deb/Containerfile's comment.
+    container: debian:trixie-slim
+    permissions:
+      contents: read
+    timeout-minutes: 60
+    env:
+      EXPECT_VERSION: ${{ github.event_name == 'push' && github.ref_name || '' }}
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: Install build dependencies
+        run: >
+          apt-get update && apt-get install -y --no-install-recommends
+          git ca-certificates
+          build-essential debhelper
+          cargo rustc
+          libnautilus-extension-dev libglib2.0-dev libfuse3-dev pkgconf
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Cache the cargo registry
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ runner.os }}-${{ matrix.arch }}-cargo-deb-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.arch }}-cargo-deb-
+      - name: Check the tag matches the packaged version
+        run: ./packaging/deb/build-deb.sh --check-version
+      - name: Build the .deb
+        run: ./packaging/deb/build-deb.sh
+      # An RPM's filename says what it was built for — `fc44` sits right in it.
+      # A .deb's does not: `wusel_0.2.2_amd64.deb` looks universal while being
+      # linked against trixie's glibc and Nautilus ABI, so somebody will try it
+      # on an older Ubuntu and file a bug. The target goes in as its own token,
+      # deliberately not as a `~deb13` version suffix: the version inside the
+      # package is untouched, and this cannot be misread as one.
+      - name: Name the target in the file
+        run: |
+          for f in dist/wusel_*.deb; do
+            case "$f" in *_debian13.deb) continue ;; esac
+            mv "$f" "${f%.deb}_debian13.deb"
+          done
+          ls -1 dist/*.deb
+      - name: Upload the DEB artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: deb-${{ matrix.arch }}
+          # Not *.deb: dh_strip's automatic dbgsym package would double the
+          # upload for no benefit here (see packaging/deb/README.md).
+          path: dist/wusel_*.deb
+          if-no-files-found: error
+
   release:
     name: publish release
-    # Only a tag publishes. A manual run stops after the RPMs are built and
-    # attached to the run, which is the whole point of being able to try it.
+    # Only a tag publishes. A manual run stops after the packages are built
+    # and attached to the run, which is the whole point of being able to try it.
     if: github.event_name == 'push'
-    needs: rpm
+    needs: [rpm, deb]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # The only job that writes, and it compiles nothing: it just moves the
-    # artifacts the rpm job produced onto the release page.
+    # artifacts the rpm/deb jobs produced onto the release page.
     permissions:
-      contents: write # create the release and upload the RPM assets
+      contents: write # create the release and upload the package assets
     steps:
-      - name: Download the built RPMs
+      - name: Download the built packages
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: dist
-          pattern: rpm-*
+          pattern: "{rpm,deb}-*"
           merge-multiple: true
       - name: Create the GitHub release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
-          files: dist/*.rpm
+          files: |
+            dist/*.rpm
+            dist/*.deb
           fail_on_unmatched_files: true
           generate_release_notes: true

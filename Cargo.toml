@@ -14,9 +14,19 @@ members = [
 # simply does not get it, so a new field added below is only live once the crate
 # manifests reference it.
 [workspace.package]
-version = "0.2.2"
+version = "0.3.0"
 edition = "2021"
-rust-version = "1.97"
+# Distro packaging (RPM/DEB from source, COPR/OBS/AUR) needs this to be the true
+# floor, not "whatever mise happened to pin at scaffold time" (it was 1.97, an
+# unexamined accident, until packaging work measured the real one). 1.85 is
+# Debian 13 (trixie) stable's rustc — the oldest of our packaging targets — and
+# is only reachable because `idna_adapter` is pinned in Cargo.lock to 1.0.0:
+# from 1.2.2 it pulls the icu4x stack (icu_normalizer et al.), which floors at
+# 1.86 on its own. `cargo update -p idna_adapter` silently re-floors this at
+# 1.86 (still fine) or higher in a later idna_adapter release (not fine) —
+# check `cargo check --ignore-rust-version` against the oldest supported
+# compiler before accepting such a bump.
+rust-version = "1.85"
 license = "Apache-2.0"
 authors = ["Christoph D. Hermann <christoph.hermann@itbh.at>"]
 repository = "https://github.com/itbh-at/wusel"

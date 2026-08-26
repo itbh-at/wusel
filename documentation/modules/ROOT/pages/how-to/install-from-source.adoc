@@ -1,0 +1,138 @@
+////
+  // SPDX-License-Identifier: Apache-2.0
+  // Copyright 2026 IT Beratung Hermann GmbH
+////
+
+= Install from source
+:description: Build Wusel yourself and install it as a real program, when no package fits your distribution.
+
+Use this when your distribution has no package
+(xref:reference/packages.adoc[Packages] lists which do). The result is a single
+native binary that needs neither Rust nor mise to run.
+
+If you want to *work on* Wusel rather than just install it, follow
+xref:tutorials/set-up-a-development-environment.adoc[Set up a development
+environment] instead — it covers the same build plus the test suite.
+
+== 1. Build tools
+
+Rust uses the system linker, and the mount needs the FUSE library. Install both.
+
+RPM-based:
+
+[source,sh]
+----
+sudo dnf group install development-tools
+sudo dnf install pkgconf-pkg-config fuse3-devel fuse3
+----
+
+Debian-based:
+
+[source,sh]
+----
+sudo apt update
+sudo apt install build-essential pkg-config libfuse3-dev fuse3
+----
+
+`fuse3-devel` / `libfuse3-dev` are the headers, needed while building; `fuse3`
+is the runtime `fusermount3` helper, needed while running. Missing compiler
+tooling shows up as `error: linker 'cc' not found` — that is this step, not a
+bug.
+
+To build the Nautilus extension as well, add its development files:
+`nautilus-devel glib2-devel gcc make` on RPM-based systems,
+`libnautilus-extension-dev libglib2.0-dev gcc make` on Debian-based ones.
+
+== 2. The toolchain
+
+Wusel pins its exact Rust version with https://mise.jdx.dev[mise], so you do not
+install or manage Rust yourself:
+
+[source,sh]
+----
+curl https://mise.run | sh
+echo 'eval "$(~/.local/bin/mise activate bash)"' >> ~/.bashrc   # zsh: activate zsh, ~/.zshrc
+----
+
+Open a new terminal so the activation takes effect.
+
+IMPORTANT: Activation is the step people miss. Installing mise only puts the
+program on disk; until you activate it, `cargo` is "command not found" even
+though Rust is installed.
+
+== 3. Build
+
+[source,sh]
+----
+git clone https://github.com/itbh-at/wusel.git
+cd wusel
+mise install
+cargo build -p wusel --features fuse --release
+----
+
+`--features fuse` is what compiles the mount in. Without it you get a binary
+that can log in and manage pins but cannot mount anything.
+
+== 4. Install the binary
+
+System-wide, which is the reliable choice because `/usr/local/bin` is always on
+the `PATH`:
+
+[source,sh]
+----
+sudo install -Dm755 target/release/wusel /usr/local/bin/wusel
+----
+
+Or for your user alone, assuming `~/.local/bin` is on your `PATH`:
+
+[source,sh]
+----
+install -Dm755 target/release/wusel ~/.local/bin/wusel
+----
+
+From here it is an ordinary command — `wusel login …`, `wusel mount` — with no
+`cargo run`, no `--features`, no `--` separator.
+
+== 5. Optional: the Nautilus extension
+
+The packages ship this; a source build does not. Building it by hand:
+
+[source,sh]
+----
+cd integration/nautilus
+make
+sudo make install     # the .so into the extension dir, emblem icons into hicolor
+nautilus -q           # restart Nautilus so it loads the extension
+----
+
+`make install` also refreshes the icon cache; `make uninstall` removes both.
+`wusel` must be on the `PATH` for the menu actions to work. The `.so` is tied to
+the Nautilus major version, so it is built against the Nautilus you have.
+
+The GNOME Shell search provider is registered separately, from
+`integration/gnome-search/install.sh`.
+
+== 6. Switch it on
+
+[source,sh]
+----
+wusel login https://cloud.example.org
+wusel service enable
+----
+
+`wusel service enable` writes and enables the systemd user unit for you. Run it
+from the *installed* binary, not through `cargo run`: the service records the
+path of the binary you enabled it with, and one under `target/` breaks the
+moment that directory is cleaned.
+
+== Updating
+
+There is no auto-update. Pull, rebuild, re-install:
+
+[source,sh]
+----
+git pull
+cargo build -p wusel --features fuse --release
+sudo install -Dm755 target/release/wusel /usr/local/bin/wusel
+systemctl --user restart wusel@default
+----
