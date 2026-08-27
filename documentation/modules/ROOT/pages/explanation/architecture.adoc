@@ -5,6 +5,7 @@
 
 = Architecture
 :description: A platform-independent engine plus thin, interchangeable frontends — where the seam runs, and why the mount is the replaceable part.
+:page-aliases: architecture.adoc
 
 Nextcloud's official client avoids a Linux VFS because a single Qt/C++ code base
 is maintained for Windows/macOS/Linux, and Linux would need its own,

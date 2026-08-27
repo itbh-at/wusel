@@ -1,0 +1,7 @@
+# Files listed here are written to the *site root* rather than under the UI
+# output directory. Both have to be there: GitHub Pages reads CNAME to learn
+# which custom domain serves this artifact, and robots.txt points crawlers at
+# the sitemap.
+static_files:
+  - CNAME
+  - robots.txt

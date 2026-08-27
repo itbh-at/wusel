@@ -5,6 +5,7 @@
 
 = Contributing
 :description: How to report a bug, propose a change, and get a patch merged.
+:page-aliases: contributing.adoc
 
 Wusel is developed by https://itbh.at/[*IT Beratung Hermann GmbH (ITBH)*] and is
 open under Apache-2.0. Contributions are welcome — on a simple, honest basis.

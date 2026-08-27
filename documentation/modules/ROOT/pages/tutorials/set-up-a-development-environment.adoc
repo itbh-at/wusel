@@ -5,6 +5,7 @@
 
 = Set up a Wusel development environment
 :description: Work on the Wusel client itself: from a fresh clone to a running build, a passing test suite and a live FUSE mount against the mock server — on Linux.
+:page-aliases: development.adoc
 
 This one is for people who want to *change Wusel's own code*. If you only want
 to use it — to get your Nextcloud files as a folder — you want

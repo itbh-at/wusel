@@ -5,6 +5,7 @@
 
 = Desktop integration
 :description: The sidebar, the emblems, the search and the notifications are four independent, fail-soft channels — what each one costs and why none of them can break the mount.
+:page-aliases: file-manager.adoc
 
 A mounted drive announces itself as a drive. Wusel is trying not to be one: the
 sidebar entry, the emblem on every file, the search that finds your Nextcloud

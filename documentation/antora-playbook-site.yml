@@ -11,6 +11,10 @@
 site:
   title: Wusel
   start_page: wusel::index.adoc
+  # An absolute URL is what makes Antora emit sitemap.xml at all — without it
+  # there is none, and a search engine has to discover every page by following
+  # links. It also makes the canonical URL on each page absolute.
+  url: https://wusel.itbh.at
 
 content:
   sources:
@@ -34,9 +38,22 @@ runtime:
   log:
     format: json
 
+urls:
+  # The Diátaxis restructure moved every page into its section, which broke
+  # every URL a search engine had indexed. `static` makes Antora emit a small
+  # redirect page at each old address, driven by the `page-aliases` attribute on
+  # the page that replaced it — so the old links keep working and the ranking
+  # they earned follows them instead of expiring in a 404.
+  redirect_facility: static
+
 ui:
   bundle:
     url: ui-bundle
+  # Copied verbatim into the site root: the CNAME GitHub Pages needs for the
+  # custom domain (the deploy uploads this directory as the whole site, so a
+  # file added by hand in the repository settings would be gone on the next
+  # build), and robots.txt pointing at the sitemap.
+  supplemental_files: ./supplemental-ui
 
 asciidoc:
   attributes:

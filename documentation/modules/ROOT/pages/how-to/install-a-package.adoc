@@ -5,6 +5,7 @@
 
 = Install a package
 :description: Add the Wusel repository and install with your own package manager — Fedora, openSUSE, Debian, Ubuntu — or take a single file for anything else.
+:page-aliases: installation.adoc
 
 Wusel is published as a *signed repository* through the openSUSE Build Service,
 so your package manager installs it and keeps it up to date like anything else
