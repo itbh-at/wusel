@@ -5,6 +5,7 @@
 
 = Changelog
 :description: What changed in each release.
+:page-aliases: changelog.adoc
 
 User-facing changes, newest first. This page and the RPM's `%changelog`
 (`packaging/rpm/wusel.spec`) describe the same releases and must stay in step —

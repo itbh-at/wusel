@@ -5,6 +5,7 @@
 
 = Roadmap
 :description: What is planned but not built: near-term refinements first, then the larger pieces.
+:page-aliases: roadmap.adoc
 
 What Wusel already does is described throughout this site — start at
 xref:index.adoc[the overview], or at

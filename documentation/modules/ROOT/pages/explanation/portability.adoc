@@ -5,6 +5,7 @@
 
 = Portability
 :description: What a port to another platform actually is here, which knowledge is allowed to live in a frontend, and the two gates that keep the answer checkable.
+:page-aliases: frontends.adoc
 
 NOTE: This page records an **intention**, not shipped behaviour. Only the Linux
 FUSE frontend exists — but the groundwork it argues for is now built, and the

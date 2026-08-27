@@ -5,6 +5,7 @@
 
 = Your Nextcloud files as a folder — on GNOME
 :description: Set up the Wusel client on a GNOME desktop so the files in your Nextcloud appear as an ordinary folder, with sidebar entry, per-file emblems and Shell search.
+:page-aliases: trying-it-out.adoc, tutorials/your-nextcloud-as-a-folder.adoc
 
 Wusel is a *client*. You install it on the machine that should see the files,
 and it makes what lives in your Nextcloud appear there as an ordinary folder —

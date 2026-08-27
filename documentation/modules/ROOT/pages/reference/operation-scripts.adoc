@@ -5,6 +5,7 @@
 
 = Operation scripts
 :description: Which filesystem callback becomes which intent, and the state-machine script each intent runs.
+:page-aliases: fsm-scripts.adoc
 
 NOTE: These scripts are **built and running**, released in 0.2.0. Wusel 0.1.0
 ran every callback as a straight blocking function on one dispatch thread. This

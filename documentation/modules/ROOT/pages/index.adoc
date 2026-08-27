@@ -5,6 +5,7 @@
 
 = Wusel
 :description: Wusel is a virtual file system for Nextcloud on Linux — your files appear in a folder, and are fetched only when you open them.
+:page-aliases: rust-learning-path.adoc
 
 image::wusel-logo.png[Wusel,140,role="right"]
 

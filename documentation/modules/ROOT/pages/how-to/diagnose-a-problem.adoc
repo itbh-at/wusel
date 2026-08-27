@@ -5,6 +5,7 @@
 
 = Diagnose a problem
 :description: Two commands that answer most questions, then a symptom-ordered checklist for the mount, the desktop integration, uploads and the cache.
+:page-aliases: troubleshooting.adoc
 
 Work down this page: the two commands first, then the symptom that matches
 yours. The cases are ordered by how often each has actually bitten.

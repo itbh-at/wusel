@@ -5,6 +5,7 @@
 
 = Licence and what it means for you
 :description: Apache-2.0, who develops and sells Wusel, what is free, what is commercial, and why the split is drawn where it is.
+:page-aliases: distribution.adoc
 
 This page states plainly who is behind Wusel, what is free, and where money is
 involved. We would rather be upfront about the commercial side than pretend it

@@ -5,6 +5,7 @@
 
 = Concurrency: getting off the single dispatch thread
 :description: Why one thread deciding everything was a ceiling, and how a dependency-free state machine over a pool substrate replaced it.
+:page-aliases: concurrency.adoc
 
 NOTE: Wusel 0.1.0 served FUSE requests one at a time. This page is how that
 changed in 0.2.0, why it is shaped the way it is, and how each step is proven.

@@ -5,6 +5,7 @@
 
 = Known limitations
 :description: Behaviour that is deliberate but surprising: what it looks like, why it is that way, and what to do about it.
+:page-aliases: known-limitations.adoc
 
 Behaviour that is understood, reproducible and *not* fixed yet. Every entry says
 what you see, why the software behaves that way, and what removing the

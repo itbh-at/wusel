@@ -1,0 +1,5 @@
+# Wusel documentation — https://wusel.itbh.at/
+User-agent: *
+Allow: /
+
+Sitemap: https://wusel.itbh.at/sitemap.xml
