@@ -76,3 +76,7 @@ icon. Fewer moving parts, and an experience that feels native because it is.
 
 Native frontends for macOS (File Provider) and Windows (Cloud Filter) are
 planned but not built; see the xref:project/roadmap.adoc[roadmap].
+
+Wusel is built by https://itbh.at/en/wusel/[IT Beratung Hermann], who also offer
+commercial support for it. The source is the whole product and always will be —
+xref:project/licence.adoc[Licence] says where the line runs.

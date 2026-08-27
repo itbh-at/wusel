@@ -19,7 +19,8 @@ FUSE only makes the files appear; on top of it sits a full GNOME desktop
 integration (sidebar, emblems, notifications, Shell search). Native macOS
 (File Provider) and Windows (Cloud Filter) frontends remain planned.
 
-**Documentation: <https://wusel.itbh.at/>**
+**Documentation: <https://wusel.itbh.at/>** ·
+**Product page: <https://itbh.at/en/wusel/>**
 
 ## Architecture in one sentence
 
