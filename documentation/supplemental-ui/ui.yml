@@ -1,7 +1,20 @@
 # Files listed here are written to the *site root* rather than under the UI
-# output directory. Both have to be there: GitHub Pages reads CNAME to learn
-# which custom domain serves this artifact, and robots.txt points crawlers at
-# the sitemap.
+# output directory.
+#
+#   CNAME                  GitHub Pages reads it to learn which custom domain
+#                          serves this artifact. It has to come from the build:
+#                          the deploy uploads the built site as the whole thing,
+#                          so a file added by hand would be gone on the next run.
+#   robots.txt             points crawlers at the sitemap.
+#   wusel-social-card.*    the og:image every page points at. The SVG is the
+#                          source and is kept beside it so the card can be
+#                          re-rendered (rsvg-convert -w 1200 -h 630); social
+#                          platforms will not render SVG, hence the PNG.
+#   index.html             replaces the redirect stub Antora generates for the
+#                          site root, which had no metadata at all.
 static_files:
+  - index.html
   - CNAME
   - robots.txt
+  - wusel-social-card.png
+  - wusel-social-card.svg
