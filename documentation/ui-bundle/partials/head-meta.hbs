@@ -1,2 +1,25 @@
     {{!-- Add additional meta tags here --}}
     <meta name="author" content="IT Beratung Hermann GmbH">
+    {{!--
+      Link previews. Without these, sharing a page anywhere social produced a
+      bare title and nothing else — and sharing the bare domain produced
+      Antora's "Redirect Notice", since a crawler does not follow a meta
+      refresh. site.url is what makes the image and URL absolute, which every
+      platform requires.
+    --}}
+    <meta property="og:type" content="website">
+    <meta property="og:site_name" content="{{site.title}}">
+    <meta property="og:title" content="{{#if page.title}}{{{detag page.title}}}{{else}}{{site.title}}{{/if}}">
+    {{#with page.description}}
+    <meta property="og:description" content="{{{detag this}}}">
+    {{/with}}
+    {{#with page.canonicalUrl}}
+    <meta property="og:url" content="{{{this}}}">
+    {{/with}}
+    {{#with site.url}}
+    <meta property="og:image" content="{{{this}}}/wusel-social-card.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    {{/with}}
+    <meta property="og:image:alt" content="Wusel — Nextcloud, woven into your desktop.">
+    <meta name="twitter:card" content="summary_large_image">
