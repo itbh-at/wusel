@@ -19,7 +19,7 @@ FUSE only makes the files appear; on top of it sits a full GNOME desktop
 integration (sidebar, emblems, notifications, Shell search). Native macOS
 (File Provider) and Windows (Cloud Filter) frontends remain planned.
 
-**Documentation: <https://itbh-at.github.io/wusel/>**
+**Documentation: <https://wusel.itbh.at/>**
 
 ## Architecture in one sentence
 
@@ -33,7 +33,7 @@ Details: [Architecture](documentation/modules/ROOT/pages/explanation/architectur
 Order of work: [Roadmap](documentation/modules/ROOT/pages/project/roadmap.adoc). The
 docs are an [Antora](https://antora.org) component under
 [`documentation/`](documentation/), published to
-<https://itbh-at.github.io/wusel/> on every push to `main` (build locally:
+<https://wusel.itbh.at/> on every push to `main` (build locally:
 `./documentation/build.sh`, live: `./documentation/build.sh watch`).
 
 ## Install
