@@ -98,7 +98,7 @@ checkout — there is no separate CI script to keep in sync.
 | *Docs* (`pages.yml`)
 | every push to `main` and every pull request
 | Builds this Antora site; pushes to `main` also publish it to GitHub Pages at
-  https://itbh-at.github.io/wusel/[itbh-at.github.io/wusel]. Pull requests build
+  https://wusel.itbh.at/[wusel.itbh.at]. Pull requests build
   only, as validation.
 
 | *Release* (`release.yml`)
