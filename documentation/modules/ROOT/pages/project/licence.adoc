@@ -27,8 +27,9 @@ Nextcloud's own server (AGPL-3.0) or desktop client (GPL-2.0-or-later).
 
 == Who is behind it
 
-* https://itbh.at/[*IT Beratung Hermann GmbH (ITBH)*] develops `wusel` and
-  holds the copyright and the product brand.
+* https://itbh.at/en/wusel/[*IT Beratung Hermann GmbH (ITBH)*] develops
+  `wusel` and holds the copyright and the product brand. The product page also
+  carries the commercial-support offering.
 * https://ke-online.at/[*KE-Online FlexCo*] distributes the commercial store
   builds and provides commercial support.
 
