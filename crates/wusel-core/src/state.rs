@@ -679,6 +679,21 @@ impl StateDb {
         Ok(())
     }
 
+    /// Drop pending uploads whose node no longer exists, returning how many went.
+    ///
+    /// A removed node's upload is now cleared with the node ([`delete_subtree`]),
+    /// but a database written before that fix can still hold such ghosts — rows
+    /// the uploader retries forever with no buffer to send, showing as permanent
+    /// "waiting" uploads in `wusel status`. A periodic sweep heals them.
+    pub fn remove_orphaned_uploads(&self) -> Result<usize> {
+        let n = self.conn.execute(
+            "DELETE FROM pending_uploads
+             WHERE object_id NOT IN (SELECT inode FROM nodes)",
+            [],
+        )?;
+        Ok(n)
+    }
+
     // --- Pins ("always keep offline") ---------------------------------------
 
     /// The pins of a database written before they moved into their own file.
@@ -798,6 +813,10 @@ fn delete_subtree(tx: &rusqlite::Transaction, inode: u64) -> Result<usize> {
     }
     for ino in &to_delete {
         tx.execute("DELETE FROM nodes WHERE inode = ?1", [ino])?;
+        // A removed node owes no upload. Drop any so it cannot linger as a ghost
+        // "waiting" entry the uploader retries forever with no buffer to send
+        // (which showed up as permanent, unexplained uploads in `wusel status`).
+        tx.execute("DELETE FROM pending_uploads WHERE object_id = ?1", [ino])?;
     }
     Ok(to_delete.len())
 }
@@ -958,6 +977,52 @@ mod tests {
         assert!(db.children_loaded(ROOT_INODE).unwrap());
         let photos = db.child_by_name(ROOT_INODE, "Photos").unwrap().unwrap();
         assert!(!db.children_loaded(photos.inode).unwrap());
+    }
+
+    #[test]
+    fn deleting_a_node_clears_its_pending_upload() {
+        let mut db = StateDb::open_in_memory().unwrap();
+        db.reconcile_children(ROOT_INODE, "", &[entry("Invoice.pdf", false)])
+            .unwrap();
+        let node = db
+            .child_by_name(ROOT_INODE, "Invoice.pdf")
+            .unwrap()
+            .unwrap();
+        db.mark_pending_upload(ObjectId(node.inode), "Invoice.pdf", "e", None)
+            .unwrap();
+        assert_eq!(db.pending_uploads().unwrap().len(), 1);
+
+        // Removing the node (a server-side delete/rename) must take its owed
+        // upload with it — otherwise it lingers as a ghost "waiting" entry.
+        db.remove_subtree(node.inode).unwrap();
+        assert!(
+            db.pending_uploads().unwrap().is_empty(),
+            "a removed node must not leave a pending upload behind"
+        );
+    }
+
+    #[test]
+    fn the_orphan_sweep_clears_only_ghost_uploads() {
+        let mut db = StateDb::open_in_memory().unwrap();
+        db.reconcile_children(ROOT_INODE, "", &[entry("Live.pdf", false)])
+            .unwrap();
+        let live = db.child_by_name(ROOT_INODE, "Live.pdf").unwrap().unwrap();
+        db.mark_pending_upload(ObjectId(live.inode), "Live.pdf", "e", None)
+            .unwrap();
+        // A ghost from an older database: a pending upload whose node is gone.
+        db.mark_pending_upload(ObjectId(999_999), "Gone.pdf", "e", None)
+            .unwrap();
+        assert_eq!(db.pending_uploads().unwrap().len(), 2);
+
+        let removed = db.remove_orphaned_uploads().unwrap();
+        assert_eq!(removed, 1, "only the node-less ghost is swept");
+        let left = db.pending_uploads().unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(
+            left[0].object,
+            ObjectId(live.inode),
+            "the live upload stays"
+        );
     }
 
     #[test]

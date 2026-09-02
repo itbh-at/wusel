@@ -194,9 +194,13 @@ const MAX_BACKOFF_SECS: u64 = 30;
 /// using notices that the server went away — and, more usefully, that it came
 /// back — and can say so (see [`crate::health`]).
 ///
-/// A server that *answers* is not retried: a rejected password, or an OCS
-/// endpoint that is simply not there, will answer the same way forever, and TTL
-/// revalidation is the correct fallback for it.
+/// A server that answers with a *settled* client refusal — a rejected password
+/// (`401`), or an OCS endpoint that is simply not there (`404`) — will answer the
+/// same way forever, so it is not retried and TTL revalidation is the correct
+/// fallback. A transient answer, though, *is* retried (see
+/// [`retriable_for_discovery`]): transport blips, `408`/`429`/`5xx`, and a `403`,
+/// which on the public capabilities endpoint is a proxy/CSRF-window or
+/// brute-force-throttle artifact rather than a real refusal.
 async fn discover(
     client: &reqwest::Client,
     server: &str,
@@ -217,20 +221,39 @@ async fn discover(
                 }
                 return Some(info);
             }
-            Err(e) if e.is_transport() => {
-                if let Some(health) = health {
-                    health.failed(&e);
+            Err(e) if retriable_for_discovery(&e) => {
+                // A transport failure is also a reachability event; a bad status
+                // is the server answering, so it is not.
+                if e.is_transport() {
+                    if let Some(health) = health {
+                        health.failed(&e);
+                    }
                 }
-                tracing::warn!(%e, "notify_push: the server cannot be reached — retrying in {backoff}s");
+                tracing::warn!(%e, "notify_push: capability lookup failed — retrying in {backoff}s");
                 tokio::time::sleep(Duration::from_secs(backoff)).await;
                 backoff = (backoff * 2).min(MAX_BACKOFF_SECS);
             }
             Err(e) => {
-                tracing::warn!(%e, "notify_push: capability lookup failed — relying on TTL");
+                tracing::warn!(%e, "notify_push: capability lookup refused — relying on TTL");
                 return None;
             }
         }
     }
+}
+
+/// Whether a failed capability lookup is worth retrying rather than giving up on
+/// notify_push for the whole session.
+///
+/// Retry transport blips and transient HTTP (`408`/`429`/`5xx`) — and, unlike
+/// [`Error::is_permanent`], also **403**: the capabilities endpoint is public, so
+/// a 403 there is a proxy/CSRF-window or brute-force-throttle artifact during a
+/// connection wobble, not a real permission denial. Treating it as final (the
+/// old behaviour) stranded instant push on TTL until the next restart, even
+/// though the very next request would have succeeded. A genuinely settled client
+/// refusal (`401` bad credentials, `404` no such endpoint, other `4xx`) still
+/// gives up — TTL revalidation is the right fallback there.
+fn retriable_for_discovery(e: &Error) -> bool {
+    e.is_transport() || !e.is_permanent() || matches!(e, Error::HttpStatus { status: 403, .. })
 }
 
 /// One connection: authenticate, then translate events into invalidations until
@@ -335,6 +358,34 @@ fn now_secs() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn http(status: u16) -> Error {
+        Error::HttpStatus {
+            status,
+            message: "test".into(),
+        }
+    }
+
+    #[test]
+    fn discovery_retries_transient_failures_including_403() {
+        // Retriable: a transport blip, transient HTTP, and a 403 (proxy/CSRF/
+        // throttle artifact on the public capabilities endpoint).
+        assert!(retriable_for_discovery(&Error::Http(
+            "connection reset".into()
+        )));
+        assert!(retriable_for_discovery(&http(500)));
+        assert!(retriable_for_discovery(&http(503)));
+        assert!(retriable_for_discovery(&http(429)));
+        assert!(retriable_for_discovery(&http(408)));
+        assert!(
+            retriable_for_discovery(&http(403)),
+            "a 403 during a wobble must not strand push on TTL until restart"
+        );
+        // Settled client refusals: give up, TTL is the right fallback.
+        assert!(!retriable_for_discovery(&http(401)));
+        assert!(!retriable_for_discovery(&http(404)));
+        assert!(!retriable_for_discovery(&http(400)));
+    }
 
     #[test]
     fn classifies_events() {

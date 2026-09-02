@@ -657,8 +657,25 @@ fn uploader_loop(to_fsm: &Sender<Event>, db_path: &std::path::Path, shutdown: &R
     loop {
         // A fresh connection per pass, like the syncer's: cheap, and it never
         // holds the database while it waits.
-        let owed = match StateDb::open_existing(db_path).and_then(|db| db.pending_uploads()) {
-            Ok(pending) => {
+        let owed = match StateDb::open_existing(db_path) {
+            Ok(db) => {
+                // Heal ghost uploads (the node is gone) before resuming the rest,
+                // so a database written before the delete-cascade fix stops
+                // retrying them forever as no-ops. New deletes clear their own.
+                match db.remove_orphaned_uploads() {
+                    Ok(n) if n > 0 => {
+                        tracing::info!(count = n, "uploader: cleared orphaned pending uploads")
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::debug!(%e, "uploader: orphan sweep failed"),
+                }
+                let pending = match db.pending_uploads() {
+                    Ok(pending) => pending,
+                    Err(e) => {
+                        tracing::debug!(%e, "uploader: could not read pending uploads");
+                        Vec::new()
+                    }
+                };
                 let mut owed = 0usize;
                 for p in pending {
                     // `error` records are parked for the user; only `pending`
@@ -680,7 +697,7 @@ fn uploader_loop(to_fsm: &Sender<Event>, db_path: &std::path::Path, shutdown: &R
                 owed
             }
             Err(e) => {
-                tracing::debug!(%e, "uploader: could not read pending uploads");
+                tracing::debug!(%e, "uploader: could not open the state database");
                 0
             }
         };
@@ -1529,10 +1546,7 @@ impl Worker {
                 precondition,
                 mtime,
             } => self.upload(*object, *size, precondition, *mtime),
-            Job::ResolveConflict { object } => match self.resolve_conflict(*object) {
-                Ok(()) => (Completion::Done, Payload::None),
-                Err(e) => failed(job, &e),
-            },
+            Job::ResolveConflict { object } => self.resolve_conflict(*object),
             Job::HydrateBuffer { object } => match self.hydrate_buffer(*object) {
                 Ok(()) => (Completion::Done, Payload::None),
                 Err(e) => failed(job, &e),
@@ -1816,6 +1830,46 @@ impl Worker {
             .store_file(&node, &self.buffer_path(object), &etag)
     }
 
+    /// A publish that was already answered "saved" then failed on the network.
+    ///
+    /// Both server-touching halves of a publish reach here — the direct `PUT`
+    /// (`upload`) and the 412 sub-script (`resolve_conflict`) — so the decision
+    /// is made once and identically:
+    ///
+    /// - **permanent** (a `4xx` that is not `408`/`429`, or `507 Insufficient
+    ///   Storage` — wrong permissions, a name conflict, no quota): tell the user
+    ///   and return [`Failure::Permanent`]. The script's `past_commit` handling
+    ///   (see `wusel-fsm`'s `advance`) then routes it to `SetUploadError`, which
+    ///   parks the record so it is not retried and keeps the buffer so the edit
+    ///   can still be resolved.
+    /// - **transient** (a `5xx`, a timeout, a dropped connection): stay silent —
+    ///   a notice on every attempt is noise — and return [`Failure::Io`], which
+    ///   leaves the record `pending` for the uploader to try again.
+    ///
+    /// The distinction used to live only in the direct `PUT` step; a permanent
+    /// refusal *inside* conflict resolution was flattened to `Failure::Io` by
+    /// `failed_at` and retried forever, and the user was never told. Sharing the
+    /// decision closes that gap for every frontend.
+    fn publish_failed(
+        desktop: &dyn crate::desktop::Desktop,
+        path: &str,
+        e: &crate::Error,
+    ) -> (Completion, Payload) {
+        // The edit is only local now — data at risk — so the tray reflects it.
+        desktop.set_status(crate::desktop::Status::Error);
+        if e.is_permanent() {
+            desktop.notify(&crate::desktop::Notice::UploadFailed {
+                path: path.to_string(),
+                reason: e.to_string(),
+            });
+            tracing::warn!(%path, error = %e, "publish failed permanently; parked");
+            (Completion::Failed(Failure::Permanent), Payload::None)
+        } else {
+            tracing::debug!(%path, error = %e, "publish failed transiently; will retry");
+            (Completion::Failed(Failure::Io), Payload::None)
+        }
+    }
+
     /// Send the buffer to the server under the precondition the machine chose.
     ///
     /// A rejection is not an error: `Rejected` is a step outcome the script has
@@ -1873,52 +1927,39 @@ impl Worker {
             // Not an error: the sub-script resolves it, and it sets the
             // indicator back itself once the bytes are safe somewhere.
             Ok(crate::webdav::PutResult::Conflict) => (Completion::Rejected, Payload::None),
-            Err(e) => {
-                // The edit is only local, which is data at risk and worth
-                // telling the user about — the buffer is kept, so the next
-                // flush retries.
-                write.desktop.set_status(crate::desktop::Status::Error);
-                if e.is_permanent() {
-                    // No retry will fix this — tell the user and park it. The
-                    // buffer is kept, so the change is not lost and can be
-                    // resolved.
-                    write.desktop.notify(&crate::desktop::Notice::UploadFailed {
-                        path: node.path.clone(),
-                        reason: e.to_string(),
-                    });
-                    tracing::warn!(path = %node.path, error = %e, "upload failed permanently; parked");
-                    (Completion::Failed(Failure::Permanent), Payload::None)
-                } else {
-                    // Transient (a 5xx, a timeout, a dropped connection): the
-                    // uploader will retry. Do not notify on every attempt — that
-                    // is noise — and leave the change queued.
-                    tracing::debug!(path = %node.path, error = %e, "upload failed transiently; will retry");
-                    failed_at("upload", &e)
-                }
-            }
+            // A permanent refusal is parked and shown; a transient one is
+            // retried in silence — the same decision the conflict sub-script makes.
+            Err(e) => Self::publish_failed(&*write.desktop, &node.path, &e),
         }
     }
 
     /// The 412 sub-script: merge if we can, otherwise park the bytes beside the
     /// server's version. One implementation, shared with the engine's own path.
-    fn resolve_conflict(&mut self, object: ObjectId) -> crate::Result<()> {
+    fn resolve_conflict(&mut self, object: ObjectId) -> (Completion, Payload) {
         let Some(write) = self.write.clone() else {
-            return Err(crate::Error::Other("no write context".into()));
+            return failed_at("resolve-conflict", &"no write context");
         };
-        // Whichever way it resolves, the bytes end up safe — so the indicator
-        // goes back to Idle when it returns.
-        let Some(node) = self.db.node_by_inode(object.0)? else {
-            return Err(crate::Error::NotFound);
+        let node = match self.db.node_by_inode(object.0) {
+            Ok(Some(n)) => n,
+            Ok(None) => return failed_at("resolve-conflict", &"the row is gone"),
+            Err(e) => return failed_at("resolve-conflict", &e),
         };
         let path = self.buffer_path(object);
-        let size = std::fs::metadata(&path)?.len();
-        let outcome = run_conflict_resolution(&write, &mut self.db, &node, &path, size);
-        write.desktop.set_status(if outcome.is_ok() {
-            crate::desktop::Status::Idle
-        } else {
-            crate::desktop::Status::Error
-        });
-        outcome
+        let size = match std::fs::metadata(&path) {
+            Ok(m) => m.len(),
+            Err(e) => return failed_at("resolve-conflict", &e),
+        };
+        match run_conflict_resolution(&write, &mut self.db, &node, &path, size) {
+            // Whichever way it resolved, the bytes ended up safe.
+            Ok(()) => {
+                write.desktop.set_status(crate::desktop::Status::Idle);
+                (Completion::Done, Payload::None)
+            }
+            // A server write after the local commit failed. Classify it like the
+            // direct PUT: a permanent refusal is parked and the user told once, a
+            // transient one is retried — never a silent forever-loop.
+            Err(e) => Self::publish_failed(&*write.desktop, &node.path, &e),
+        }
     }
 
     /// The shareable half of the engine, or a clear error if this substrate was
@@ -2035,11 +2076,12 @@ impl Worker {
 
 #[cfg(test)]
 mod tests {
-    use super::{withdraw_write, Metered};
-    use crate::desktop::Desktop;
+    use super::{withdraw_write, Metered, Worker};
+    use crate::desktop::{Desktop, Notice, Status};
     use crate::model::is_writable;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use wusel_fsm::{Completion, Failure};
 
     /// Withdrawing the write permission is what makes an outdated offline copy
     /// read-only, so it must actually leave the row non-writable — and the empty
@@ -2135,5 +2177,79 @@ mod tests {
             "a failing step must say what failed — use `failed(job, &e)` or \
              `failed_at(name, &e)`: {offenders:?}"
         );
+    }
+
+    /// Records every notice and the last status, so a decision that must *tell
+    /// the user* can be asserted without a D-Bus round-trip.
+    #[derive(Default)]
+    struct Recording {
+        notices: Mutex<Vec<Notice>>,
+        last_status: Mutex<Option<Status>>,
+    }
+    impl Desktop for Recording {
+        fn notify(&self, n: &Notice) {
+            self.notices.lock().unwrap().push(n.clone());
+        }
+        fn set_status(&self, s: Status) {
+            *self.last_status.lock().unwrap() = Some(s);
+        }
+        fn is_metered(&self) -> Option<bool> {
+            None
+        }
+    }
+
+    fn http(status: u16) -> crate::Error {
+        crate::Error::HttpStatus {
+            status,
+            message: "x".into(),
+        }
+    }
+
+    /// A permanent publish refusal is shown to the user exactly once and returns
+    /// `Permanent`, which the script routes to parking (not an endless retry).
+    #[test]
+    fn a_permanent_publish_failure_notifies_and_parks() {
+        for e in [http(403), http(507), http(409), crate::Error::Denied] {
+            let d = Recording::default();
+            let (completion, _) = Worker::publish_failed(&d, "docs/report.txt", &e);
+            assert_eq!(
+                completion,
+                Completion::Failed(Failure::Permanent),
+                "{e} must park, not retry"
+            );
+            let notices = d.notices.lock().unwrap();
+            assert_eq!(notices.len(), 1, "{e} must tell the user once");
+            assert!(
+                matches!(&notices[0], Notice::UploadFailed { path, .. } if path == "docs/report.txt"),
+                "the notice names the file: {:?}",
+                notices[0]
+            );
+            assert_eq!(*d.last_status.lock().unwrap(), Some(Status::Error));
+        }
+    }
+
+    /// A transient publish failure stays silent (a notice per attempt is noise)
+    /// and returns `Io`, which leaves the record pending for the uploader.
+    #[test]
+    fn a_transient_publish_failure_is_silent_and_retried() {
+        for e in [
+            http(500),
+            http(503),
+            http(429),
+            http(408),
+            crate::Error::Http("[connect] reset".into()),
+        ] {
+            let d = Recording::default();
+            let (completion, _) = Worker::publish_failed(&d, "docs/report.txt", &e);
+            assert_eq!(
+                completion,
+                Completion::Failed(Failure::Io),
+                "{e} must be retried, not parked"
+            );
+            assert!(
+                d.notices.lock().unwrap().is_empty(),
+                "{e} must not notify — retries would spam the user"
+            );
+        }
     }
 }

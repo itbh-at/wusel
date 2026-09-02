@@ -171,6 +171,11 @@ fi
 # with no system-wide preset to apply; each user enables their own instance.
 
 %changelog
+* Thu Aug 27 2026 Christoph D. Hermann <christoph.hermann@itbh.at> - 0.3.2-1
+- A permanently failed upload is now surfaced once instead of retried forever
+  in silence, phantom "waiting" uploads left by a delete or rename are cleared,
+  and notify_push recovers on its own after a transient discovery error.
+
 * Wed Aug 26 2026 Christoph D. Hermann <christoph.hermann@itbh.at> - 0.3.1-1
 - The Debian and Ubuntu packages build again; the documentation installs from
   the signed repository rather than from a downloaded file.

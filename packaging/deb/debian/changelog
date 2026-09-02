@@ -1,3 +1,11 @@
+wusel (0.3.2) unstable; urgency=medium
+
+  * Surface a permanently failed upload instead of retrying it forever in
+    silence; heal phantom "waiting" uploads left by a delete or rename; and
+    let notify_push recover on its own after a transient discovery error.
+
+ -- Christoph D. Hermann <christoph.hermann@itbh.at>  Thu, 27 Aug 2026 17:00:00 +0200
+
 wusel (0.3.1) unstable; urgency=medium
 
   * Keep the vendored Cargo.toml.orig manifests through dh_clean, without which
