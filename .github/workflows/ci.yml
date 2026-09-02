@@ -87,6 +87,11 @@ jobs:
 
       - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
+          # Pin mise itself, not only the action: the action installs the latest
+          # mise otherwise, and a new mise (2027.x changed the npm backend's
+          # layout) breaks a build that passes on the pinned version. Same value
+          # as MISE_VERSION in the Containerfiles — one source of truth.
+          version: 2026.6.10
           install: false
       # Exactly the tools this workflow uses — rust for the cargo tasks, hawkeye
       # for headers-check, shellcheck for the script lint. The docs toolchain is

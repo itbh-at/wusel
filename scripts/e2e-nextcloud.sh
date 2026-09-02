@@ -213,6 +213,18 @@ APP_PASS="$(curl -fsS "${ADMIN[@]}" "${OCS_H[@]}" \
 write_curl_rc "$APP_RC" "$NC_USER" "$APP_PASS"
 AUTH=(--config "$APP_RC")
 
+# A quota on the account, so `statfs` has real numbers to report (step 5b).
+# Nextcloud accounts are unlimited by default, and for an unlimited account it
+# answers `quota-available-bytes` with a negative sentinel — which is not a
+# number a filesystem can advertise, so the mount keeps its placeholder. That
+# is correct behaviour, and it is also why this must be set explicitly here:
+# without it the gate below would be testing the fallback, not the feature.
+curl -fsS "${ADMIN[@]}" "${OCS_H[@]}" -X PUT \
+  -d 'key=quota' -d 'value=10 GB' \
+  "$NC_URL/ocs/v2.php/cloud/users/$NC_USER" >/dev/null \
+  || fail "could not set a storage quota on $NC_USER"
+ok "storage quota set to 10 GB on $NC_USER"
+
 mkdir -p "$XDG_CONFIG_HOME/wusel"
 printf '{"server":"%s","loginName":"%s","appPassword":"%s","in_keyring":false}\n' \
   "$(esc "$NC_URL")" "$(esc "$NC_USER")" "$(esc "$APP_PASS")" \
@@ -224,6 +236,9 @@ cat > "$XDG_CONFIG_HOME/wusel/config.toml" <<EOF
 [sync]
 text_merge = true
 revalidate_secs = 3600
+# Low on purpose, for step 13: the quota is changed on the server mid-run and
+# the mount has to notice within the test's patience, not the 60s default.
+quota_revalidate_secs = 2
 [mount]
 dispatch_threads = 4
 EOF
@@ -280,6 +295,45 @@ for i in $(seq 1 30); do
   [ "$i" = 30 ] && fail "mount never showed merge.txt"
 done
 ok "mounted; merge.txt visible"
+
+# --- 5b. statfs reports the server's real quota, not the placeholder --------
+# `df` on the mount must show the account's Nextcloud quota. There is a
+# mock-backed test for this too, but only a real server proves that the
+# PROPFIND we send is one Nextcloud answers with numbers we can actually use:
+# the mock returns a fixture by construction, while a real instance decides for
+# itself (and answers "unlimited"/"not computed" as a negative sentinel, which
+# leaves the mount on its placeholder). A mount stuck on the placeholder looks
+# exactly like a working one until somebody runs `df` — so assert it here.
+echo ">> checking statfs reports the server's real quota ..."
+q_xml="$(curl -fsS "${AUTH[@]}" -X PROPFIND -H 'Depth: 0' -H 'Content-Type: application/xml' \
+  --data '<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:quota-used-bytes/><d:quota-available-bytes/></d:prop></d:propfind>' \
+  "$DAV/")"
+# Namespace-prefix-agnostic (`d:`, `D:`, none — the server picks): grab the
+# element with its opening tag, then strip everything up to that tag's `>`.
+q_used="$(printf '%s' "$q_xml" | grep -o '<[^>]*quota-used-bytes>[^<]*' | head -1 | sed 's#.*>##')"
+q_avail="$(printf '%s' "$q_xml" | grep -o '<[^>]*quota-available-bytes>[^<]*' | head -1 | sed 's#.*>##')"
+[ -n "$q_avail" ] && [ -n "$q_used" ] || fail "the server did not answer the quota PROPFIND: $q_xml"
+case "$q_avail" in
+  -*) fail "the server reports no usable free space ($q_avail) — the quota set above did not take" ;;
+esac
+want_total=$(( q_used + q_avail ))
+# The mount answers `statfs` from cache and refreshes in the background, so the
+# first reading can still be the placeholder — poll rather than assert once.
+got_total=0
+for _ in $(seq 1 30); do
+    fs_blocks="$(stat -f -c '%b' "$MNT")"
+    fs_bsize="$(stat -f -c '%s' "$MNT")"
+    got_total=$(( fs_blocks * fs_bsize ))
+    # Whole blocks, rounded up — so allow one block of slack either way.
+    if [ "$got_total" -ge $(( want_total - fs_bsize )) ] \
+       && [ "$got_total" -le $(( want_total + fs_bsize )) ]; then
+        break
+    fi
+    sleep 1
+done
+[ "$got_total" -ge $(( want_total - fs_bsize )) ] && [ "$got_total" -le $(( want_total + fs_bsize )) ] \
+  || fail "statfs never reported the server's quota: want ~$want_total bytes, got $got_total"
+ok "statfs reports the server's real quota ($got_total bytes total)"
 
 # --- 5. Read / hydration (also caches the base + its ETag) ------------------
 got="$(cat "$MNT/merge.txt")"
@@ -512,6 +566,57 @@ fi
 else
     skip "step 12 - overlap of concurrent transfers under added latency"
 fi
+
+# --- 13. An account with NO quota must fall back safely --------------------
+# The common case in the field: no quota configured, so Nextcloud answers
+# `quota-available-bytes` with a negative sentinel — no free-space figure a
+# filesystem can advertise. Last, because it changes the account for good.
+# What matters is not the exact number but that the mount stays *usable*:
+# free space must never come out as 0, or applications that check before
+# saving refuse to write at all. Runs after every other gate so the quota is
+# real for those.
+echo ">> removing the account's quota and checking the fallback ..."
+# Retried: this server runs on SQLite and this call lands right after the
+# parallel-transfer steps, where a busy database has answered 500 — a flaky
+# fixture, not a finding about wusel. The gate below is what we are testing.
+quota_cleared=0
+for _ in 1 2 3 4 5; do
+    if curl -fsS "${ADMIN[@]}" "${OCS_H[@]}" -X PUT \
+        -d 'key=quota' -d 'value=none' \
+        "$NC_URL/ocs/v2.php/cloud/users/$NC_USER" >/dev/null 2>&1; then
+        quota_cleared=1
+        break
+    fi
+    sleep 3
+done
+[ "$quota_cleared" = 1 ] || fail "could not clear the storage quota on $NC_USER (5 attempts)"
+q_xml="$(curl -fsS "${AUTH[@]}" -X PROPFIND -H 'Depth: 0' -H 'Content-Type: application/xml' \
+  --data '<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:quota-available-bytes/></d:prop></d:propfind>' \
+  "$DAV/")"
+q_avail="$(printf '%s' "$q_xml" | grep -o '<[^>]*quota-available-bytes>[^<]*' | head -1 | sed 's#.*>##')"
+echo ">> the server now reports quota-available-bytes=${q_avail:-<absent>}"
+# The mount re-reads on its TTL (config.toml pins it low for this run).
+fb_free=0
+fb_total=0
+for _ in $(seq 1 30); do
+    fs_blocks="$(stat -f -c '%b' "$MNT")"
+    fs_avail="$(stat -f -c '%a' "$MNT")"
+    fs_bsize="$(stat -f -c '%s' "$MNT")"
+    fb_total=$(( fs_blocks * fs_bsize ))
+    fb_free=$(( fs_avail * fs_bsize ))
+    # Left the real 10 GB figure behind → the fallback is in effect.
+    [ "$fb_total" -gt 10737418240 ] && break
+    sleep 1
+done
+[ "$fb_free" -gt 0 ] || fail "an account without a quota left the mount reporting 0 bytes free — applications will refuse to save"
+[ "$fb_total" -gt 10737418240 ] \
+  || fail "the mount never fell back after the quota was removed (total still $fb_total bytes)"
+# `quota-used-bytes` stays a real number even with no quota set, so the used
+# figure must survive the fallback — reporting 0 used would throw it away.
+fb_used=$(( fb_total - fb_free ))
+[ "$fb_used" -gt 0 ] \
+  || fail "the fallback reported 0 bytes used, though the server still knows the real figure"
+ok "no quota on the account → usable fallback ($fb_used bytes used, $fb_free free)"
 
 if [ "$SKIPPED" -gt 0 ]; then
     echo ">> E2E PASSED — but $SKIPPED step(s) were SKIPPED for want of link shaping."

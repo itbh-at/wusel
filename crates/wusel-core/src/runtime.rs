@@ -231,6 +231,10 @@ pub struct Context {
     /// runtime, the desktop channel. `None` leaves the network steps unwired,
     /// which is what the substrate-level tests use.
     pub write: Option<WriteContext>,
+    /// Real storage quota for `statfs`, refreshed in the background — see
+    /// [`QuotaCache`]. `None` in the substrate-level tests, for the same
+    /// reason `write` is: there is no WebDAV client to ask.
+    pub quota: Option<Arc<QuotaCache>>,
 }
 
 /// How many threads each pool gets.
@@ -336,6 +340,123 @@ impl Metered {
     }
 }
 
+/// Real Nextcloud storage quota (used/available bytes), refreshed in the
+/// background and served from cache in between.
+///
+/// Modelled on [`Metered`], with one difference: the underlying check here is
+/// a network round-trip, not a local D-Bus call, so it must never block the
+/// caller. `snapshot` always answers immediately with whatever is cached (the
+/// zero value before the first fetch has landed) and, if that is stale,
+/// spawns a refresh on the runtime for *next* time instead of waiting for this
+/// one — `statfs` is asked before every save by some applications, and
+/// blocking that on the network is exactly the kind of FUSE-thread stall the
+/// `put_chunked` "trust the assembled file" check exists to route around
+/// elsewhere.
+pub struct QuotaCache {
+    dav: crate::webdav::WebDavClient,
+    rt: Arc<tokio::runtime::Runtime>,
+    state: Mutex<QuotaCacheState>,
+    ttl: std::time::Duration,
+}
+
+struct QuotaCacheState {
+    quota: crate::model::Quota,
+    fetched_at: Option<std::time::Instant>,
+    /// Set while a background refresh is in flight, so a burst of `statfs`
+    /// calls before it lands triggers one fetch, not one per call.
+    refreshing: bool,
+}
+
+impl QuotaCache {
+    #[must_use]
+    pub fn new(
+        dav: crate::webdav::WebDavClient,
+        rt: Arc<tokio::runtime::Runtime>,
+        ttl: std::time::Duration,
+    ) -> Self {
+        Self {
+            dav,
+            rt,
+            state: Mutex::new(QuotaCacheState {
+                quota: crate::model::Quota::default(),
+                fetched_at: None,
+                refreshing: false,
+            }),
+            ttl,
+        }
+    }
+
+    /// The best known quota right now. Never blocks: if the cache is stale (or
+    /// there is nothing cached yet) and no refresh is already running, one is
+    /// spawned on `rt` for next time; either way this returns immediately with
+    /// whatever was cached going in.
+    #[must_use]
+    pub fn snapshot(self: &Arc<Self>) -> crate::model::Quota {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let stale = state
+            .fetched_at
+            .map(|at| at.elapsed() >= self.ttl)
+            .unwrap_or(true);
+        if stale && !state.refreshing {
+            state.refreshing = true;
+            let this = Arc::clone(self);
+            self.rt.spawn(async move {
+                // Logged at `info`, in pairs (this line, then exactly one
+                // outcome line below). Silence used to be indistinguishable
+                // between "never asked", "still in flight" and "answered with
+                // something unusable" — and `statfs` showing the placeholder
+                // looks identical in all three, so a stuck quota was
+                // undiagnosable from a log without attaching a debugger.
+                tracing::info!("fetching the storage quota");
+                let result = this.dav.quota().await;
+                let mut state = this.state.lock().unwrap_or_else(|e| e.into_inner());
+                state.refreshing = false;
+                match result {
+                    Ok(quota) => {
+                        // `available: None` is a *successful* fetch the server
+                        // answered unusably (unlimited, or not yet computed) —
+                        // reported distinctly, because it leaves `statfs` on the
+                        // placeholder and would otherwise read as a failure.
+                        match quota.available {
+                            Some(available) => tracing::info!(
+                                used = quota.used,
+                                available,
+                                "storage quota updated"
+                            ),
+                            None => tracing::info!(
+                                used = quota.used,
+                                "the server reported no usable free-space figure \
+                                 (unlimited, or not yet computed) — statfs keeps \
+                                 its placeholder"
+                            ),
+                        }
+                        state.quota = quota;
+                        state.fetched_at = Some(std::time::Instant::now());
+                    }
+                    // `fetched_at` is left as it was: a failed first fetch
+                    // (`None`) retries on the very next `snapshot` rather than
+                    // sitting on the placeholder for a whole TTL, and a failed
+                    // refresh of an existing value retries on the next call
+                    // too, since that value is already past its TTL.
+                    Err(e) => {
+                        tracing::warn!(%e, "quota refresh failed; keeping the last known value");
+                    }
+                }
+            });
+        }
+        state.quota
+    }
+
+    /// Start the first fetch now, without waiting for it and without asking for
+    /// a value — for mount start-up, so the answer is usually already in by the
+    /// time anything asks (`statfs`, i.e. `df`). Without it the *first* `df`
+    /// after a mount always reports the placeholder, because that call is what
+    /// triggers the fetch it cannot wait for.
+    pub fn prime(self: &Arc<Self>) {
+        let _ = self.snapshot();
+    }
+}
+
 /// A running substrate. Dropping it stops every thread.
 pub struct Substrate {
     to_fsm: Sender<Event>,
@@ -357,6 +478,8 @@ pub struct Substrate {
     /// Dropped first on teardown, to wake the uploader out of its wait so the
     /// join below does not block for a whole retry interval.
     uploader_shutdown: Option<Sender<()>>,
+    /// See [`Context::quota`].
+    quota: Option<Arc<QuotaCache>>,
 }
 
 impl Substrate {
@@ -507,9 +630,18 @@ impl Substrate {
                 // last of them is gone.
                 done: Mutex::new(Some(done_rx)),
                 uploader_shutdown,
+                quota: ctx.quota.clone(),
             },
             answers_rx,
         ))
+    }
+
+    /// The account's real storage quota right now, or `None` if this substrate
+    /// has no WebDAV client wired up (tests) — the frontend then falls back to
+    /// its own placeholder. Never blocks on the network; see [`QuotaCache`].
+    #[must_use]
+    pub fn quota(&self) -> Option<crate::model::Quota> {
+        self.quota.as_ref().map(QuotaCache::snapshot)
     }
 
     /// A read-only snapshot of what the substrate is doing. See

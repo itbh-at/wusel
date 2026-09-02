@@ -116,7 +116,7 @@ environment].
 
 The diagrams under `documentation/diagrams/*.d2` are rendered to **committed**
 SVGs, and the docs build embeds those — it never runs `d2`, which is why the
-Pages workflow installs nothing but antora. The workflow after editing one:
+Pages workflow installs no more than antora and the search extension. The workflow after editing one:
 
 [source,bash]
 ----

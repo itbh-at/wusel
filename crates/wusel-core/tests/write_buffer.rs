@@ -75,6 +75,7 @@ fn bytes_written_are_read_back_from_the_buffer_not_the_server() {
         invalidate_after: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
         async_upload: true,
         write: None,
+        quota: None,
     };
     let (substrate, answers) = Substrate::start(&ctx, Pools::default()).expect("start");
 
@@ -137,6 +138,7 @@ fn a_second_write_lands_after_the_first_and_keeps_its_bytes() {
         invalidate_after: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
         async_upload: true,
         write: None,
+        quota: None,
     };
     let (substrate, answers) = Substrate::start(&ctx, Pools::default()).expect("start");
 

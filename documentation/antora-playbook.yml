@@ -23,6 +23,14 @@ content:
       start_path: documentation
       version: latest
 
+antora:
+  extensions:
+    # Full-text search. The extension indexes the generated pages and writes the
+    # index beside the site (search-index.js); the search box in the header, the
+    # client-side UI and its stylesheet come from the UI bundle. Everything runs
+    # in the reader's browser — no search server, no external service.
+    - require: '@antora/lunr-extension'
+
 runtime:
   log:
     format: json

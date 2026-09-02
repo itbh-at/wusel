@@ -17,6 +17,18 @@ Antora Default UI
   directory). The layouts, partials, helpers, stylesheet, and images in
   this bundle are derived from that project.
 
+Antora lunr extension (css/search.css)
+--------------------------------------
+  https://gitlab.com/antora/antora-lunr-extension
+  Copyright (c) OpenDevise Inc. and the individual contributors to the
+  Antora lunr extension project.
+  Licensed under the Mozilla Public License, v. 2.0 (LICENSE in this
+  directory). css/search.css is derived from the stylesheet shipped with
+  that extension; the extension itself is not vendored here — it is
+  pinned in mise.toml and loaded at build time. Its remaining browser
+  assets (js/search-ui.js, js/vendor/lunr.js) are added to the site by
+  the extension during the build and are not part of this bundle.
+
 highlight.js (js/vendor/highlight.js)
 -------------------------------------
   https://highlightjs.org/

@@ -125,6 +125,32 @@ many of whom do not read English. Everything else — logs, CLI output, terminal
 errors — stays English. Adding a language is one match arm; a background systemd
 service that does not inherit `LANG` just falls back to English (safe).
 
+[#notify-hook]
+=== Notify hook: reaching a headless box
+
+Every channel above assumes a session bus. A server or a container has none —
+notices there have nowhere to go, `NullDesktop` swallows them, and the first
+sign of trouble is the one thing on this page nobody reads: the journal.
+
+`[desktop] notify_hook` (optional, off by default) closes that gap: a script
+run for every notice, independent of whether a session bus exists at all — it
+still fires from inside the Linux backend's "no session bus" branch, not only
+alongside a working D-Bus connection. It is additive, not a replacement: the
+engine logs every notice at `warn` regardless of whether a hook is configured,
+so there is always a trail in the journal either way. The hook is for an admin
+who wants to *act* on a notice — forward it to mail, a webhook, an alerting
+system — rather than wait for someone to read a log.
+
+The script receives the same localized text a D-Bus toast would show
+(`WUSEL_NOTICE_TITLE`/`_BODY`), plus the raw, unlocalized payload as JSON
+(`WUSEL_NOTICE_JSON` — `kind`, `severity`, and the notice's own fields, from
+`Notice::to_json`) for a script that wants to act on `kind` rather than parse a
+sentence that changes with the user's language. Fire-and-forget with a bounded
+timeout: a missing, non-executable, or hanging script is logged and skipped,
+never allowed to block a notice or the daemon. See
+xref:how-to/set-up-a-notify-hook.adoc[Set up a notify hook] for the concrete
+recipe.
+
 === "Can we reach the server?" — one shared answer (`health::Reachability`)
 
 Of those cases, *the connection is gone* is the one the user cannot diagnose at

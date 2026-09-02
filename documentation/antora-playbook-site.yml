@@ -34,6 +34,15 @@ content:
         'v(?<version>+({0..9}).+({0..9}).+({0..9}))': $<version>
         main: latest
 
+antora:
+  extensions:
+    # Full-text search; see antora-playbook.yml for what the extension adds.
+    - require: '@antora/lunr-extension'
+      # This site carries every release as its own version. Indexing them all
+      # would answer a query with a hit from an old release as readily as from
+      # the current one, so only "latest" goes into the index.
+      index_latest_only: true
+
 runtime:
   log:
     format: json

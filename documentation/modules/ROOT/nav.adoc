@@ -18,6 +18,7 @@
 * xref:how-to/add-another-account.adoc[Add another account]
 * xref:how-to/keep-files-offline.adoc[Keep files offline]
 * xref:how-to/connect-to-a-self-signed-server.adoc[Connect to a server with a private certificate]
+* xref:how-to/set-up-a-notify-hook.adoc[Set up a notify hook]
 * xref:how-to/diagnose-a-problem.adoc[Diagnose a problem]
 * xref:how-to/uninstall.adoc[Uninstall]
 

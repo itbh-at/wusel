@@ -76,8 +76,11 @@ none of the rest.
 
 | No desktop (server, SSH)
 | supported
-| The mount and the CLI. The integration disables itself silently. Note that a
-  headless machine usually has no unlocked keyring either — see
+| The mount and the CLI. The D-Bus channels disable themselves silently — but
+  notices still have a way out here: a
+  xref:how-to/set-up-a-notify-hook.adoc[notify hook] runs a script for each one
+  and needs no session bus. Note that a headless machine usually has no
+  unlocked keyring either — see
   xref:explanation/credentials-and-trust.adoc[Credentials and trust].
 |===
 

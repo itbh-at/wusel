@@ -7,10 +7,15 @@ provider, and the default cloud-provider (sidebar) registration.
 
 ## Build
 
-On a **Fedora** machine (needs `rpm-build gcc make pkgconf nautilus-devel
-glib2-devel fuse3-devel`, plus a Rust toolchain — `mise` is used if present):
+On a **Fedora** machine, with `rpm-build gcc make pkgconf nautilus-devel
+glib2-devel fuse3-devel` **and `rust cargo` installed via `dnf`** (not only
+via `mise` or otherwise on `PATH` — see the comment in `build-rpm.sh` for why
+`rpmbuild --rebuild` needs the `dnf` packages specifically, no matter what
+else provides a working `cargo`):
 
 ```sh
+sudo dnf install rpm-build gcc make pkgconf-pkg-config nautilus-devel \
+    glib2-devel fuse3-devel rust cargo
 ./packaging/rpm/build-rpm.sh
 ```
 

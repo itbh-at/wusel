@@ -82,6 +82,7 @@ fn stopping_does_not_wait_for_a_worker_stuck_in_a_job() {
         invalidate_after: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         async_upload: true,
         write: None,
+        quota: None,
     };
     let (substrate, _answers) = Substrate::start(&ctx, Pools::default()).expect("start");
 

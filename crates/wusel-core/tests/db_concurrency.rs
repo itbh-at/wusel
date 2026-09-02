@@ -81,6 +81,7 @@ fn a_metadata_read_is_served_while_a_write_transaction_is_held() {
         invalidate_after: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
         async_upload: true,
         write: None,
+        quota: None,
     };
     let (substrate, answers) =
         Substrate::start(&ctx, Pools::default()).expect("start the substrate");

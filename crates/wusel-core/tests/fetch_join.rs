@@ -99,6 +99,7 @@ fn a_second_reader_of_the_same_range_joins_the_transfer_in_flight() {
         invalidate_after: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
         async_upload: true,
         write: None,
+        quota: None,
     };
     let (substrate, answers) = Substrate::start(&ctx, Pools::default()).expect("start");
 
@@ -209,6 +210,7 @@ fn an_abandoned_fetch_is_answered_with_an_error_and_leaves_no_slot_behind() {
         invalidate_after: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
         async_upload: true,
         write: None,
+        quota: None,
     };
     let (substrate, answers) = Substrate::start(&ctx, Pools::default()).expect("start");
 

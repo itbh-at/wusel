@@ -92,6 +92,7 @@ fn the_substrate_reports_a_stuck_fetch_while_the_decider_stays_responsive() {
         invalidate_after: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         async_upload: true,
         write: None,
+        quota: None,
     };
     let (substrate, _answers) = Substrate::start(&ctx, Pools::default()).expect("start");
 

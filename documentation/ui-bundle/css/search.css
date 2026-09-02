@@ -1,0 +1,123 @@
+/* Styles for the lunr search UI (@antora/lunr-extension).
+ *
+ * The extension ships a stylesheet of its own and only uses it when the UI
+ * bundle brings none — this file is that opt-out, so the result dropdown wears
+ * the ITBH palette (the --itbh-* variables from site.css) instead of the Antora
+ * default grey. The class names are the extension's contract; keep them.
+ *
+ * Derived from the stylesheet in @antora/lunr-extension, MPL-2.0 — see NOTICE.
+ * The search field itself lives in the navbar and is styled in site.css.
+ */
+
+.search-result-dropdown-menu {
+    position: absolute;
+    z-index: 100;
+    display: block;
+    right: 0;
+    left: inherit;
+    top: 100%;
+    margin: .4rem 0 0;
+    padding: 0;
+    text-align: left;
+    height: auto;
+    background: transparent;
+    border: none;
+    max-width: 600px;
+    min-width: 500px;
+}
+
+@media screen and (max-width:768.5px) {
+    .search-result-dropdown-menu {
+        min-width: calc(100vw - 3.75rem);
+    }
+}
+
+.search-result-dataset {
+    position: relative;
+    border: 1px solid var(--itbh-border);
+    background: #fff;
+    border-radius: .35rem;
+    box-shadow: 0 .5rem 1.5rem rgba(10, 27, 52, .12);
+    overflow: auto;
+    padding: .5rem;
+    max-height: calc(100vh - 5.25rem);
+    line-height: 1.5;
+}
+
+.search-result-item {
+    display: flex;
+    margin-top: .5rem;
+}
+
+/* Component name above its group of hits — only ever shown when the site
+   carries more than one component. */
+.search-result-component-header {
+    color: var(--itbh-navy);
+    border-bottom: 1px solid var(--itbh-border);
+    margin: 0 .5em;
+    padding: .25em 0;
+    font-size: .8rem;
+    font-weight: 500;
+}
+
+.search-result-document-title {
+    width: 33%;
+    border-right: 1px solid var(--itbh-border);
+    color: var(--itbh-navy);
+    font-weight: 500;
+    font-size: .8rem;
+    padding: .5rem .5rem .5rem 0;
+    text-align: right;
+    position: relative;
+    word-wrap: break-word;
+}
+
+.search-result-document-hit {
+    flex: 1;
+    font-size: .75rem;
+    color: #4a5568;
+}
+
+.search-result-document-hit > a {
+    color: inherit;
+    display: block;
+    padding: .55rem .25rem .55rem .75rem;
+    border-radius: .25rem;
+}
+
+.search-result-document-hit > a:hover {
+    background-color: var(--itbh-sky-soft);
+}
+
+.search-result-document-hit .search-result-highlight {
+    color: var(--itbh-blue);
+    background: rgba(26, 143, 227, .12);
+    padding: .1em .05em;
+    font-weight: 500;
+}
+
+.search-result-document-hit .search-result-section-title {
+    color: var(--itbh-navy);
+    font-weight: 500;
+    font-size: 1.05em;
+    margin-bottom: .25em;
+}
+
+.search-result-document-hit .search-result-keywords {
+    margin-top: .25em;
+}
+
+.search-result-document-hit .search-result-keywords-field-label {
+    font-weight: 700;
+}
+
+#search-input:focus {
+    outline: none;
+    border-color: var(--itbh-sky);
+    box-shadow: 0 0 0 2px rgba(26, 143, 227, .2);
+}
+
+#search-field {
+    display: flex;
+    position: relative;
+}

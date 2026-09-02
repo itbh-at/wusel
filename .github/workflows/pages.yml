@@ -72,14 +72,15 @@ jobs:
           fetch-tags: true
       - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
+          version: 2026.6.10 # pin mise; see ci.yml
           install: false
       # The docs are the one place that legitimately needs the node toolchain —
       # but only `antora`. watchexec and browser-sync serve `build.sh watch`
       # locally, d2 renders diagrams whose SVGs are committed, and rust/hawkeye
       # belong to the Rust workflow. Naming them keeps this job's footprint to
       # what the antora build actually uses.
-      - name: Install the pinned docs toolchain (node, antora)
-        run: mise install node "npm:antora"
+      - name: Install the pinned docs toolchain (node, antora, lunr)
+        run: mise install node "npm:antora" "npm:@antora/lunr-extension"
       - name: Build the documentation
         # `site`, not the default: the multi-version, version-selector build.
         run: mise exec -- ./documentation/build.sh site

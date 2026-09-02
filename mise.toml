@@ -12,6 +12,9 @@
 rust = { version = "1.97.1", components = "rustfmt,clippy" }  # components explicit: fresh installs (CI) omit them otherwise
 node = "24"                # runtime for the Antora docs (documentation/build.sh)
 "npm:antora" = "3.1.15"    # the `antora` CLI itself — mise manages npm CLIs via the npm backend
+# Full-text search for the docs. Not a CLI but a library antora `require`s;
+# documentation/build.sh points NODE_PATH at this prefix so antora finds it.
+"npm:@antora/lunr-extension" = "1.0.0-alpha.13"
 watchexec = "2.5.1"        # file-event watcher for `build.sh watch` (no busy-waiting)
 "npm:browser-sync" = "3.0.4"  # live-preview server for `build.sh watch` (serve + open browser + reload)
 "ubi:korandoru/hawkeye" = "6.5.1"  # license-header tool (like spotless); see licenserc.toml
@@ -109,7 +112,7 @@ description = "Interactive Linux shell with /dev/fuse (for testing the mount)"
 run = "./scripts/podman-shell.sh"
 
 [tasks.fuse-test]
-description = "Run the Linux-only tests (FUSE mount e2e, network-home relocation) in the container"
+description = "Run the Linux-only tests (FUSE mount e2e, network-home relocation, wusel-desktop's D-Bus/notify-hook path) in the container"
 run = "./scripts/podman-test.sh"
 
 [tasks.e2e-local]
