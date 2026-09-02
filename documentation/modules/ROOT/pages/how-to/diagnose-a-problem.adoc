@@ -233,6 +233,24 @@ xref:reference/limitations.adoc#cache-clear-needs-unmount[known limitation] rath
 than a technical necessity. If a problem survives `cache clear`, it is not a
 caching problem.
 
+== `df` shows a petabyte
+
+Check which case the mount is in:
+
+[source,sh]
+----
+journalctl --user -u wusel@default | grep quota
+----
+
+`storage quota updated …` means the numbers are the server's. `… no usable
+free-space figure …` means the account has no quota configured, and the size is
+a stand-in — assign the account a quota in Nextcloud (*Administration settings →
+Users*) if you want real numbers. Neither is a fault: see
+xref:reference/limitations.adoc#df-without-a-quota[Known limitations].
+
+No `quota` line at all means the fetch has not finished yet — it runs at mount
+and is retried on access; give it a moment and look again.
+
 == What a conflict should look like
 
 An upload that loses against a newer server version keeps both files: the

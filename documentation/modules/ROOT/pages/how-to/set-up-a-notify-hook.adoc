@@ -1,0 +1,126 @@
+////
+  // SPDX-License-Identifier: Apache-2.0
+  // Copyright 2026 IT Beratung Hermann GmbH
+////
+
+= Set up a notify hook
+:description: Run a script on every user notice — the escape hatch for a headless server, where the desktop notification channel has nowhere to go.
+
+On a desktop, a conflicted copy or a failed upload shows up as a notification.
+On a headless server there is no session bus for that notification to reach —
+it is logged and otherwise silently dropped. A *notify hook* is a script Wusel
+runs for every notice, so something still happens: mail an admin, post to a
+webhook, page whoever is on call.
+
+This is additive, not a replacement for watching the journal
+(`journalctl --user -u wusel@default`) — logging happens either way. Set this
+up if nobody actively watches the journal, or as a second, faster path on top
+of it. See xref:explanation/desktop-integration.adoc#notify-hook[why this
+exists] for the reasoning.
+
+== Write the script
+
+The script is invoked with no arguments; everything about the notice arrives
+as environment variables:
+
+[cols="1,3"]
+|===
+| Variable | Contents
+
+| `WUSEL_NOTICE_TITLE`
+| The localized title — the same text a desktop toast would show.
+
+| `WUSEL_NOTICE_BODY`
+| The localized body text.
+
+| `WUSEL_NOTICE_JSON`
+| The unlocalized, structured payload: `kind`, `severity`, and the notice's own
+  fields (e.g. `path`, `copy` for a conflict). Use this, not `_TITLE`/`_BODY`,
+  to act on a specific *kind* of notice — it does not change with the server's
+  or user's language.
+|===
+
+A minimal example that mails an admin address, e.g. `/etc/wusel/on-notice`:
+
+[source,sh]
+----
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+set -eu
+
+to="admin@example.org"
+echo "$WUSEL_NOTICE_BODY" | mail -s "wusel: $WUSEL_NOTICE_TITLE" "$to"
+----
+
+An example that only escalates the notices that actually need action, using
+`WUSEL_NOTICE_JSON`'s `kind` field (this needs `jq`):
+
+[source,sh]
+----
+#!/bin/sh
+set -eu
+
+kind=$(printf '%s' "$WUSEL_NOTICE_JSON" | jq -r .kind)
+case "$kind" in
+  upload-failed|connection-lost)
+    curl -fsS -d "$WUSEL_NOTICE_BODY" "https://ntfy.example.org/wusel-alerts"
+    ;;
+  *)
+    ;; # conflict copies, stale-copy notes etc. — journal already has them
+esac
+----
+
+Make it executable:
+
+[source,sh]
+----
+chmod +x /etc/wusel/on-notice
+----
+
+A missing executable bit is the most common way this silently does nothing —
+Wusel checks for it at start-up and logs a warning
+(`journalctl --user -u wusel@default`), but the check cannot run before the
+file exists, so a typo in the path only ever shows up there too.
+
+== Configure it
+
+[source,toml]
+----
+[desktop]
+notify_hook = "/etc/wusel/on-notice"
+----
+
+Restart the mount (or start it, if it was not running) for the setting to take
+effect — see xref:how-to/mount-at-login.adoc[Mount at login] for the
+`systemctl`/`wusel service` commands.
+
+== Test it
+
+There is no dedicated diagnostic command for the hook (unlike
+`wusel desktop notify` for D-Bus) — a notice is, deliberately, a rare event.
+Two ways to check it works:
+
+* *Standalone*, without waiting for a real incident — run the script by hand
+  with the same environment variables it would receive:
++
+[source,sh]
+----
+WUSEL_NOTICE_TITLE="Test" \
+WUSEL_NOTICE_BODY="This is a test." \
+WUSEL_NOTICE_JSON='{"kind":"upload-failed","severity":"error","path":"x","reason":"test"}' \
+  /etc/wusel/on-notice
+----
+* *End to end* — provoke a real notice, e.g. edit a file both locally and on
+  the Nextcloud web UI before the mount re-lists it, which produces a
+  `conflict-copy` notice.
+
+== Keep in mind
+
+* The hook runs with a bounded timeout (currently 10 seconds); a script that
+  hangs longer is killed, logged, and skipped for that notice — it never blocks
+  a notice or the mount.
+* A missing script, a non-executable one, or a non-zero exit is logged and
+  otherwise has no effect — never a reason the mount stops working.
+* The hook fires for every notice, with no built-in rate limiting beyond what
+  already applies to notices themselves (e.g. one notice per hundreds of
+  pinned files going stale together, not hundreds of hook invocations).

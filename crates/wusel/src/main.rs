@@ -475,12 +475,13 @@ fn cmd_mount(account: &Account, mountpoint: Option<&str>) -> anyhow::Result<()> 
         .unwrap_or_else(|_| mountpoint.to_path_buf());
 
     // The platform OS-integration backend (Linux notifications + the file-manager
-    // cloud-provider status for this account's mountpoint; a no-op elsewhere or
-    // when D-Bus is absent — fail-soft). Built *before* the first network call,
-    // not after the provider: the very first thing that can go wrong is that the
-    // server cannot be reached, and a start-up that says nothing is exactly the
-    // silence this exists to break.
-    let desktop = wusel_desktop::backend(account.name(), &target);
+    // cloud-provider status for this account's mountpoint, plus the notify-hook
+    // script if configured; a no-op elsewhere or when D-Bus is absent —
+    // fail-soft). Built *before* the first network call, not after the provider:
+    // the very first thing that can go wrong is that the server cannot be
+    // reached, and a start-up that says nothing is exactly the silence this
+    // exists to break.
+    let desktop = wusel_desktop::backend(account.name(), &target, settings.notify_hook.as_deref());
     // One shared answer to "can we reach the server?", fed by every request the
     // engine makes, and the only thing allowed to notify about it.
     let health = std::sync::Arc::new(wusel_core::health::Reachability::new(
@@ -1331,11 +1332,12 @@ fn cmd_unpin(account: &Account, path: &str) -> anyhow::Result<()> {
 /// fail. The state is already correct either way; this is only how quickly it
 /// is *shown*.
 fn announce_emblem(account: &Account, remote: &str) {
-    let mount = account
-        .settings()
+    let settings = account.settings();
+    let mount = settings
         .mount_point
+        .clone()
         .unwrap_or_else(|| account.default_mountpoint());
-    let desktop = wusel_desktop::backend(account.name(), &mount);
+    let desktop = wusel_desktop::backend(account.name(), &mount, settings.notify_hook.as_deref());
     desktop.file_changed(&mount.join(remote).to_string_lossy());
 }
 

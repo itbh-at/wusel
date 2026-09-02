@@ -23,6 +23,22 @@ pub struct RemoteEntry {
     pub permissions: String,
 }
 
+/// The account's storage quota, from a WebDAV `PROPFIND` on the account root
+/// (`quota-used-bytes` / `quota-available-bytes`) — the same properties the
+/// official client reads for its storage bar.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Quota {
+    /// Bytes already used.
+    pub used: u64,
+    /// Bytes still free, or `None` if the server did not report a usable
+    /// number. Nextcloud encodes "unlimited" and "quota not yet computed" as
+    /// negative values rather than omitting the property, and a negative
+    /// value fails to parse as a `u64` — which collapses both of those (and
+    /// anything else non-numeric) into "we don't actually know", rather than
+    /// risking a wrong guess at which sentinel means what.
+    pub available: Option<u64>,
+}
+
 /// The last path segment of a server-relative path — a child's own name.
 ///
 /// One definition for the whole crate: state and provider both need it, and both

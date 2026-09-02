@@ -866,6 +866,21 @@ fn entry_xml(cfg: &Config, rel: &str, meta: &Metadata) -> String {
         )
     };
 
+    // Real Nextcloud only reports quota on the account root, and the client
+    // only ever asks there (a Depth-0 PROPFIND of it) — so that is the only
+    // place the mock renders it. `used` mirrors the served tree's real size,
+    // so a test can assert against a number it did not have to hardcode
+    // separately; `available` is a fixed, arbitrary "still room" figure.
+    let quota = if is_dir && rel.is_empty() {
+        format!(
+            "\x20     <d:quota-used-bytes>{}</d:quota-used-bytes>\n\
+             \x20     <d:quota-available-bytes>1000000000</d:quota-available-bytes>\n",
+            dir_size(&cfg.root)
+        )
+    } else {
+        String::new()
+    };
+
     format!(
         "  <d:response>\n\
          \x20   <d:href>{href}</d:href>\n\
@@ -874,9 +889,25 @@ fn entry_xml(cfg: &Config, rel: &str, meta: &Metadata) -> String {
          \x20     <d:getlastmodified>{last_modified}</d:getlastmodified>\n\
          \x20     <d:getetag>\"{etag}\"</d:getetag>\n\
          \x20     <oc:fileid>{file_id}</oc:fileid>\n\
+         {quota}\
          \x20   </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>\n\
          \x20 </d:response>\n"
     )
+}
+
+/// Recursive total size of every regular file under `path` — the mock's stand-in
+/// for a real storage quota's "used" figure.
+fn dir_size(path: &Path) -> u64 {
+    let Ok(rd) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    rd.flatten()
+        .map(|e| match e.metadata() {
+            Ok(m) if m.is_dir() => dir_size(&e.path()),
+            Ok(m) => m.len(),
+            Err(_) => 0,
+        })
+        .sum()
 }
 
 /// Absolute href under the user root, each path segment percent-encoded; a

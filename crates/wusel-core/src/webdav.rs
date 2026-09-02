@@ -17,7 +17,7 @@ use quick_xml::events::Event;
 use quick_xml::Reader;
 use url::Url;
 
-use crate::model::RemoteEntry;
+use crate::model::{Quota, RemoteEntry};
 use crate::{Error, Result};
 
 /// Bytes per chunk for chunked upload NG. Bounds memory to one chunk regardless
@@ -246,6 +246,30 @@ impl WebDavClient {
             .into_iter()
             .next()
             .map(|e| (e.size, e.etag)))
+    }
+
+    /// The account's storage quota, via a Depth-0 `PROPFIND` on the account
+    /// root. See [`Quota`] for how an unusable (unlimited/unknown) server
+    /// answer is told apart from a real byte count.
+    pub async fn quota(&self) -> Result<Quota> {
+        const BODY: &str = r#"<?xml version="1.0"?>
+<d:propfind xmlns:d="DAV:"><d:prop><d:quota-used-bytes/><d:quota-available-bytes/></d:prop></d:propfind>"#;
+        let resp = self
+            .send(
+                self.http
+                    .request(
+                        reqwest::Method::from_bytes(b"PROPFIND").unwrap(),
+                        self.url_for("", true)?,
+                    )
+                    .basic_auth(&self.login_name, Some(&self.app_password))
+                    .header("Depth", "0")
+                    .header("Content-Type", "application/xml")
+                    .body(BODY),
+            )
+            .await?
+            .error_for_status()?;
+        let xml = resp.text().await?;
+        Ok(parse_quota(&xml))
     }
 
     /// Loads (part of) a file. `range` = (start, len) for a range GET.
@@ -880,6 +904,55 @@ fn parse_multistatus(xml: &str, base: &str) -> Result<Vec<RemoteEntry>> {
     Ok(entries)
 }
 
+/// Parses a quota `PROPFIND` response into a [`Quota`].
+///
+/// Same event-walking shape as [`parse_multistatus`], simplified: there is
+/// only ever one `<d:response>` (Depth 0), and both properties are plain text,
+/// so no per-response bookkeeping is needed. A property that is missing,
+/// empty, or holds a negative sentinel value all fall through to `Quota`'s
+/// defaults — see its docs for why that is the safe reading.
+fn parse_quota(xml: &str) -> Quota {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+
+    let mut used = 0u64;
+    let mut available = None;
+    let mut text_target: Option<bool> = None; // Some(true) = used, Some(false) = available
+
+    loop {
+        match reader.read_event() {
+            Err(_) | Ok(Event::Eof) => break,
+            Ok(Event::Start(e)) => {
+                text_target = match local_name(e.name().as_ref()) {
+                    b"quota-used-bytes" => Some(true),
+                    b"quota-available-bytes" => Some(false),
+                    _ => None,
+                };
+            }
+            Ok(Event::Text(t)) => {
+                if let Some(is_used) = text_target {
+                    // A negative number (Nextcloud's "unlimited"/"not yet
+                    // computed" sentinels) does not parse as a `u64` — which is
+                    // exactly the fallback we want, without having to guess
+                    // which negative value means what.
+                    let parsed = t.unescape().ok().and_then(|v| v.parse::<u64>().ok());
+                    if is_used {
+                        used = parsed.unwrap_or(0);
+                    } else {
+                        available = parsed;
+                    }
+                }
+            }
+            // Same reasoning as `parse_multistatus`: any element end disarms a
+            // pending text target, so an empty property never captures a
+            // sibling's text.
+            Ok(Event::End(_)) => text_target = None,
+            _ => {}
+        }
+    }
+    Quota { used, available }
+}
+
 #[derive(Clone, Copy)]
 enum Field {
     Href,
@@ -1132,6 +1205,56 @@ mod tests {
             entries[0].etag, "abc",
             "status text must not leak into the etag"
         );
+    }
+
+    #[test]
+    fn quota_parses_real_numbers() {
+        let xml = r#"<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:">
+  <d:response>
+    <d:href>/remote.php/dav/files/alice/</d:href>
+    <d:propstat><d:prop>
+      <d:quota-used-bytes>123456</d:quota-used-bytes>
+      <d:quota-available-bytes>987654321</d:quota-available-bytes>
+    </d:prop></d:propstat>
+  </d:response>
+</d:multistatus>"#;
+        let quota = parse_quota(xml);
+        assert_eq!(quota.used, 123_456);
+        assert_eq!(quota.available, Some(987_654_321));
+    }
+
+    #[test]
+    fn quota_treats_a_negative_available_as_unusable() {
+        // Nextcloud's "unlimited" and "not yet computed" sentinels are negative
+        // numbers, not an omitted property.
+        let xml = r#"<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:">
+  <d:response>
+    <d:href>/remote.php/dav/files/alice/</d:href>
+    <d:propstat><d:prop>
+      <d:quota-used-bytes>123456</d:quota-used-bytes>
+      <d:quota-available-bytes>-3</d:quota-available-bytes>
+    </d:prop></d:propstat>
+  </d:response>
+</d:multistatus>"#;
+        let quota = parse_quota(xml);
+        assert_eq!(quota.used, 123_456);
+        assert_eq!(quota.available, None);
+    }
+
+    #[test]
+    fn quota_defaults_when_the_server_has_no_such_property() {
+        let xml = r#"<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:">
+  <d:response>
+    <d:href>/remote.php/dav/files/alice/</d:href>
+    <d:propstat><d:prop/></d:propstat>
+  </d:response>
+</d:multistatus>"#;
+        let quota = parse_quota(xml);
+        assert_eq!(quota.used, 0);
+        assert_eq!(quota.available, None);
     }
 
     #[test]

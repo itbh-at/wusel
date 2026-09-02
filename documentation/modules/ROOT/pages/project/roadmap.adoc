@@ -78,6 +78,13 @@ fresh app password is in place.
   shipped docs) and `v0.2.0` → `0.2.0` join the menu, and each `vX.Y.Z` from then
   on appears automatically. Local editing is unaffected — `antora-playbook.yml`
   still previews the working tree via `build.sh` / `build.sh watch`.
+* ✅ **Full-text search over the documentation.** `@antora/lunr-extension` builds
+  a lunr index while the site is generated and ships the browser-side UI, so the
+  search box in the header works with no search server and no external service.
+  The published site indexes `latest` only — a hit never comes from a superseded
+  release. The dropdown wears the site's own palette because the UI bundle
+  carries `css/search.css`, which is what makes the extension leave its default
+  stylesheet out.
 * ⬜ Re-crawl a pinned directory to pick up files added after the pin; prefetch
   policy and exclusion patterns.
 * ✅ **Serve a stale pinned file when the server is unreachable.** It was a

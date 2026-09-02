@@ -144,6 +144,9 @@ pub struct Provider {
     revalidate_secs: u64,
     /// Rate-limit for push-triggered re-lists (see [`crate::config::Settings`]).
     push_floor_secs: u64,
+    /// How long a fetched storage quota is trusted before `statfs` triggers a
+    /// refresh. See [`crate::runtime::QuotaCache`].
+    quota_revalidate_secs: u64,
     /// Opt-in: expose synthetic desktop-indexer exclusion markers at the mount
     /// root (a frontend reads this; see [`Self::exclude_from_indexers`]).
     exclude_from_indexers: bool,
@@ -1077,6 +1080,7 @@ impl Provider {
             content,
             revalidate_secs,
             push_floor_secs: settings.push_floor_secs,
+            quota_revalidate_secs: settings.quota_revalidate_secs,
             exclude_from_indexers: settings.exclude_from_indexers,
             invalidate_after: Arc::new(AtomicI64::new(0)),
             scratch_dir,
@@ -1211,6 +1215,11 @@ impl Provider {
             invalidate_after: Arc::clone(&self.invalidate_after),
             async_upload: self.async_upload,
             write: Some(self.write_context()),
+            quota: Some(Arc::new(crate::runtime::QuotaCache::new(
+                self.dav.clone(),
+                Arc::clone(&self.rt),
+                std::time::Duration::from_secs(self.quota_revalidate_secs),
+            ))),
         }
     }
 

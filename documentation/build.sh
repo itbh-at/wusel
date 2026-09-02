@@ -12,6 +12,29 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# The lunr search extension is a library, not a command: antora `require`s it
+# while building. mise gives every npm package its own prefix, so it is not a
+# sibling of antora's own node_modules and plain module resolution misses it —
+# NODE_PATH is what makes `require: '@antora/lunr-extension'` in the playbooks
+# resolve. mise gives every npm package its own prefix; the module lives *some*
+# levels below it, but not always at the same subpath — mise 2027.x changed the
+# npm layout, and a hardcoded `$prefix/lib/node_modules` (correct on 2026.x)
+# then pointed at nothing, so antora failed with "Cannot find module". Find the
+# module wherever mise actually put it and set NODE_PATH to the directory that
+# holds its `@antora/` scope, so this survives the next layout change too.
+if ! lunr_prefix="$(mise where "npm:@antora/lunr-extension" 2>/dev/null)" || [ -z "$lunr_prefix" ]; then
+  echo "build.sh: @antora/lunr-extension is missing — run: mise install 'npm:@antora/lunr-extension'" >&2
+  exit 1
+fi
+lunr_module="$(find "$lunr_prefix" -type d -path '*/@antora/lunr-extension' -print 2>/dev/null | head -1)"
+if [ -z "$lunr_module" ]; then
+  echo "build.sh: @antora/lunr-extension installed at $lunr_prefix but its module dir was not found" >&2
+  exit 1
+fi
+# NODE_PATH must hold the dir *containing* the @antora scope, i.e. two up.
+NODE_PATH="$(cd "$lunr_module/../.." && pwd)"
+export NODE_PATH
+
 # Diagrams are pre-rendered committed SVGs (see diagrams/ and `mise run
 # docs-diagrams`), so this build needs nothing beyond antora — no server.
 #

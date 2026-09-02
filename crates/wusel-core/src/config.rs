@@ -272,6 +272,7 @@ pub fn list_accounts() -> Vec<String> {
 /// [sync]
 /// revalidate_secs = 30   # re-list a directory older than this (no-push fallback)
 /// push_floor_secs = 5    # min interval between push-triggered re-lists of a dir
+/// quota_revalidate_secs = 60  # how long a fetched storage quota is trusted
 /// text_merge = false     # opt-in: 3-way-merge text on conflict (else a copy)
 /// refresh_pinned = "ask" # manual | ask | auto — what to do when a pinned
 ///                        # file's server copy has moved on
@@ -290,6 +291,9 @@ pub fn list_accounts() -> Vec<String> {
 /// point = "/home/you/Wusel"            # where `mount` (with no path) attaches
 /// [desktop]
 /// exclude_from_indexers = true         # default; false = allow GNOME Tracker to index
+/// notify_hook = "/etc/wusel/on-notice" # optional: run this on every user notice — the
+///                                       # escape hatch for headless boxes with no D-Bus
+///                                       # session (see the notify-hook how-to)
 /// ```
 #[derive(Debug, Clone)]
 pub struct Settings {
@@ -300,6 +304,12 @@ pub struct Settings {
     /// hammering the same directory) into at most one PROPFIND per window, while
     /// still reacting to real changes within a few seconds.
     pub push_floor_secs: u64,
+    /// How long a fetched Nextcloud storage quota (`statfs`'s notion of total
+    /// / free space) is trusted before it is refreshed. Deliberately coarser
+    /// than `revalidate_secs`: quota changes far less often than a directory's
+    /// contents, and a refresh is a request some applications trigger before
+    /// every save.
+    pub quota_revalidate_secs: u64,
     pub cache_max_bytes: Option<u64>,
     pub cache_max_age_secs: Option<u64>,
     pub tls: TlsSettings,
@@ -353,6 +363,13 @@ pub struct Settings {
     /// storm. Set `false` to opt back in to indexing. (KDE Baloo ignores markers
     /// — it needs a config-based exclude, a later addition.)
     pub exclude_from_indexers: bool,
+    /// A script run on every [`crate::desktop::Notice`], in addition to the
+    /// platform notification. **Off by default.** The escape hatch for a
+    /// headless box with no D-Bus session (a server, a container): the notice
+    /// still reaches something — journal, mail, a webhook — via whatever the
+    /// script does with it. See [`crate::desktop::Notice::to_json`] for what it
+    /// receives.
+    pub notify_hook: Option<PathBuf>,
 }
 
 /// The default dispatch-thread count: the machine's parallelism, floored at 4 so
@@ -371,6 +388,7 @@ impl Default for Settings {
         Self {
             revalidate_secs: 30,
             push_floor_secs: 5,
+            quota_revalidate_secs: 60,
             cache_max_bytes: Some(5 * 1024 * 1024 * 1024), // 5 GiB
             cache_max_age_secs: None,
             tls: TlsSettings::default(),
@@ -387,6 +405,7 @@ impl Default for Settings {
                 .collect(),
             auth_keyring: true,
             exclude_from_indexers: true,
+            notify_hook: None,
         }
     }
 }
@@ -625,6 +644,7 @@ impl UploadMode {
 struct RawSync {
     revalidate_secs: Option<u64>,
     push_floor_secs: Option<u64>,
+    quota_revalidate_secs: Option<u64>,
     text_merge: Option<bool>,
     refresh_pinned: Option<String>,
     open_pinned: Option<String>,
@@ -649,6 +669,7 @@ struct RawAuth {
 #[derive(serde::Deserialize, Default)]
 struct RawDesktop {
     exclude_from_indexers: Option<bool>,
+    notify_hook: Option<String>,
 }
 
 fn parse_settings(text: &str) -> crate::Result<Settings> {
@@ -660,6 +681,9 @@ fn parse_settings(text: &str) -> crate::Result<Settings> {
     }
     if let Some(v) = raw.sync.push_floor_secs {
         s.push_floor_secs = v;
+    }
+    if let Some(v) = raw.sync.quota_revalidate_secs {
+        s.quota_revalidate_secs = v;
     }
     if let Some(v) = raw.sync.ignore_patterns {
         s.ignore_patterns = v; // an explicit list REPLACES the built-in default
@@ -743,6 +767,11 @@ fn parse_settings(text: &str) -> crate::Result<Settings> {
         s.dispatch_threads = n.clamp(1, 16);
     }
     s.exclude_from_indexers = raw.desktop.exclude_from_indexers.unwrap_or(true);
+    s.notify_hook = raw
+        .desktop
+        .notify_hook
+        .filter(|p| !p.is_empty())
+        .map(|p| expand_tilde(&p));
     Ok(s)
 }
 
@@ -876,10 +905,17 @@ mod tests {
     }
 
     #[test]
+    fn parses_quota_revalidate_secs() {
+        let s = parse_settings("[sync]\nquota_revalidate_secs = 120\n").unwrap();
+        assert_eq!(s.quota_revalidate_secs, 120);
+    }
+
+    #[test]
     fn empty_config_uses_defaults() {
         let s = parse_settings("").unwrap();
         assert_eq!(s.revalidate_secs, 30);
         assert_eq!(s.push_floor_secs, 5);
+        assert_eq!(s.quota_revalidate_secs, 60);
         assert!(s.cache_max_bytes.is_some());
         assert_eq!(s.cache_max_age_secs, None);
         // TLS defaults: verify against the OS store, no custom CA.
@@ -901,6 +937,19 @@ mod tests {
     fn desktop_indexing_can_be_opted_back_in() {
         let s = parse_settings("[desktop]\nexclude_from_indexers = false\n").unwrap();
         assert!(!s.exclude_from_indexers);
+    }
+
+    #[test]
+    fn notify_hook_is_off_by_default_and_parses_and_expands_tilde() {
+        assert_eq!(parse_settings("").unwrap().notify_hook, None);
+        let s = parse_settings("[desktop]\nnotify_hook = \"/etc/wusel/on-notice\"\n").unwrap();
+        assert_eq!(
+            s.notify_hook.as_deref(),
+            Some(std::path::Path::new("/etc/wusel/on-notice"))
+        );
+        // Empty string means "not set", same as every other optional path here.
+        let s = parse_settings("[desktop]\nnotify_hook = \"\"\n").unwrap();
+        assert_eq!(s.notify_hook, None);
     }
 
     #[test]

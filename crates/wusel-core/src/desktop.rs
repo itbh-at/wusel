@@ -102,6 +102,58 @@ impl Notice {
             Notice::UploadFailed { .. } | Notice::ConnectionLost { .. } => Severity::Error,
         }
     }
+
+    /// Stable, unlocalized identifier for this notice's kind — the `"kind"` field
+    /// in [`Notice::to_json`]. **A public contract** — keep these strings stable,
+    /// like [`FileState::as_xattr`](crate::provider::FileState::as_xattr): a
+    /// notify-hook script may already be matching on them.
+    fn kind(&self) -> &'static str {
+        match self {
+            Notice::ConflictCopy { .. } => "conflict-copy",
+            Notice::UploadFailed { .. } => "upload-failed",
+            Notice::ConnectionLost { .. } => "connection-lost",
+            Notice::PinnedOutOfDate { .. } => "pinned-out-of-date",
+            Notice::StaleCopyServed { .. } => "stale-copy-served",
+            Notice::ConnectionRestored { .. } => "connection-restored",
+        }
+    }
+
+    /// The raw, **unlocalized** payload — `kind`, `severity`, and this notice's
+    /// own fields as JSON. For the notify-hook's `WUSEL_NOTICE_JSON`: a script
+    /// that wants to act on a specific kind of notice (not just forward the
+    /// human sentence) reads this instead of parsing [`Notice::localize`]'s
+    /// `Message`, which changes with the user's language and wording.
+    pub fn to_json(&self) -> serde_json::Value {
+        let mut fields = match self {
+            Notice::ConflictCopy { path, copy } => {
+                serde_json::json!({ "path": path, "copy": copy })
+            }
+            Notice::UploadFailed { path, reason } => {
+                serde_json::json!({ "path": path, "reason": reason })
+            }
+            Notice::ConnectionLost { server } => serde_json::json!({ "server": server }),
+            Notice::PinnedOutOfDate { count, first } => {
+                serde_json::json!({ "count": count, "first": first })
+            }
+            Notice::StaleCopyServed { path, reason } => serde_json::json!({
+                "path": path,
+                "reason": match reason {
+                    Stale::Unreachable => "unreachable",
+                    Stale::ByChoice => "by-choice",
+                },
+            }),
+            Notice::ConnectionRestored { server } => serde_json::json!({ "server": server }),
+        };
+        // `fields` is always an object literal from the arms above, so indexing
+        // it to add two more members cannot panic.
+        fields["kind"] = serde_json::json!(self.kind());
+        fields["severity"] = serde_json::json!(match self.severity() {
+            Severity::Success => "success",
+            Severity::Warning => "warning",
+            Severity::Error => "error",
+        });
+        fields
+    }
 }
 
 /// Why an outdated copy was served.
@@ -421,5 +473,45 @@ mod tests {
             Notice::ConnectionLost { server: "x".into() }.severity(),
             Severity::Error
         );
+    }
+
+    #[test]
+    fn to_json_carries_kind_severity_and_the_raw_fields() {
+        let v = conflict().to_json();
+        assert_eq!(v["kind"], "conflict-copy");
+        assert_eq!(v["severity"], "warning");
+        assert_eq!(v["path"], "Docs/plan.md");
+        assert_eq!(v["copy"], "Docs/plan (conflicted copy 1700).md");
+    }
+
+    #[test]
+    fn to_json_is_unaffected_by_locale() {
+        // Unlike `localize`, `to_json` never translates — a script matching on
+        // `kind` must not have to handle every language.
+        let en = conflict().to_json();
+        assert_eq!(en["kind"], conflict().to_json()["kind"]);
+        assert!(!en["kind"].as_str().unwrap().is_empty());
+        // Sanity: every variant gets a distinct, non-empty kind.
+        let kinds: std::collections::HashSet<_> = [
+            conflict(),
+            Notice::UploadFailed {
+                path: "x".into(),
+                reason: "y".into(),
+            },
+            Notice::ConnectionLost { server: "x".into() },
+            Notice::ConnectionRestored { server: "x".into() },
+            Notice::PinnedOutOfDate {
+                count: 1,
+                first: "x".into(),
+            },
+            Notice::StaleCopyServed {
+                path: "x".into(),
+                reason: Stale::Unreachable,
+            },
+        ]
+        .iter()
+        .map(|n| n.to_json()["kind"].as_str().unwrap().to_string())
+        .collect();
+        assert_eq!(kinds.len(), 6, "every variant must have a distinct kind");
     }
 }

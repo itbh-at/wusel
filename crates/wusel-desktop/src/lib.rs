@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 IT Beratung Hermann GmbH
 
-//! Linux OS-integration backend behind [`wusel_core::desktop::Desktop`].
+//! OS-integration backend behind [`wusel_core::desktop::Desktop`].
 //!
-//! Two channels, both over one session D-Bus connection via `zbus` (talking the
-//! protocol directly — no higher-level crate, so no second zbus stack):
+//! Four channels. The first three are Linux/GNOME-specific and live in
+//! [`mod@linux`], the fourth is plain `std::process` and works on any platform
+//! this crate builds for:
 //!
 //! * **Notifications** — the engine's notices become freedesktop notifications
 //!   (`org.freedesktop.Notifications.Notify`), localized and severity-styled.
+//!   One session D-Bus connection via `zbus` (talking the protocol directly — no
+//!   higher-level crate, so no second zbus stack).
 //! * **File manager** — the mount registers as an `org.freedesktop.CloudProviders`
 //!   provider (the GNOME/Nautilus + GTK integration), so a file manager shows it
 //!   with a live sync status (idle / syncing / error). The daemon exports the
@@ -15,34 +18,184 @@
 //!   `.desktop` registration file it points at lives in a *system* data dir and is
 //!   installed separately ([`install_provider`]), because the collector scans only
 //!   `$XDG_DATA_DIRS`, never `~/.local/share`.
+//! * **GNOME Shell search** — [`run_search_provider`], its own D-Bus service.
+//! * **Notify hook** (opt-in, `[desktop] notify_hook` in `config.toml`) — a script
+//!   run for every notice. Deliberately **not** gated to Linux: it depends on
+//!   nothing Linux-specific (a subprocess and some environment variables), and a
+//!   headless box — the whole reason it exists — is exactly where the other three
+//!   channels have nowhere to go. See [`run_hook`].
 //!
 //! It is a swappable module: KDE Dolphin (no libcloudproviders — its own KIO /
 //! plugin mechanism), macOS (File Provider) and Windows (Cloud Filter) would each
-//! be their own backend behind the same trait. The daemon injects it with
-//! `Provider::set_desktop`.
+//! be their own backend behind the same trait for their three platform-specific
+//! channels — the notify hook needs no equivalent, it already works there. The
+//! daemon injects the whole thing once via `Provider::set_desktop`.
 //!
 //! **Fail-soft throughout.** The trait methods never block the caller (they hand
 //! work to a worker thread) and never fail: no session bus, no notification
-//! daemon, no file-manager support — the messages are dropped and logged. Desktop
+//! daemon, no file-manager support, no hook configured, a hook that cannot run —
+//! every one of those is dropped and logged, never propagated. Desktop
 //! integration can never affect whether the filesystem works.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use wusel_core::desktop::Desktop;
+use wusel_core::desktop::{Desktop, Notice};
+// `Status` is only needed by `HookOnlyDesktop`, which exists on non-Linux
+// only (see below) — importing it unconditionally would warn as unused on a
+// Linux build, where `mod linux` brings in its own copy instead.
+#[cfg(not(target_os = "linux"))]
+use wusel_core::desktop::Status;
 
 /// The OS-integration backend for this platform, for `Provider::set_desktop`. On
 /// Linux it drives notifications + the file-manager cloud-provider status for the
-/// mount at `mount_path` under `account`. On any other platform it is the engine's
-/// no-op default, so the daemon can call this unconditionally.
+/// mount at `mount_path` under `account`, plus the notify-hook script at `hook`
+/// (if configured). On any other platform, the notify hook is all there is to
+/// offer — `account`/`mount_path` go unused there, kept only so every platform
+/// takes the same signature.
 #[cfg(target_os = "linux")]
-pub fn backend(account: &str, mount_path: &Path) -> Arc<dyn Desktop> {
-    linux::backend(account, mount_path)
+pub fn backend(account: &str, mount_path: &Path, hook: Option<&Path>) -> Arc<dyn Desktop> {
+    if let Some(h) = hook {
+        check_hook(h);
+    }
+    linux::backend(account, mount_path, hook)
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn backend(_account: &str, _mount_path: &Path) -> Arc<dyn Desktop> {
-    wusel_core::desktop::null()
+pub fn backend(_account: &str, _mount_path: &Path, hook: Option<&Path>) -> Arc<dyn Desktop> {
+    match hook {
+        Some(h) => {
+            check_hook(h);
+            Arc::new(HookOnlyDesktop {
+                hook: h.to_path_buf(),
+                locale: wusel_core::desktop::ui_locale(),
+            })
+        }
+        // Nothing configured, nothing this platform can offer on its own —
+        // the true no-op, same as before this function took a `hook` argument.
+        None => wusel_core::desktop::null(),
+    }
+}
+
+/// The `Desktop` backend for a platform with no notification channel of its own
+/// (today: everything but Linux) but a configured notify hook still deserving to
+/// fire — it depends on nothing platform-specific. Status/file-changed have
+/// nowhere to go here and stay the trait's no-op defaults. Only ever
+/// constructed on a non-Linux platform (see `backend` above); cfg-gated so a
+/// Linux build, which never uses it, does not warn about dead code.
+#[cfg(not(target_os = "linux"))]
+struct HookOnlyDesktop {
+    hook: PathBuf,
+    locale: String,
+}
+
+#[cfg(not(target_os = "linux"))]
+impl Desktop for HookOnlyDesktop {
+    fn notify(&self, notice: &Notice) {
+        run_hook(Some(&self.hook), notice, &self.locale);
+    }
+    fn set_status(&self, _status: Status) {}
+}
+
+/// Log once, at start-up, whether the configured notify-hook actually looks
+/// runnable — a missing file or a missing executable bit. Advisory only: it does
+/// not stop the daemon (the file could appear later) and is not the only check —
+/// [`exec_hook`] still handles a failure at run time the same way, since the file
+/// can change between here and then.
+fn check_hook(hook: &Path) {
+    #[cfg(unix)]
+    let runnable = {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(hook).map(|m| m.permissions().mode() & 0o111 != 0)
+    };
+    #[cfg(not(unix))]
+    let runnable = std::fs::metadata(hook).map(|_| true);
+    match runnable {
+        Ok(true) => {}
+        Ok(false) => tracing::warn!(
+            hook = %hook.display(),
+            "notify_hook is not executable — notices will not reach it \
+             until `chmod +x` is run"
+        ),
+        Err(e) => tracing::warn!(
+            %e,
+            hook = %hook.display(),
+            "notify_hook does not exist yet — notices will not reach it \
+             until it does"
+        ),
+    }
+}
+
+/// Fire the notify-hook for one notice, if configured. Hands off to its own
+/// thread immediately — like every `Desktop` method, this must never make the
+/// caller wait on an external script.
+fn run_hook(hook: Option<&Path>, notice: &Notice, locale: &str) {
+    let Some(hook) = hook else { return };
+    let message = notice.localize(locale);
+    let json = notice.to_json().to_string();
+    let hook = hook.to_path_buf();
+    if let Err(e) = std::thread::Builder::new()
+        .name("wusel-notify-hook".into())
+        .spawn(move || exec_hook(&hook, &message.title, &message.body, &json))
+    {
+        tracing::debug!(%e, "could not start the notify-hook thread");
+    }
+}
+
+/// Run one notify-hook invocation to completion, on the calling (dedicated)
+/// thread. `WUSEL_NOTICE_TITLE`/`_BODY` are the localized text (what a desktop
+/// notification would also show, where one exists); `WUSEL_NOTICE_JSON` is the
+/// unlocalized structured payload from [`Notice::to_json`], for a script that
+/// wants to act on `kind` rather than parse a sentence.
+fn exec_hook(hook: &Path, title: &str, body: &str, json: &str) {
+    let mut child = match std::process::Command::new(hook)
+        .env("WUSEL_NOTICE_TITLE", title)
+        .env("WUSEL_NOTICE_BODY", body)
+        .env("WUSEL_NOTICE_JSON", json)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            // Not found, not executable, a permissions problem — all the same to
+            // the caller: the hook did not run. Warn, not debug (see
+            // `check_hook` — this is the same failure, just discovered late).
+            tracing::warn!(%e, hook = %hook.display(), "notify_hook could not start");
+            return;
+        }
+    };
+    // A broken or hanging script must not leak this thread forever: give it a
+    // generous but bounded window, then kill it. Polling rather than a blocking
+    // `wait()` is what makes the kill possible at all.
+    const HOOK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    tracing::debug!(
+                        hook = %hook.display(),
+                        %status,
+                        "notify_hook exited with a non-zero status"
+                    );
+                }
+                return;
+            }
+            Ok(None) if start.elapsed() > HOOK_TIMEOUT => {
+                tracing::warn!(hook = %hook.display(), "notify_hook timed out — killing it");
+                let _ = child.kill();
+                let _ = child.wait();
+                return;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(100)),
+            Err(e) => {
+                tracing::debug!(%e, hook = %hook.display(), "notify_hook: wait failed");
+                return;
+            }
+        }
+    }
 }
 
 /// Deliver a single notification **synchronously**, for the `wusel desktop
@@ -179,11 +332,13 @@ pub fn uninstall_provider(account: &str, dir: &Path) -> std::io::Result<bool> {
 #[cfg(target_os = "linux")]
 mod linux {
     use std::collections::HashMap;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicI32, Ordering};
     use std::sync::mpsc::{channel, Receiver, Sender};
     use std::sync::Arc;
     use std::thread::JoinHandle;
+
+    use super::run_hook;
 
     use wusel_core::desktop::{self, Desktop, Notice, Severity, Status};
     use zbus::blocking::Connection;
@@ -308,13 +463,14 @@ mod linux {
         }
     }
 
-    pub fn backend(account: &str, mount_path: &Path) -> Arc<dyn Desktop> {
+    pub fn backend(account: &str, mount_path: &Path, hook: Option<&Path>) -> Arc<dyn Desktop> {
         let (tx, rx) = channel();
         let account = account.to_string();
         let mount = mount_path.display().to_string();
+        let hook = hook.map(Path::to_path_buf);
         match std::thread::Builder::new()
             .name("wusel-desktop".into())
-            .spawn(move || worker(rx, &account, &mount))
+            .spawn(move || worker(rx, &account, &mount, hook))
         {
             Ok(worker) => Arc::new(LinuxDesktop {
                 tx,
@@ -356,7 +512,7 @@ mod linux {
         }
     }
 
-    fn worker(rx: Receiver<Msg>, account: &str, mount: &str) {
+    fn worker(rx: Receiver<Msg>, account: &str, mount: &str, hook: Option<PathBuf>) {
         let locale = desktop::ui_locale();
         // One session-bus connection for the backend's lifetime; its object server
         // dispatches incoming D-Bus calls on zbus's own task, so it keeps serving
@@ -371,8 +527,16 @@ mod linux {
                     "no session D-Bus — desktop integration disabled \
                      (notifications, file-manager status)"
                 );
-                // Drain so senders (unbounded) never wedge; do nothing with them.
-                while rx.recv().is_ok() {}
+                // The notify hook does not depend on D-Bus — a headless server is
+                // exactly where it matters most, so notices still reach it even
+                // though the desktop channel is down. `Status`/`FileChanged` stay
+                // drained: both are purely D-Bus concerns (cloud-provider status,
+                // file-manager invalidation), nothing a hook script would act on.
+                while let Ok(msg) = rx.recv() {
+                    if let Msg::Notify(notice) = msg {
+                        run_hook(hook.as_deref(), &notice, &locale);
+                    }
+                }
                 return;
             }
         };
@@ -397,10 +561,13 @@ mod linux {
 
         while let Ok(msg) = rx.recv() {
             match msg {
-                Msg::Notify(notice) => match show(&conn, &notice, &locale) {
-                    Ok(()) => tracing::debug!("desktop notification sent"),
-                    Err(e) => tracing::debug!(%e, "desktop notification not shown"),
-                },
+                Msg::Notify(notice) => {
+                    match show(&conn, &notice, &locale) {
+                        Ok(()) => tracing::debug!("desktop notification sent"),
+                        Err(e) => tracing::debug!(%e, "desktop notification not shown"),
+                    }
+                    run_hook(hook.as_deref(), &notice, &locale);
+                }
                 Msg::Status(s) => {
                     status.store(wire_status(s), Ordering::Relaxed);
                     if provider_ok {

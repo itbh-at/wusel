@@ -68,6 +68,16 @@ applies.
   re-listed on next access only if its last listing is older than this, so a
   burst of events collapses into at most one PROPFIND per window.
 
+| `quota_revalidate_secs`
+| integer (seconds)
+| `60`
+| How long a fetched storage quota — what `df` on the mount reports — is
+  trusted before it is refreshed. Coarser than `revalidate_secs` on purpose:
+  a quota changes far less often than a directory's contents, and some
+  applications ask for it before every save. See
+  xref:reference/limitations.adoc#df-without-a-quota[Known limitations] for what
+  `df` shows when the account has no quota at all.
+
 | `text_merge`
 | boolean
 | `false`
@@ -212,6 +222,15 @@ path.
   opening a file caches it, so an indexer walking the mount would hydrate
   everything it touches. KDE Baloo ignores such markers and needs its own
   exclude.
+
+| `notify_hook`
+| path
+| unset
+| Run this script on every user notice, in addition to the desktop
+  notification. Off by default. See
+  xref:how-to/set-up-a-notify-hook.adoc[Set up a notify hook] — it is the
+  escape hatch for a headless box with no D-Bus session, where a notice
+  otherwise reaches nobody.
 |===
 
 == `[state]`
@@ -242,6 +261,7 @@ max_age  = "30d"          # default: age alone never evicts
 [sync]
 revalidate_secs = 60      # default 30
 push_floor_secs = 10      # default 5
+quota_revalidate_secs = 300  # default 60
 text_merge      = true    # default false
 refresh_pinned  = "auto"  # default "ask"
 open_pinned     = "offline"  # default "newest"
@@ -258,7 +278,8 @@ ca_cert = "/etc/pki/tls/certs/my-ca.pem"   # default: OS trust store only
 keyring = false           # default true
 
 [desktop]
-exclude_from_indexers = false   # default true
+exclude_from_indexers = false            # default true
+notify_hook = "/etc/wusel/on-notice"     # default unset
 
 [state]
 db_path = "/var/tmp/wusel/state.sqlite"

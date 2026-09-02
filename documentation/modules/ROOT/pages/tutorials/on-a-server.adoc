@@ -238,7 +238,10 @@ it touches.
   filesystem never depends on it.
 * *The journal is your feedback channel.* `journalctl --user -u wusel@default -f`.
   What would have been a desktop notification — a failed upload, a lost
-  connection — is a `WARN` line there.
+  connection — is a `WARN` line there. Where nobody watches the journal, a
+  xref:how-to/set-up-a-notify-hook.adoc[notify hook] pushes those same few
+  messages somewhere that is watched — mail, a webhook, your alerting. It
+  needs no session bus, which is the point of it.
 * *Watch for parked uploads.* `wusel status` marks an upload `PARKED` when it
   failed permanently, for instance on a full quota. Nothing retries a parked
   upload on its own, and on an unattended machine nobody sees an emblem. Worth a
@@ -252,6 +255,8 @@ it touches.
 ****
 * xref:how-to/diagnose-a-problem.adoc[Diagnose a problem] — `wusel doctor`
   produces a redacted report you can attach to a ticket.
+* xref:how-to/set-up-a-notify-hook.adoc[Set up a notify hook] — the one piece of
+  desktop integration a headless box can still have: a script per notice.
 * xref:reference/configuration.adoc[Configuration reference] — the cache budget
   and `refresh_pinned` are the two worth reading for an unattended machine.
 * xref:reference/files-and-directories.adoc[Files and directories] — every path

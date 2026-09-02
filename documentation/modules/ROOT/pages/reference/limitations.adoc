@@ -152,3 +152,50 @@ manage and simply fail. Leftovers can be found and removed by hand:
 getfattr -R -n user.wusel.state ~ 2>/dev/null   # find copies carrying it
 setfattr -x user.wusel.state <file>             # drop it from one file
 ----
+
+[#df-without-a-quota]
+== `df` reports a stand-in size when the account has no quota
+
+[source,console]
+----
+$ df -h ~/Wusel
+Filesystem      Size  Used Avail Use% Mounted on
+wusel           1.0P  586M  1.0P   1% /home/you/Wusel
+----
+
+The *used* figure is real. The 1 PiB is not: it stands for "free space
+unknown", and it appears whenever the server names no limit for the account.
+
+*Why it happens.* Wusel asks the server for the account's quota (the WebDAV
+properties `quota-used-bytes` and `quota-available-bytes`). An account with no
+quota configured gets a truthful used figure and `-3` for the available one —
+Nextcloud's sentinel for "unlimited". There are two more, `-1` for "not yet
+computed" and `-2` for "unknown". None of them is a number of free bytes, so
+there is nothing to report.
+
+*Why not report zero.* `statfs(2)` says undefined fields are zero, and zero
+free is precisely the answer that makes applications refuse to save before they
+have tried. So the mount advertises a large fixed amount instead — the same
+1 PiB rclone's VFS uses in the same position. The real used figure is added on
+top of it rather than replacing it, so `df` still shows what is actually
+stored.
+
+*What to do about it.* Assign the account a quota in Nextcloud (*Administration
+settings → Users*). `df` then reports the server's real numbers, within
+`quota_revalidate_secs` (xref:reference/configuration.adoc[Configuration]) at
+the latest. Nothing else changes: the placeholder never limited what could be
+stored, it only meant the limit was unknown.
+
+The mount says which case it is in, at `info`, once per fetch:
+
+[source,console]
+----
+$ journalctl --user -u wusel@default | grep quota
+... storage quota updated used=534696340 available=10202721900
+... the server reported no usable free-space figure (unlimited, or not yet
+    computed) — statfs keeps its placeholder used=614388147
+----
+
+The official Nextcloud desktop client hits the same wall and sidesteps it: for
+an unlimited account it shows "X in use" with no total and no bar. A filesystem
+has no such option — `df` has fields that must be filled.

@@ -16,12 +16,14 @@ categories.workspace = true
 # out here makes an accidental `cargo publish` fail instead of claiming a name.
 publish.workspace = true
 
-# wusel-desktop is the **Linux** OS-integration backend behind `wusel_core::desktop::Desktop`:
-# freedesktop notifications (zbus) now, and the file-manager cloud-provider
-# status (libcloudproviders / zbus) as it grows. It is a swappable module — macOS
-# (File Provider) and Windows (Cloud Filter) would be their own crates. The daemon
-# injects it via `Provider::set_desktop`; on any other platform, or when D-Bus is
-# absent, nothing here is used and the engine keeps the no-op default.
+# wusel-desktop is the OS-integration backend behind `wusel_core::desktop::Desktop`.
+# Most of it is Linux-only — freedesktop notifications (zbus), the file-manager
+# cloud-provider status (libcloudproviders / zbus) — behind `cfg(target_os =
+# "linux")`, a swappable module macOS (File Provider) and Windows (Cloud Filter)
+# would each get their own equivalent of. The notify hook (an opt-in script run on
+# every notice) is the one channel that is NOT Linux-gated: it depends on nothing
+# platform-specific, so it stays available everywhere this crate builds, headless
+# boxes included. The daemon injects the whole backend via `Provider::set_desktop`.
 
 [lib]
 name = "wusel_desktop"
@@ -31,8 +33,8 @@ path = "src/lib.rs"
 wusel-core = { path = "../wusel-core" }
 tracing.workspace = true
 
-# The desktop backend is Linux-only (freedesktop D-Bus); elsewhere the crate is an
-# empty stub so `cargo build` stays clean without pulling any D-Bus deps.
+# D-Bus itself stays Linux-only; elsewhere the crate still builds (the notify
+# hook needs nothing here) without pulling in any D-Bus dependency.
 #
 # We talk D-Bus directly via `zbus` — one method call for notifications
 # (`org.freedesktop.Notifications.Notify`), and an exported object for the file

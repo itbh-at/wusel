@@ -60,6 +60,25 @@ async fn propfind_dir_lists_children_over_http() {
 }
 
 #[tokio::test]
+async fn quota_reaches_the_server_over_http() {
+    let base = std::env::temp_dir().join(format!("wusel-mock-dav-quota-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let fixture = base.join("fixture");
+    std::fs::create_dir_all(&fixture).unwrap();
+    std::fs::write(fixture.join("Notes.txt"), vec![b'x'; 4096]).unwrap();
+
+    let mock = common::Mock::serve(&fixture);
+    let dav = client_for(&mock.addr);
+
+    let quota = dav.quota().await.expect("quota should succeed");
+
+    assert_eq!(quota.used, 4096, "the mock reports the fixture's real size");
+    assert_eq!(quota.available, Some(1_000_000_000));
+
+    std::fs::remove_dir_all(&base).ok();
+}
+
+#[tokio::test]
 async fn write_verbs_reach_the_server() {
     let base = std::env::temp_dir().join(format!("wusel-mock-dav-write-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);

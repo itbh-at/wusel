@@ -13,11 +13,18 @@
 # if you are iterating on something not yet committed; this mirrors what an
 # actual release tag would contain, which is the point of testing this way.
 #
-# Run this ON Fedora (needs: rust >= 1.85, cargo, rpm-build, gcc, make, pkgconf,
-# nautilus-devel, glib2-devel, fuse3-devel — mise is used for the Rust
-# toolchain if present, else the system cargo). To build from a macOS host
-# without a Fedora machine, use scripts/podman-rpm.sh, which runs this inside
-# a Fedora container.
+# Run this ON Fedora, with rpm-build, gcc, make, pkgconf, nautilus-devel,
+# glib2-devel, fuse3-devel, AND rust >= 1.85 / cargo installed via `dnf`
+# specifically — not just on PATH. The `cargo vendor` step below happily uses
+# mise's pinned toolchain if present, but `rpmbuild --rebuild` runs its own
+# %build in a buildroot that resolves wusel.spec's BuildRequires only against
+# installed RPM packages, the same as a real COPR/OBS/`mock` build — mise is
+# invisible there no matter what is on this shell's PATH. Skip the `dnf
+# install` and this script still gets partway (the SRPM builds fine), then
+# fails at the rebuild step with "cargo is needed" / "rust >= 1.85 is needed"
+# even though `cargo --version` works right above it. To build from a macOS
+# host without a Fedora machine, use scripts/podman-rpm.sh, which runs this
+# inside a Fedora container that already has the dnf packages.
 #
 # Options / env:
 #   --check-version    validate the version only (see EXPECT_VERSION) and exit

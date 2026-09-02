@@ -426,17 +426,47 @@ impl Filesystem for NcFs {
         }
     }
 
-    /// Filesystem statistics. We are a virtual, server-backed filesystem, so we
-    /// advertise a large capacity with plenty free — otherwise applications that
-    /// check available space before saving would see zero and refuse.
+    /// Filesystem statistics, from the account's real Nextcloud quota where the
+    /// substrate has one cached (see `Substrate::quota`).
+    ///
+    /// Where it does not — nothing fetched yet, or the server answered with no
+    /// usable free-space figure (an account with no quota answers `-3`,
+    /// "unlimited"; there are sentinels for "unknown" and "not yet computed"
+    /// too) — free space is *unknown*, and `statfs` has no way to say so:
+    /// POSIX only says undefined fields are zero, and zero free is exactly what
+    /// makes applications refuse to save. So we advertise a large fixed amount
+    /// free, as every filesystem in this position does (rclone's VFS uses this
+    /// same 1 PiB; davfs2 picks a similar invented figure).
+    ///
+    /// `used` is still reported truthfully there, because Nextcloud answers
+    /// `quota-used-bytes` with a real byte count even when it will not name a
+    /// limit — so `df` shows what is actually stored, with the invented free
+    /// space added on top rather than replacing it. Reporting zero used (which
+    /// is what "1 PiB, all free" amounted to) threw away a number we had.
     fn statfs(&self, _req: &Request_, _ino: INodeNo, reply: ReplyStatfs) {
         const BSIZE: u32 = 512;
-        const TOTAL_BLOCKS: u64 = 1 << 41; // ~1 PiB at 512-byte blocks
+        /// Stands in for "free space unknown" — never a claim about the server.
+        const PLACEHOLDER_FREE_BLOCKS: u64 = 1 << 41; // 1 PiB at 512-byte blocks
         const TOTAL_INODES: u64 = 1 << 32;
+
+        let quota = self.substrate.quota();
+        let (blocks, free) = match quota.and_then(|q| q.available.map(|a| (q.used, a))) {
+            Some((used, available)) => (
+                used.saturating_add(available).div_ceil(u64::from(BSIZE)),
+                available.div_ceil(u64::from(BSIZE)),
+            ),
+            None => {
+                let used_blocks = quota.map_or(0, |q| q.used).div_ceil(u64::from(BSIZE));
+                (
+                    PLACEHOLDER_FREE_BLOCKS.saturating_add(used_blocks),
+                    PLACEHOLDER_FREE_BLOCKS,
+                )
+            }
+        };
         reply.statfs(
-            TOTAL_BLOCKS,
-            TOTAL_BLOCKS,
-            TOTAL_BLOCKS,
+            blocks,
+            free,
+            free,
             TOTAL_INODES,
             TOTAL_INODES,
             BSIZE,
@@ -831,6 +861,12 @@ pub fn mount(mountpoint: &std::path::Path, mut provider: Provider) -> anyhow::Re
     // the network and file pools. The Provider hands over its own parts rather
     // than having us assemble them from pieces we would have to be told about.
     let ctx = provider.substrate_context();
+    // Ask for the storage quota now rather than letting the first `statfs` call
+    // trigger it: that call must not wait for the network (see `QuotaCache`), so
+    // without this the first `df` after every mount reports the placeholder.
+    if let Some(quota) = &ctx.quota {
+        quota.prime();
+    }
     let pools = Pools {
         db_readers: dispatch_threads.max(2),
         net: dispatch_threads.max(4),
