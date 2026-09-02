@@ -14,6 +14,35 @@ the RPM is terse because a package changelog is, this page has room to say why.
 The format follows https://keepachangelog.com/en/1.1.0/[Keep a Changelog]; the
 project uses https://semver.org/[Semantic Versioning].
 
+== 0.3.2 — 2026-08-27
+
+=== Fixed
+
+* **A file that cannot be uploaded now says so, once, instead of retrying
+  forever in silence.** When a save hit a conflict and the server then refused
+  the merged result for good — no quota, a revoked permission — that permanent
+  refusal was mistaken for a transient one, so the upload was retried on every
+  pass and the user was never told. The file read as saved and was not on the
+  server. A permanent failure during conflict resolution is now surfaced and
+  parked exactly like a permanent failure on a direct upload — the contract
+  0.2.0 already promised, now kept in this case too.
+
+* **A deleted or renamed file no longer leaves a phantom upload behind.**
+  Removing a node dropped it from the state but left its pending-upload record,
+  which the uploader then resumed on every pass — no file, no attempt, no error
+  — so it sat in `wusel status` as a "waiting" upload that could never land or
+  clear. The record is now removed with the node, and a one-time sweep heals
+  databases that already carry such leftovers.
+
+* **A brief hiccup at start no longer costs live updates for the whole
+  session.** Discovering the `notify_push` endpoint gave up permanently on a
+  single transient error — most often a 403 from a proxy's CSRF window or a
+  throttle during a connection wobble — stranding the mount on slower TTL
+  revalidation until the next restart. Discovery now retries the same transient
+  failures the uploader does (and treats a 403 on the public capabilities
+  endpoint as transient rather than a real refusal), so instant updates resume
+  on their own once the server does.
+
 == 0.3.1 — 2026-08-26
 
 === Added
