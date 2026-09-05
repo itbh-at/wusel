@@ -21,6 +21,17 @@ pub struct RemoteEntry {
     /// Raw Nextcloud permission letters (`oc:permissions`), e.g. `"RGDNVW"`.
     /// Empty if the server did not report them. See [`is_writable`].
     pub permissions: String,
+    /// What kind of mount this entry sits on (`nc:mount-type`): empty for an
+    /// ordinary folder in the user's own storage, `group` for a Team/Group
+    /// folder, `shared` for a received share, `external`/`external-session`
+    /// for external storage, `collective` for the Collectives app. Empty if
+    /// the server did not report it. See [`is_group_folder_root`].
+    pub mount_type: String,
+    /// Whether this entry is the *root* of that mount (`nc:is-mount-root`)
+    /// rather than something inside it. Nextcloud sets `mount-type` on every
+    /// node within a mount, so this is what separates the folder itself from
+    /// its contents. Absent before Nextcloud 28, where it reads as `false`.
+    pub is_mount_root: bool,
 }
 
 /// The account's storage quota, from a WebDAV `PROPFIND` on the account root
@@ -62,6 +73,27 @@ pub fn is_writable(permissions: &str, is_dir: bool) -> bool {
     } else {
         permissions.contains('W')
     }
+}
+
+/// The `nc:mount-type` value Nextcloud gives a Team/Group folder. Unchanged by
+/// the "Group folders" → "Team folders" rename, which touched only UI strings.
+pub const MOUNT_TYPE_GROUP: &str = "group";
+
+/// Whether this entry is the folder a Team/Group folder is mounted *at* — the
+/// one worth marking in a file manager.
+///
+/// Both halves matter. `mount-type` alone is true for everything *inside* the
+/// folder as well, so marking on that alone would badge every file in it; and
+/// `is-mount-root` alone says nothing about what kind of mount it is. An older
+/// server (before Nextcloud 28) omits `is-mount-root`, which reads as `false`
+/// here — no marking rather than a wrong one, which is the right way to be
+/// wrong.
+///
+/// `oc:permissions` cannot answer this: a group folder carries `M` (mounted)
+/// and no `S` (shared) — but so does external storage.
+#[must_use]
+pub fn is_group_folder_root(mount_type: &str, is_mount_root: bool) -> bool {
+    is_mount_root && mount_type == MOUNT_TYPE_GROUP
 }
 
 // NOTE: earlier revisions kept `Hydration`/`SyncState` enums here, mirrored into

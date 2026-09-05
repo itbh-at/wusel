@@ -182,8 +182,22 @@ pub enum Payload {
     Entries(Vec<NodeRow>),
     /// How many bytes a write accepted.
     Written(u32),
-    /// What an OS integration should draw for this object.
-    State(FileState),
+    /// What an OS integration should draw for this object: its sync state,
+    /// plus whether the object is the root of a Team/Group folder.
+    ///
+    /// The two ride together because they come from the same database read.
+    /// They are separate axes — a group folder is still online-only or cached
+    /// like anything else — so they are separate attributes at the surface,
+    /// not one conflated value.
+    ///
+    /// The state is optional: a directory has no content of its own and so no
+    /// emblem, yet it can still be a group-folder root. Keeping the state an
+    /// `Option` lets that kind travel even when there is no state to report —
+    /// see [`Self::read_state`].
+    State {
+        state: Option<FileState>,
+        group_root: bool,
+    },
 }
 
 /// A finished request, on its way back to whoever asked.
@@ -1538,7 +1552,9 @@ impl Worker {
                 Err(e) => failed(job, &e),
             },
             Job::ReadState { object, buffered } => match self.read_state(*object, *buffered) {
-                Ok(state) => (Completion::StateKnown, Payload::State(state)),
+                Ok((state, group_root)) => {
+                    (Completion::StateKnown, Payload::State { state, group_root })
+                }
                 Err(e) => failed(job, &e),
             },
             Job::TruncateBuffer { object, size } => match self.truncate_buffer(*object, *size) {
@@ -1837,7 +1853,29 @@ impl Worker {
     /// `buffered` comes from the machine and is not re-derived here: an unsaved
     /// edit is the most actionable thing there is, and it is knowledge only the
     /// machine holds.
-    fn read_state(&mut self, object: ObjectId, buffered: bool) -> crate::Result<FileState> {
+    fn read_state(
+        &mut self,
+        object: ObjectId,
+        buffered: bool,
+    ) -> crate::Result<(Option<FileState>, bool)> {
+        let Some(node) = self.db.node_by_inode(object.0)? else {
+            return Err(crate::Error::NotFound);
+        };
+        let group_root = node.group_root;
+        match self.sync_state(object, buffered) {
+            Ok(state) => Ok((Some(state), group_root)),
+            // `sync_state` reports an unpinned directory as `NotFound`: it has no
+            // content of its own, hence no emblem. That absence must not swallow
+            // the folder's kind — a group folder's root is always a directory,
+            // so this is the one path its marker travels.
+            Err(crate::Error::NotFound) if node.is_dir => Ok((None, group_root)),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The sync state alone — see [`Self::read_state`], which pairs it with the
+    /// folder's kind.
+    fn sync_state(&mut self, object: ObjectId, buffered: bool) -> crate::Result<FileState> {
         // A committed change on its way to the server — or parked after a
         // permanent failure — is the state the user most needs to see, so it
         // trumps everything else, including the still-open buffer it rides on.

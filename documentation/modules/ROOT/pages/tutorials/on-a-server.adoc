@@ -20,6 +20,15 @@ By the end of this a machine with no graphical session will have your Nextcloud
 mounted at `~/Wusel`, the mount will survive you logging out, and you will have
 verified it from the terminal alone. About fifteen minutes.
 
+Here is what that looks like — a real session against a real Nextcloud, which is
+all a server ever gives you: no desktop, just the mount and the terminal.
+
+// Recorded by scripts/demo-nextcloud.sh; the player is lazy-loaded by the UI bundle.
+[subs=attributes+]
+++++
+<div class="asciinema" data-cast="{attachmentsdir}/wusel-demo.cast" data-cols="90" data-rows="28"></div>
+++++
+
 Two things differ from a desktop, and both are the reason this page exists
 rather than a note on another one: there is no keyring to store the password in,
 and there is no login session to hang the service off.

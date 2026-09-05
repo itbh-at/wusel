@@ -22,6 +22,23 @@ integration (sidebar, emblems, notifications, Shell search). Native macOS
 **Documentation: <https://wusel.itbh.at/>** ·
 **Product page: <https://itbh.at/en/wusel/>**
 
+## What it looks like
+
+The whole account appears as a folder; each file is fetched only when opened,
+and you can pin the ones to keep offline — a real session against a real
+Nextcloud:
+
+<p align="center">
+  <img src="documentation/modules/ROOT/images/wusel-demo.gif" alt="Terminal: the whole Nextcloud listed as ~/Wusel, a file opened on demand, a folder pinned offline, and the mount's live status" width="760">
+</p>
+
+In a file manager, every file carries its state as an emblem — online-only,
+cached, or pinned offline:
+
+<p align="center">
+  <img src="documentation/modules/ROOT/images/wusel-nautilus.png" alt="GNOME Files showing the Wusel mount in the sidebar and three files with state emblems: online-only, cached, and pinned offline" width="760">
+</p>
+
 ## Architecture in one sentence
 
 A platform-independent **engine** (`wusel-core`: Login Flow v2, WebDAV, sync,

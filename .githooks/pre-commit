@@ -1,0 +1,22 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 IT Beratung Hermann GmbH
+#
+# Auto-format staged Rust before every commit, so unformatted code can never
+# reach a commit — and therefore never reach main, where the publish's fmt-check
+# would otherwise catch it far too late. There is no internal CI running
+# rustfmt, so this hook is the gate.
+#
+# Enable once per clone:  mise run setup-hooks   (sets core.hooksPath=.githooks)
+set -eu
+
+staged_rs=$(git diff --cached --name-only --diff-filter=ACM -- '*.rs' || true)
+[ -z "$staged_rs" ] && exit 0
+
+# rustfmt needs the crate/workspace context, so format the workspace, then
+# re-stage only the files that were already staged. A staged file that also has
+# unstaged edits gets its formatting folded into the commit too — inspect with
+# `git diff` if you keep partial stages.
+mise exec -- cargo fmt --all
+
+printf '%s\n' "$staged_rs" | tr '\n' '\0' | xargs -0 git add --

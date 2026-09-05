@@ -1407,6 +1407,7 @@ mod tests {
             mtime: 0,
             file_id: Some(42),
             permissions: String::new(),
+            group_root: false,
         }
     }
 

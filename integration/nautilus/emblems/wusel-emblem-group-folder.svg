@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
+  <!-- group folder: shared with a team, not just with you (white people on blue).
+       Blue, not the state palette's green/amber/red: this says what the folder
+       *is*, never how its sync is going. -->
+  <circle cx="8" cy="8" r="7" fill="#3584e4"/>
+  <!-- the person behind, offset and clipped by the one in front -->
+  <circle cx="10.3" cy="6.3" r="1.7" fill="#ffffff" opacity="0.75"/>
+  <path d="M7.4 11.6c0-1.9 1.4-3 2.9-3s2.9 1.1 2.9 3z" fill="#ffffff" opacity="0.75"/>
+  <!-- the person in front -->
+  <circle cx="6.3" cy="6" r="2.1" fill="#ffffff"/>
+  <path d="M2.7 12.2c0-2.2 1.7-3.5 3.6-3.5s3.6 1.3 3.6 3.5z" fill="#ffffff"/>
+</svg>

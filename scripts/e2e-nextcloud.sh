@@ -296,6 +296,37 @@ for i in $(seq 1 30); do
 done
 ok "mounted; merge.txt visible"
 
+# --- 4b. A Team/Group folder is marked — and only its root -----------------
+# Nextcloud sets `nc:mount-type` on everything inside the mount, so the
+# assertion that matters is the negative one: the folder carries the marking,
+# what is in it does not. Only a real server settles that; the mock answers a
+# fixture of our own devising.
+if [ -n "${GROUPFOLDER:-}" ]; then
+    echo ">> checking the Team folder is marked, and only at its root ..."
+    gf_root="$MNT/$GROUPFOLDER"
+    for _ in $(seq 1 30); do
+        [ -d "$gf_root" ] && break
+        sleep 1
+    done
+    [ -d "$gf_root" ] || fail "the Team folder never appeared in the mount"
+    kind="$(getfattr --only-values -n user.wusel.kind "$gf_root" 2>/dev/null || true)"
+    [ "$kind" = "group-folder" ] \
+        || fail "the Team folder's root is not marked (user.wusel.kind = '${kind:-<absent>}')"
+
+    mkdir -p "$gf_root/inside"
+    inside_kind="$(getfattr --only-values -n user.wusel.kind "$gf_root/inside" 2>/dev/null || true)"
+    [ -z "$inside_kind" ] \
+        || fail "a folder inside the Team folder is marked too ('$inside_kind') — the whole subtree would be"
+
+    mkdir -p "$MNT/plain-folder"
+    plain_kind="$(getfattr --only-values -n user.wusel.kind "$MNT/plain-folder" 2>/dev/null || true)"
+    [ -z "$plain_kind" ] || fail "an ordinary folder is marked as a group folder ('$plain_kind')"
+    ok "Team folder marked at its root only"
+else
+    echo "!! SKIPPED: step 4b - Team folder marking (the groupfolders app was not available)"
+    SKIPPED=$((SKIPPED + 1))
+fi
+
 # --- 5b. statfs reports the server's real quota, not the placeholder --------
 # `df` on the mount must show the account's Nextcloud quota. There is a
 # mock-backed test for this too, but only a real server proves that the

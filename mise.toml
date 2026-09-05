@@ -19,6 +19,7 @@ watchexec = "2.5.1"        # file-event watcher for `build.sh watch` (no busy-wa
 "npm:browser-sync" = "3.0.4"  # live-preview server for `build.sh watch` (serve + open browser + reload)
 "ubi:korandoru/hawkeye" = "6.5.1"  # license-header tool (like spotless); see licenserc.toml
 "ubi:terrastruct/d2" = "0.7.1"     # diagram renderer (local binary, no server); see mise run docs-diagrams
+"ubi:asciinema/agg" = "1.9.0"      # renders the demo cast to the README GIF; see mise run demo-cast
 shellcheck = "0.11.0"      # linter for scripts/ and packaging/ — the release and E2E logic lives in shell, so it gets linted like the Rust does
 
 [env]
@@ -47,6 +48,10 @@ run = "cargo fmt --all"
 [tasks.fmt-check]
 description = "Check formatting without changing files (for CI)"
 run = "cargo fmt --all -- --check"
+
+[tasks.setup-hooks]
+description = "Point git at the checked-in hooks (.githooks/pre-commit auto-formats)"
+run = "git config core.hooksPath .githooks"
 
 [tasks.headers]
 description = "Apply the Apache-2.0 SPDX license headers (hawkeye)"
@@ -118,6 +123,10 @@ run = "./scripts/podman-test.sh"
 [tasks.e2e-local]
 description = "End-to-end test against a real Nextcloud container (mirrors the CI E2E)"
 run = "./scripts/podman-e2e.sh"
+
+[tasks.demo-cast]
+description = "Record the screencast (asciicast) against a real Nextcloud → wusel-demo.cast"
+run = "./scripts/podman-demo.sh"
 
 # --- Packaging (Fedora RPM) -------------------------------------------------
 # Builds the .rpm in a Fedora container (for a macOS host). On a Fedora machine

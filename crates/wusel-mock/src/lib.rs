@@ -61,6 +61,13 @@ struct Config {
     /// succeeds afterwards, so a test can assert the client retries without
     /// losing the buffered content. Shared across connections via `Arc`.
     failed_once: Arc<Mutex<HashSet<String>>>,
+    /// Directories the mock presents as Team/Group folder roots — rel paths, as
+    /// the server would mount them. Each listed directory carries
+    /// `nc:mount-type=group` with `nc:is-mount-root=true`, and everything inside
+    /// it carries the same mount type with `is-mount-root=false`, exactly as
+    /// real Nextcloud answers. Lets a test cover the marking without a live
+    /// server; set from `WUSEL_MOCK_GROUP_FOLDERS` (comma-separated).
+    group_folders: Vec<String>,
 }
 
 /// Removes the uploads scratch directory when the server goes away.
@@ -100,6 +107,16 @@ pub async fn serve(listener: TcpListener, root: PathBuf, user: &str) -> std::io:
         uploads_prefix: format!("/remote.php/dav/uploads/{user}"),
         uploads_dir,
         failed_once: Arc::new(Mutex::new(HashSet::new())),
+        group_folders: std::env::var("WUSEL_MOCK_GROUP_FOLDERS")
+            .ok()
+            .into_iter()
+            .flat_map(|v| {
+                v.split(',')
+                    .map(|s| s.trim().trim_matches('/').to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .collect(),
     };
     loop {
         let (stream, _peer) = listener.accept().await?;
@@ -739,7 +756,7 @@ async fn propfind(
 
     let mut body = String::from(
         "<?xml version=\"1.0\"?>\n\
-         <d:multistatus xmlns:d=\"DAV:\" xmlns:oc=\"http://owncloud.org/ns\">\n",
+         <d:multistatus xmlns:d=\"DAV:\" xmlns:oc=\"http://owncloud.org/ns\" xmlns:nc=\"http://nextcloud.org/ns\">\n",
     );
     body.push_str(&entry_xml(cfg, &req.rel, &meta));
     if meta.is_dir() && req.depth != "0" {
@@ -836,6 +853,29 @@ async fn get(stream: &mut TcpStream, req: &Request, fs_path: &Path) -> std::io::
     respond(stream, "200 OK", "application/octet-stream", &headers, body).await
 }
 
+/// Whether `rel` sits on one of the configured group-folder mounts, and if so
+/// whether it is the mount's own root.
+///
+/// `Some(true)` for the root itself, `Some(false)` for anything strictly inside
+/// it, `None` for everything else — the three cases real Nextcloud distinguishes
+/// with `nc:is-mount-root`.
+fn mount_membership(group_folders: &[String], rel: &str) -> Option<bool> {
+    for gf in group_folders {
+        if rel == gf {
+            return Some(true);
+        }
+        // A child's rel path is the root's plus a `/…` tail; guard the slash so
+        // `TeamX` is not read as a child of `Team`.
+        if rel
+            .strip_prefix(gf)
+            .is_some_and(|tail| tail.starts_with('/'))
+        {
+            return Some(false);
+        }
+    }
+    None
+}
+
 /// Renders one `<d:response>` for a file or directory at `rel`.
 fn entry_xml(cfg: &Config, rel: &str, meta: &Metadata) -> String {
     let is_dir = meta.is_dir();
@@ -881,6 +921,18 @@ fn entry_xml(cfg: &Config, rel: &str, meta: &Metadata) -> String {
         String::new()
     };
 
+    // Team/Group folder markers, as real Nextcloud sets them: the mount type on
+    // the root *and* everything within it, but `is-mount-root` only on the root.
+    // That is what lets a test assert the marking lands on the folder alone.
+    let mount = match mount_membership(&cfg.group_folders, rel) {
+        Some(is_root) => format!(
+            "\x20     <nc:mount-type>group</nc:mount-type>\n\
+             \x20     <nc:is-mount-root>{}</nc:is-mount-root>\n",
+            if is_root { "true" } else { "false" }
+        ),
+        None => String::new(),
+    };
+
     format!(
         "  <d:response>\n\
          \x20   <d:href>{href}</d:href>\n\
@@ -889,7 +941,7 @@ fn entry_xml(cfg: &Config, rel: &str, meta: &Metadata) -> String {
          \x20     <d:getlastmodified>{last_modified}</d:getlastmodified>\n\
          \x20     <d:getetag>\"{etag}\"</d:getetag>\n\
          \x20     <oc:fileid>{file_id}</oc:fileid>\n\
-         {quota}\
+         {quota}{mount}\
          \x20   </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>\n\
          \x20 </d:response>\n"
     )
@@ -1111,6 +1163,7 @@ mod tests {
             uploads_prefix: "/remote.php/dav/uploads/alice".into(),
             uploads_dir: PathBuf::from("/tmp/wusel-mock-uploads"),
             failed_once: Arc::new(Mutex::new(HashSet::new())),
+            group_folders: Vec::new(),
         }
     }
 

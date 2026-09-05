@@ -75,6 +75,19 @@ pub(crate) const GENERATION: Generation = Generation(0);
 /// per-file emblems. See [`wusel_core::provider::FileState`].
 pub(crate) const STATE_XATTR: &str = "user.wusel.state";
 
+/// The object's *kind*, for a file manager that wants to draw a Team/Group
+/// folder differently — `group-folder` on such a folder's root, absent
+/// everywhere else. **A public contract**, like `STATE_XATTR`.
+///
+/// Deliberately a second attribute rather than another value of the first:
+/// kind and sync state are independent (a group folder is online-only or
+/// cached like any other), and a reader wanting one must not have to parse
+/// the other.
+pub(crate) const KIND_XATTR: &str = "user.wusel.kind";
+
+/// The one value [`KIND_XATTR`] currently takes.
+pub(crate) const KIND_GROUP_FOLDER: &str = "group-folder";
+
 /// Reply to an xattr get/list following the kernel's two-call protocol: a
 /// `size == 0` probe asks only for the length; a sized call copies the bytes if
 /// they fit, else `ERANGE`.
@@ -476,16 +489,20 @@ impl Filesystem for NcFs {
     }
 
     fn getxattr(&self, _req: &Request_, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
-        if name != OsStr::new(STATE_XATTR) {
+        let want = if name == OsStr::new(STATE_XATTR) {
+            crate::dispatch::XattrName::State
+        } else if name == OsStr::new(KIND_XATTR) {
+            crate::dispatch::XattrName::Kind
+        } else {
             return reply.error(Errno::ENODATA);
-        }
+        };
         let ino = ino.0;
         if self.markers && marker_name(ino).is_some() {
             // A fabrication has no availability state to report — the same
             // answer a real, unpinned directory gets.
             return reply.error(Errno::ENODATA);
         }
-        self.go(Pending::Xattr { reply, size }, ino, Intent::State);
+        self.go(Pending::Xattr { reply, size, want }, ino, Intent::State);
     }
 
     fn listxattr(&self, _req: &Request_, ino: INodeNo, size: u32, reply: ReplyXattr) {

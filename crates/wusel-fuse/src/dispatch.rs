@@ -58,6 +58,14 @@ pub fn errno_for(failure: Failure) -> Errno {
 ///
 /// One variant per shape the kernel expects back, because a reply object can
 /// only be completed one way and the compiler should enforce which.
+/// Which extended attribute a `getxattr` asked for. Both are answered from one
+/// state read, so the choice is carried with the pending reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XattrName {
+    State,
+    Kind,
+}
+
 pub enum Pending {
     Attr(ReplyAttr),
     Entry(ReplyEntry),
@@ -68,10 +76,13 @@ pub enum Pending {
     Xattr {
         reply: ReplyXattr,
         size: u32,
+        /// Which attribute was asked for — both are answered from the one
+        /// state read, so the request does not say it twice.
+        want: XattrName,
     },
-    /// `listxattr`: the one name we expose, but only when the object actually
-    /// has a state — so `getfattr -d` on an unpinned directory shows nothing
-    /// rather than an empty-valued attribute.
+    /// `listxattr`: the names we expose, and only those the object actually
+    /// has — so `getfattr -d` on an unpinned directory shows nothing rather
+    /// than an empty-valued attribute.
     XattrList {
         reply: ReplyXattr,
         size: u32,
@@ -130,10 +141,24 @@ impl Pending {
                 (Some(e), _) => reply.error(e),
                 (None, _) => reply.error(Errno::EIO),
             },
-            Pending::Xattr { reply, size } => match (failure, payload) {
-                (None, Payload::State(state)) => {
-                    reply_xattr(reply, state_bytes(*state).as_bytes(), size);
-                }
+            Pending::Xattr { reply, size, want } => match (failure, payload) {
+                (None, Payload::State { state, group_root }) => match want {
+                    // A directory carries no content state (`None`); reporting
+                    // its state attribute as absent is the honest answer, the
+                    // same one an unpinned file's caller would expect.
+                    XattrName::State => match state {
+                        Some(s) => reply_xattr(reply, state_bytes(*s).as_bytes(), size),
+                        None => reply.error(Errno::ENODATA),
+                    },
+                    // Absent, not empty, on everything that is not one: an
+                    // attribute that exists with no value would make every
+                    // ordinary folder look like it had been considered and
+                    // rejected.
+                    XattrName::Kind if *group_root => {
+                        reply_xattr(reply, crate::fs::KIND_GROUP_FOLDER.as_bytes(), size);
+                    }
+                    XattrName::Kind => reply.error(Errno::ENODATA),
+                },
                 // No state is not an error the caller should see as one: an
                 // unpinned directory simply has no emblem.
                 (None, _) | (Some(Errno::ENOENT), _) => reply.error(Errno::ENODATA),
@@ -141,9 +166,18 @@ impl Pending {
             },
             Pending::XattrList { reply, size } => {
                 let mut list = Vec::new();
-                if failure.is_none() && matches!(payload, Payload::State(_)) {
-                    list.extend_from_slice(crate::fs::STATE_XATTR.as_bytes());
-                    list.push(0); // NUL-separated and NUL-terminated
+                if let (None, Payload::State { state, group_root }) = (failure, payload) {
+                    // Only list an attribute that actually answers: a directory
+                    // with no state omits `state`, a group-folder root adds
+                    // `kind`. `getxattr` and `listxattr` must agree on presence.
+                    if state.is_some() {
+                        list.extend_from_slice(crate::fs::STATE_XATTR.as_bytes());
+                        list.push(0); // NUL-separated and NUL-terminated
+                    }
+                    if *group_root {
+                        list.extend_from_slice(crate::fs::KIND_XATTR.as_bytes());
+                        list.push(0);
+                    }
                 }
                 reply_xattr(reply, &list, size);
             }
@@ -247,7 +281,7 @@ fn node(payload: &Payload) -> Option<&NodeRow> {
         | Payload::Bytes(_)
         | Payload::Entries(_)
         | Payload::Written(_)
-        | Payload::State(_) => None,
+        | Payload::State { .. } => None,
     }
 }
 
