@@ -26,7 +26,9 @@ all a server ever gives you: no desktop, just the mount and the terminal.
 // Recorded by scripts/demo-nextcloud.sh; the player is lazy-loaded by the UI bundle.
 [subs=attributes+]
 ++++
-<div class="asciinema" data-cast="{attachmentsdir}/wusel-demo.cast" data-cols="90" data-rows="28"></div>
+<div style="clear: both; margin: 1.5rem 0; border: 1px solid #d7dbe0; border-radius: 8px; overflow: hidden;">
+  <div class="asciinema" data-cast="{attachmentsdir}/wusel-demo.cast" data-cols="90" data-rows="28"></div>
+</div>
 ++++
 
 Two things differ from a desktop, and both are the reason this page exists

@@ -1,0 +1,129 @@
+////
+  // SPDX-License-Identifier: Apache-2.0
+  // Copyright 2026 IT Beratung Hermann GmbH
+////
+
+= One status protocol for every file manager
+:description: Per-file status is an engine truth queried over the wusel-ipc socket, not an attribute written onto the file — so it never leaks when a file is copied out, and one protocol serves macOS, Nautilus, KDE and Windows alike.
+
+Every desktop tells the user two things about a file in a virtual mount: its
+*sync state* (online-only, cached, uploading, …) and, for a Team/Group folder,
+that the folder *is* one. Wusel first surfaced both on Linux as extended
+attributes — `user.wusel.state` and `user.wusel.kind`, read straight off the
+FUSE mount with `getxattr`. This page records why that channel is being
+replaced by a query over the `wusel-ipc` socket, and what the shared protocol
+has to guarantee to be worth it.
+
+== Why not an attribute on the file
+
+The xattr channel is simple and local, but it has a defect that is not fixable
+while the status lives *on the file*: an extended attribute is copied with the
+file. A metadata-preserving copy out of the mount — `cp -a`, or a file manager
+set to keep attributes — reads `user.wusel.kind=group-folder` through
+`getxattr` and writes it onto the destination, a plain file on an ordinary disk
+that is now, falsely and permanently, tagged as a group folder. The emblem is
+supposed to describe a file's relationship to the running mount; an attribute
+cannot, because it outlives that relationship.
+
+Status is not a property of the bytes. It is a property of the object *as this
+running daemon sees it right now* — and that is exactly what a live query
+answers and a stored attribute cannot.
+
+== The decision
+
+There is one source of status, the engine, and one way to ask it: the
+`wusel-ipc` Unix-domain socket the daemon already serves. Every file manager
+integration — the macOS File Provider extension today, a Nautilus plugin next,
+KDE's Dolphin and the Windows shell later — is a *thin projector*: it asks the
+socket for an object's status and maps the answer onto its own decoration
+vocabulary. None of them link the engine, embed sync logic, or invent their own
+status; none of them write anything onto the file.
+
+This is the encapsulation the xattr channel quietly gave up. The interesting
+work — deciding whether a file is online-only, cached, uploading, a group-folder
+root — is the engine's, is hard, and is identical on every platform. Putting it
+behind one protocol means it is written and tested once. A new file manager is
+then a rendering exercise, not a re-implementation, and it cannot drift from the
+others because there is nothing to drift.
+
+The property that motivated the change falls out for free: a status obtained by
+asking the daemon about a path is meaningless for a path that is no longer under
+the mount. A copied-out file has nothing to carry and nothing to query — no
+leak, on any platform, without special-casing the copy.
+
+== What the protocol must guarantee
+
+A protocol meant to outlast several independently-versioned clients is only as
+good as its contract. Three points carry the weight.
+
+Carry the richest truth, let the client reduce it::
+The wire carries the *full* sync state — every value the engine distinguishes
+(see xref:reference/file-states.adoc[File states]) — as a neutral superset. A
+client draws as much as its platform can: one that only knows "available" vs
+"needs downloading" ignores the rest; one with a syncing spinner reads
+`uploading`. The wire must never carry a *reduced* set shaped by whichever
+client happens to have the poorest emblems, because that stranding is
+irreversible for the richer clients. The macOS extension today renders only
+pinned/stale and pushes the active transfer states as notifications instead —
+that is a rendering choice in one client, not a limit of the wire.
+
+Keep the axes separate::
+Sync state and folder kind are two questions, not one. A group folder is still
+online-only or cached like anything else. They travel as two fields
+(`state` and `folder_kind`), never folded into a single conflated value, so a
+client can badge a group-folder root *and* show its sync emblem.
+
+Version the wire::
+The clients will not upgrade in lockstep — a system Nautilus plugin and a
+sandboxed File Provider extension update on entirely different schedules. A
+schema version on the wire lets an old client and a new daemon (or the reverse)
+detect the mismatch and refuse it, instead of silently mis-reading a field.
+Additive fields with defaults are not a break; a changed shape is.
+
+== Why the client must cache
+
+Asking per file is not free, and a file manager asks *per visible file, in its
+draw path*. The prototype (`crates/wusel-ipc/tests/status_latency.rs`) measures
+the naive port of the xattr read — one socket `stat` per file — against a
+trivial client-side cache, over the real engine and a real socket:
+
+[cols="1,1"]
+|===
+|Draw path, 200-file folder |Cost
+
+|Cold — one socket round-trip per file |≈ 46 ms  (≈ 230 µs/file)
+|Warm — client cache hit per file      |≈ 65 µs  (whole folder)
+|===
+
+The socket itself is fast; the per-file cost is the engine's work behind it
+(resolve the path, stat, read the state). At ~230 µs each, a few hundred files
+is tens of milliseconds of synchronous stutter in the draw path — so a cache is
+not an optimisation here, it is a requirement. Two things make it cheap and
+correct:
+
+* *One listing primes the whole folder.* `enumerate` already carries each
+  child's `state` and `folder_kind`, so drawing a freshly-opened folder is a
+  single round-trip that fills the cache for every file in it — not one `stat`
+  per file.
+* *The change stream keeps it warm.* The cache is invalidated by the `watch` /
+  `changes` events the engine already emits, so a hit stays correct without
+  re-asking. A cache that drifts would draw a stale emblem — the whole risk of
+  caching — which is why the prototype asserts the cached answer equals the
+  socket's.
+
+This is the one place the socket model costs more than the xattr did, and it is
+the client's cost to bear, once, in shared plumbing.
+
+== State of play
+
+The `wusel-ipc` crate and its socket live on the macOS integration branch; the
+group-folder engine (`is_group_folder_root`) lives on `main`. Until those meet,
+`folder_kind` is always `plain` on the branch that has the socket — the field is
+on the wire regardless, because the *contract* is what must be stable, and a
+group-folder-aware daemon fills it without any client changing. That is the
+single seam where the two lines of work join.
+
+On Linux the xattr channel stays until a Nautilus plugin speaks the socket with
+a working cache; the two can run side by side during the switch. The
+xref:reference/file-states.adoc[File states] reference then describes *what a
+client renders*, not the interface it reads — the interface is this protocol.
