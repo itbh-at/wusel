@@ -44,6 +44,7 @@
 * xref:explanation/testing.adoc[How Wusel is tested]
 * xref:explanation/credentials-and-trust.adoc[Credentials and trust]
 * xref:explanation/desktop-integration.adoc[Desktop integration]
+* xref:explanation/status-protocol.adoc[One status protocol for every file manager]
 * xref:explanation/portability.adoc[Portability]
 * xref:explanation/compatibility.adoc[Compatibility and stability]
 

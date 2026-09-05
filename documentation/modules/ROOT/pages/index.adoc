@@ -17,10 +17,14 @@ your disk, and it is ready the moment you log in rather than after a long first
 sync.
 
 // A real terminal session against a real Nextcloud (recorded by
-// scripts/demo-nextcloud.sh); the player is lazy-loaded by the UI bundle.
+// scripts/demo-nextcloud.sh); the player is lazy-loaded by the UI bundle. The
+// wrapper clears the floated logo so the terminal takes the full column width
+// instead of being squeezed into the space beside it.
 [subs=attributes+]
 ++++
-<div class="asciinema" data-cast="{attachmentsdir}/wusel-demo.cast" data-cols="90" data-rows="28"></div>
+<div style="clear: both; margin: 1.5rem 0; border: 1px solid #d7dbe0; border-radius: 8px; overflow: hidden;">
+  <div class="asciinema" data-cast="{attachmentsdir}/wusel-demo.cast" data-cols="90" data-rows="28"></div>
+</div>
 ++++
 
 It needs Linux. The mount works on any desktop, and on a server with none at
