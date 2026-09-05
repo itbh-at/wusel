@@ -13,8 +13,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential pkg-config \
         fuse3 libfuse3-dev \
         iproute2 \
+        attr \
         gnome-keyring dbus-bin \
     && rm -rf /var/lib/apt/lists/*
+
+# attr provides `getfattr`: the E2E reads the per-file state and kind extended
+# attributes straight off the mount, which is the same contract the file
+# manager's extension consumes.
 
 # gnome-keyring/dbus-bin belong to the *tests*, not to the product: `mise run
 # test` starts a throwaway D-Bus session with an empty keyring so the credential
@@ -33,7 +38,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Install mise (same role as on the host). Pinned via MISE_VERSION: mise pins
 # every other tool, so the installer must not be the one floating piece. Keep
 # in sync with the host (`mise version`).
-RUN curl -fsSL https://mise.run | MISE_VERSION=v2026.6.10 sh
+#
+# Run the freshly installed binary in the same layer: the installer does not
+# verify its own download, so a truncated fetch (a full disk, a dropped
+# connection) writes a corrupt binary that only segfaults on first use — and the
+# layer cache then serves that broken layer to every later build, hiding the
+# fault for as long as the cache lives. `mise version` executes it here, where a
+# bad download fails the build instead of being cached.
+RUN curl -fsSL https://mise.run | MISE_VERSION=v2026.6.10 sh \
+    && /root/.local/bin/mise version
 ENV PATH="/root/.local/bin:/root/.local/share/mise/shims:${PATH}"
 ENV MISE_TRUSTED_CONFIG_PATHS="/work"
 # Login shells (bash -lc) should also find mise — they otherwise reset PATH.

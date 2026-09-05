@@ -16,6 +16,13 @@ Nothing is downloaded until you open it, so the folder can be far larger than
 your disk, and it is ready the moment you log in rather than after a long first
 sync.
 
+// A real terminal session against a real Nextcloud (recorded by
+// scripts/demo-nextcloud.sh); the player is lazy-loaded by the UI bundle.
+[subs=attributes+]
+++++
+<div class="asciinema" data-cast="{attachmentsdir}/wusel-demo.cast" data-cols="90" data-rows="28"></div>
+++++
+
 It needs Linux. The mount works on any desktop, and on a server with none at
 all; the parts that make it feel native — the sidebar entry, the per-file
 emblems, the search — are GNOME and Nautilus for now.

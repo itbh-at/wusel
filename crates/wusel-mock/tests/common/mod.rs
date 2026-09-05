@@ -562,8 +562,27 @@ impl Engine {
 
     pub fn state(&self, ino: u64) -> Option<FileState> {
         match self.run(ino, Intent::State) {
-            (Outcome::Ok, Payload::State(s)) => Some(s),
+            // `state` is already an `Option`: `None` is a directory with no
+            // emblem, which this helper reports the same as "no state".
+            (Outcome::Ok, Payload::State { state, .. }) => state,
             _ => None,
         }
+    }
+
+    /// Whether the object is a Team/Group folder root — the same read as
+    /// [`Self::state`], the other half of what an OS integration draws. A
+    /// directory has no emblem state yet can still be a group-folder root, so
+    /// this must be answerable independently of `state`.
+    pub fn group_root(&self, ino: u64) -> bool {
+        matches!(
+            self.run(ino, Intent::State),
+            (
+                Outcome::Ok,
+                Payload::State {
+                    group_root: true,
+                    ..
+                }
+            )
+        )
     }
 }

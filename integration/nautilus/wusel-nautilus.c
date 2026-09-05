@@ -27,6 +27,11 @@
 #include <sys/xattr.h>
 
 #define STATE_XATTR "user.wusel.state"
+// The object's kind, independent of its sync state. Present only on the root
+// of a Team/Group folder, so its mere presence is the answer; the value is
+// read anyway, so a later kind can be told apart without changing this side.
+#define KIND_XATTR "user.wusel.kind"
+#define KIND_GROUP_FOLDER "group-folder"
 
 // --- GObject type: one object implementing the provider interfaces ----------
 
@@ -316,6 +321,21 @@ wusel_ext_update_file_info(NautilusInfoProvider *provider,
         }
     }
     // else: no xattr → not one of our files (or an unpinned directory).
+
+    // The kind is a separate attribute and a separate emblem: a Team/Group
+    // folder still has a sync state, and both belong on it. Absent on
+    // everything else, which is why nothing is drawn by default.
+    char kind[32];
+    ssize_t k = getxattr(path, KIND_XATTR, kind, sizeof(kind) - 1);
+    if (k > 0)
+    {
+        kind[k] = '\0';
+        if (strcmp(kind, KIND_GROUP_FOLDER) == 0)
+        {
+            track_file(path, file);
+            nautilus_file_info_add_emblem(file, "wusel-emblem-group-folder");
+        }
+    }
     g_free(path);
     return NAUTILUS_OPERATION_COMPLETE;
 }

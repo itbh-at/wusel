@@ -163,7 +163,7 @@ fn bytes(p: &Payload) -> &[u8] {
         | Payload::Node(_)
         | Payload::Entries(_)
         | Payload::Written(_)
-        | Payload::State(_) => &[],
+        | Payload::State { .. } => &[],
     }
 }
 

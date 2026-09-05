@@ -1529,6 +1529,8 @@ mod tests {
                     mtime: 0,
                     file_id: Some(1),
                     permissions: "RGDNVW".into(),
+                    mount_type: String::new(),
+                    is_mount_root: false,
                 }],
             )
             .unwrap();

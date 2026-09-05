@@ -60,6 +60,39 @@ podman run -d --name "$NC" --network "$NET" \
     -e "NEXTCLOUD_TRUSTED_DOMAINS=$NC localhost 127.0.0.1" \
     "$NC_IMAGE" >/dev/null
 
+# A Team/Group folder for the marking gate. It has to be made with `occ`, which
+# only exists inside the Nextcloud container — the test container reaches the
+# server over HTTP alone — so it happens here and the result is handed to the
+# inner script as an environment variable.
+#
+# Best-effort on purpose: `app:install` reaches out to the app store, and an
+# E2E must not turn red because that was unreachable or has no build for this
+# Nextcloud. The inner gate skips when the name is empty, and says so.
+GROUPFOLDER=""
+echo ">> waiting for Nextcloud, then setting up a Team folder ..."
+for _ in $(seq 1 60); do
+    if podman exec -u www-data "$NC" php occ status 2>/dev/null | grep -q "installed: true"; then
+        break
+    fi
+    sleep 5
+done
+if podman exec -u www-data "$NC" php occ app:install groupfolders >/dev/null 2>&1 ||
+   podman exec -u www-data "$NC" php occ app:enable groupfolders >/dev/null 2>&1; then
+    gf_id="$(podman exec -u www-data "$NC" php occ groupfolders:create "Team Folder" 2>/dev/null | tr -d '\r\n ')"
+    if [ -n "$gf_id" ]; then
+        # `admin` is in the `admin` group, so granting that group is what makes
+        # the folder appear in the account the test logs in as. The permission
+        # list is required: `groupfolders:group` with none grants read-only, and
+        # the gate below creates a subdirectory inside the folder to prove the
+        # marking does not bleed onto it — which a read-only mount refuses (403).
+        podman exec -u www-data "$NC" php occ groupfolders:group "$gf_id" admin \
+            read write delete share >/dev/null 2>&1 || true
+        GROUPFOLDER="Team Folder"
+        echo ">> Team folder created (id $gf_id)"
+    fi
+fi
+[ -n "$GROUPFOLDER" ] || echo ">> groupfolders unavailable — the marking gate will skip"
+
 # The dev container reaches Nextcloud by service name on the shared network. The
 # e2e script (and the wusel daemon it starts) all run inside this container, so
 # http://$NC is the URL both for curl and for the mount's credentials.
@@ -73,6 +106,7 @@ podman run --rm \
     -v "$WORK":/work:Z \
     -e MISE_TRUSTED_CONFIG_PATHS=/work \
     -e "NC_URL=http://$NC" \
+    -e "GROUPFOLDER=$GROUPFOLDER" \
     -e WUSEL=/work/target-linux/debug/wusel \
     -e "RUST_LOG=${RUST_LOG:-wusel=info,wusel_core=info,wusel_fuse=info}" \
     "$IMAGE" \

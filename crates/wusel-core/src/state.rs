@@ -90,6 +90,7 @@ impl StateDb {
                 children_loaded INTEGER NOT NULL DEFAULT 0,  -- has this dir been PROPFIND'd?
                 loaded_at INTEGER NOT NULL DEFAULT 0,         -- unix seconds of the last listing
                 permissions TEXT NOT NULL DEFAULT '',         -- oc:permissions letters
+                group_root  INTEGER NOT NULL DEFAULT 0,       -- root of a Team/Group folder?
                 UNIQUE(parent, name)
             );
             CREATE INDEX IF NOT EXISTS idx_nodes_parent ON nodes(parent);
@@ -119,12 +120,14 @@ impl StateDb {
         // *expected* "duplicate column name" error (the column already exists)
         // may be ignored — swallowing everything would hide a locked, corrupt or
         // read-only DB here and let it fail later, far from the cause.
-        if let Err(e) = self.conn.execute(
+        for stmt in [
             "ALTER TABLE nodes ADD COLUMN permissions TEXT NOT NULL DEFAULT ''",
-            [],
-        ) {
-            if !e.to_string().contains("duplicate column name") {
-                return Err(e.into());
+            "ALTER TABLE nodes ADD COLUMN group_root INTEGER NOT NULL DEFAULT 0",
+        ] {
+            if let Err(e) = self.conn.execute(stmt, []) {
+                if !e.to_string().contains("duplicate column name") {
+                    return Err(e.into());
+                }
             }
         }
         Ok(())
@@ -172,12 +175,13 @@ impl StateDb {
                 }
             }
             tx.execute(
-                r#"INSERT INTO nodes(parent, name, path, is_dir, size, etag, mtime, file_id, permissions)
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                r#"INSERT INTO nodes(parent, name, path, is_dir, size, etag, mtime, file_id, permissions, group_root)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                    ON CONFLICT(parent, name) DO UPDATE SET
                        size=excluded.size, etag=excluded.etag,
                        mtime=excluded.mtime, file_id=excluded.file_id,
-                       permissions=excluded.permissions"#,
+                       permissions=excluded.permissions,
+                       group_root=excluded.group_root"#,
                 rusqlite::params![
                     parent,
                     name,
@@ -188,6 +192,10 @@ impl StateDb {
                     c.mtime,
                     c.file_id.map(|v| v as i64),
                     c.permissions,
+                    // Derived here, once, rather than storing both ingredients:
+                    // "is this a group folder's root" is the only question
+                    // anything downstream asks.
+                    crate::model::is_group_folder_root(&c.mount_type, c.is_mount_root) as i64,
                 ],
             )?;
         }
@@ -248,8 +256,8 @@ impl StateDb {
             format!("{parent_path}/{name}")
         };
         self.conn.execute(
-            r#"INSERT INTO nodes(parent, name, path, is_dir, size, etag, mtime, file_id, permissions)
-               VALUES (?1, ?2, ?3, 0, 0, '', ?4, NULL, '')"#,
+            r#"INSERT INTO nodes(parent, name, path, is_dir, size, etag, mtime, file_id, permissions, group_root)
+               VALUES (?1, ?2, ?3, 0, 0, '', ?4, NULL, '', 0)"#,
             rusqlite::params![parent, name, path, now_secs() as i64],
         )?;
         let inode = self.conn.last_insert_rowid() as u64;
@@ -309,14 +317,14 @@ impl StateDb {
     pub fn node_by_inode(&self, inode: u64) -> Result<Option<NodeRow>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT inode, parent, name, path, is_dir, size, etag, mtime, file_id, permissions FROM nodes WHERE inode = ?1")?;
+            .prepare("SELECT inode, parent, name, path, is_dir, size, etag, mtime, file_id, permissions, group_root FROM nodes WHERE inode = ?1")?;
         Ok(stmt.query_row([inode], NodeRow::from_row).optional()?)
     }
 
     /// A child of `parent` by name (for `lookup`). `None` if not present.
     pub fn child_by_name(&self, parent: u64, name: &str) -> Result<Option<NodeRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT inode, parent, name, path, is_dir, size, etag, mtime, file_id, permissions
+            "SELECT inode, parent, name, path, is_dir, size, etag, mtime, file_id, permissions, group_root
              FROM nodes WHERE parent = ?1 AND name = ?2 AND inode != ?1",
         )?;
         Ok(stmt
@@ -539,7 +547,7 @@ impl StateDb {
     /// A single node by its full remote path (`""` = the root). `None` if unknown.
     pub fn node_by_path(&self, path: &str) -> Result<Option<NodeRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT inode, parent, name, path, is_dir, size, etag, mtime, file_id, permissions
+            "SELECT inode, parent, name, path, is_dir, size, etag, mtime, file_id, permissions, group_root
              FROM nodes WHERE path = ?1",
         )?;
         Ok(stmt
@@ -734,7 +742,7 @@ impl StateDb {
     /// If the state cannot be read.
     pub fn node_by_file_id(&self, file_id: u64) -> Result<Option<NodeRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT inode, parent, name, path, is_dir, size, etag, mtime, file_id, permissions
+            "SELECT inode, parent, name, path, is_dir, size, etag, mtime, file_id, permissions, group_root
              FROM nodes WHERE file_id = ?1",
         )?;
         Ok(stmt.query_row([file_id], NodeRow::from_row).optional()?)
@@ -763,7 +771,7 @@ impl StateDb {
 }
 
 const SELECT_NODE_COLS_WHERE_PARENT: &str =
-    "SELECT inode, parent, name, path, is_dir, size, etag, mtime, file_id, permissions
+    "SELECT inode, parent, name, path, is_dir, size, etag, mtime, file_id, permissions, group_root
      FROM nodes WHERE parent = ?1 AND inode != ?1";
 
 /// How far up the parent chain [`descends_from`] is willing to walk. Far beyond
@@ -907,6 +915,10 @@ pub struct NodeRow {
     pub file_id: Option<u64>,
     /// Raw `oc:permissions` letters (empty if the server did not report them).
     pub permissions: String,
+    /// Whether this directory is the root of a Team/Group folder — see
+    /// [`crate::model::is_group_folder_root`]. Stored as the answer rather
+    /// than its two ingredients: it is the only question anything asks.
+    pub group_root: bool,
 }
 
 impl NodeRow {
@@ -922,6 +934,7 @@ impl NodeRow {
             mtime: row.get(7)?,
             file_id: row.get::<_, Option<i64>>(8)?.map(|v| v as u64),
             permissions: row.get(9)?,
+            group_root: row.get::<_, i64>(10).unwrap_or(0) != 0,
         })
     }
 
@@ -945,6 +958,8 @@ mod tests {
             mtime: 0,
             file_id: Some(1),
             permissions: String::new(),
+            mount_type: String::new(),
+            is_mount_root: false,
         }
     }
 
@@ -1255,6 +1270,38 @@ mod tests {
     }
 
     #[test]
+    fn only_a_group_folders_root_is_recorded_as_one() {
+        let mut db = StateDb::open_in_memory().unwrap();
+        let mut team = entry("Team", true);
+        team.mount_type = "group".into();
+        team.is_mount_root = true;
+        // Inside the folder the server reports the same mount-type — the case
+        // that would badge a whole subtree if the root flag were not consulted.
+        let mut inside = entry("Inside", true);
+        inside.mount_type = "group".into();
+        inside.is_mount_root = false;
+        // A received share is a mount root, but not a group folder.
+        let mut shared = entry("FromBob", true);
+        shared.mount_type = "shared".into();
+        shared.is_mount_root = true;
+        let plain = entry("Plain", true);
+
+        db.reconcile_children(ROOT_INODE, "", &[team, inside, shared, plain])
+            .unwrap();
+
+        let flag = |name: &str| {
+            db.child_by_name(ROOT_INODE, name)
+                .unwrap()
+                .unwrap_or_else(|| panic!("no node for {name}"))
+                .group_root
+        };
+        assert!(flag("Team"), "the group folder's root is marked");
+        assert!(!flag("Inside"), "its contents are not");
+        assert!(!flag("FromBob"), "a received share is not a group folder");
+        assert!(!flag("Plain"));
+    }
+
+    #[test]
     fn permissions_persist_and_drive_writability() {
         let mut db = StateDb::open_in_memory().unwrap();
         let writable = RemoteEntry {
@@ -1265,10 +1312,14 @@ mod tests {
             mtime: 0,
             file_id: Some(1),
             permissions: "RGDNVW".into(),
+            mount_type: String::new(),
+            is_mount_root: false,
         };
         let readonly = RemoteEntry {
             path: "readonly.txt".into(),
             permissions: "GR".into(),
+            mount_type: String::new(),
+            is_mount_root: false,
             ..writable.clone()
         };
         db.reconcile_children(ROOT_INODE, "", &[writable, readonly])

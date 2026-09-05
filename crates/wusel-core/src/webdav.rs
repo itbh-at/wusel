@@ -162,7 +162,7 @@ impl WebDavClient {
     /// Lists a directory (depth 1) and returns its immediate children.
     pub async fn propfind_dir(&self, path: &str) -> Result<Vec<RemoteEntry>> {
         const BODY: &str = r#"<?xml version="1.0"?>
-<d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">
+<d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns" xmlns:nc="http://nextcloud.org/ns">
   <d:prop>
     <d:getcontentlength/>
     <d:getlastmodified/>
@@ -170,6 +170,8 @@ impl WebDavClient {
     <d:resourcetype/>
     <oc:fileid/>
     <oc:permissions/>
+    <nc:mount-type/>
+    <nc:is-mount-root/>
   </d:prop>
 </d:propfind>"#;
 
@@ -867,6 +869,8 @@ fn parse_multistatus(xml: &str, base: &str) -> Result<Vec<RemoteEntry>> {
                 b"getetag" => text_target = Some(Field::ETag),
                 b"fileid" => text_target = Some(Field::FileId),
                 b"permissions" => text_target = Some(Field::Permissions),
+                b"mount-type" => text_target = Some(Field::MountType),
+                b"is-mount-root" => text_target = Some(Field::IsMountRoot),
                 b"collection" => cur.is_dir = true,
                 _ => {}
             },
@@ -961,6 +965,8 @@ enum Field {
     ETag,
     FileId,
     Permissions,
+    MountType,
+    IsMountRoot,
 }
 
 #[derive(Default)]
@@ -971,6 +977,8 @@ struct PartialEntry {
     etag: String,
     file_id: Option<u64>,
     permissions: String,
+    mount_type: String,
+    is_mount_root: bool,
     is_dir: bool,
 }
 
@@ -984,6 +992,12 @@ impl PartialEntry {
             Field::ETag => self.etag = unquote_etag(val),
             Field::FileId => self.file_id = val.parse().ok(),
             Field::Permissions => self.permissions = val.to_string(),
+            Field::MountType => self.mount_type = val.to_string(),
+            // Nextcloud sends the boolean as `true`/`false` (captured against
+            // 34); `1`/`0` is Sabre's other spelling and is accepted too, so a
+            // server or proxy that uses it still marks correctly. Anything else
+            // — an older server omitting the property entirely — stays false.
+            Field::IsMountRoot => self.is_mount_root = val == "1" || val == "true",
         }
     }
 
@@ -1004,6 +1018,8 @@ impl PartialEntry {
             mtime: self.mtime,
             file_id: self.file_id,
             permissions: self.permissions,
+            mount_type: self.mount_type,
+            is_mount_root: self.is_mount_root,
         })
     }
 }
@@ -1166,6 +1182,115 @@ mod tests {
     </d:prop></d:propstat>
   </d:response>
 </d:multistatus>"#;
+
+    /// A listing containing a Team/Group folder, a received share, and a plain
+    /// folder — shaped the way Nextcloud answers, with `nc:mount-type` set on
+    /// the mount's contents as well as on its root. `is-mount-root` appears in
+    /// both spellings the parser accepts: `true`/`false` (what Nextcloud 34
+    /// actually sends, captured live) on the group folder, and `1` on the share
+    /// (Sabre's other form), so neither branch goes untested.
+    const MOUNTS: &str = r#"<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns" xmlns:nc="http://nextcloud.org/ns">
+  <d:response>
+    <d:href>/remote.php/dav/files/alice/Team/</d:href>
+    <d:propstat><d:prop>
+      <d:resourcetype><d:collection/></d:resourcetype>
+      <oc:permissions>MRGDNVCK</oc:permissions>
+      <nc:mount-type>group</nc:mount-type>
+      <nc:is-mount-root>true</nc:is-mount-root>
+    </d:prop></d:propstat>
+  </d:response>
+  <d:response>
+    <d:href>/remote.php/dav/files/alice/Team/Inside/</d:href>
+    <d:propstat><d:prop>
+      <d:resourcetype><d:collection/></d:resourcetype>
+      <nc:mount-type>group</nc:mount-type>
+      <nc:is-mount-root>false</nc:is-mount-root>
+    </d:prop></d:propstat>
+  </d:response>
+  <d:response>
+    <d:href>/remote.php/dav/files/alice/FromBob/</d:href>
+    <d:propstat><d:prop>
+      <d:resourcetype><d:collection/></d:resourcetype>
+      <oc:permissions>SRGDNVCK</oc:permissions>
+      <nc:mount-type>shared</nc:mount-type>
+      <nc:is-mount-root>1</nc:is-mount-root>
+    </d:prop></d:propstat>
+  </d:response>
+  <d:response>
+    <d:href>/remote.php/dav/files/alice/Plain/</d:href>
+    <d:propstat><d:prop>
+      <d:resourcetype><d:collection/></d:resourcetype>
+      <oc:permissions>RGDNVCK</oc:permissions>
+      <nc:mount-type></nc:mount-type>
+    </d:prop></d:propstat>
+  </d:response>
+</d:multistatus>"#;
+
+    #[test]
+    fn only_the_root_of_a_group_folder_is_marked() {
+        let entries = parse_multistatus(
+            MOUNTS,
+            "https://cloud.example.org/remote.php/dav/files/alice",
+        )
+        .expect("parse");
+        let by_path = |p: &str| {
+            entries
+                .iter()
+                .find(|e| e.path == p)
+                .unwrap_or_else(|| panic!("no entry for {p}"))
+        };
+
+        let team = by_path("Team");
+        assert_eq!(team.mount_type, "group");
+        assert!(team.is_mount_root);
+        assert!(crate::model::is_group_folder_root(
+            &team.mount_type,
+            team.is_mount_root
+        ));
+
+        // Everything *inside* carries the same mount-type — which is exactly
+        // why `is-mount-root` decides, or the whole subtree would be marked.
+        let inside = by_path("Team/Inside");
+        assert_eq!(inside.mount_type, "group");
+        assert!(!inside.is_mount_root);
+        assert!(!crate::model::is_group_folder_root(
+            &inside.mount_type,
+            inside.is_mount_root
+        ));
+
+        // A received share is a mount root too, but not a group folder.
+        let shared = by_path("FromBob");
+        assert!(shared.is_mount_root);
+        assert!(!crate::model::is_group_folder_root(
+            &shared.mount_type,
+            shared.is_mount_root
+        ));
+
+        let plain = by_path("Plain");
+        assert_eq!(plain.mount_type, "");
+        assert!(!plain.is_mount_root);
+    }
+
+    #[test]
+    fn a_server_without_the_properties_marks_nothing() {
+        // SAMPLE predates both properties — an older Nextcloud, or one that
+        // simply did not answer them. Nothing may be marked on a guess.
+        let entries = parse_multistatus(
+            SAMPLE,
+            "https://cloud.example.org/remote.php/dav/files/alice",
+        )
+        .expect("parse");
+        assert!(!entries.is_empty());
+        for e in &entries {
+            assert_eq!(e.mount_type, "");
+            assert!(!e.is_mount_root);
+            assert!(!crate::model::is_group_folder_root(
+                &e.mount_type,
+                e.is_mount_root
+            ));
+        }
+    }
 
     #[test]
     fn percent_decode_survives_multibyte_after_percent() {
