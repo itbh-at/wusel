@@ -32,7 +32,9 @@ RUST_BACKTRACE = "1"
 
 [tasks.check]
 description = "cargo check (wusel-core + wusel without the fuse feature)"
-run = "cargo check --workspace --exclude wusel-fuse"
+# --locked: a Cargo.lock out of step with Cargo.toml (e.g. a version bump that
+# forgot the lock) fails here, on every PR, instead of only in the release build.
+run = "cargo check --workspace --exclude wusel-fuse --locked"
 
 [tasks.test]
 description = "cargo test (engine + CLI; on Linux inside a throwaway keyring session)"
@@ -70,9 +72,9 @@ description = "Linter — every crate this OS can build, tests included"
 # container for the macOS case, so no path stays unlinted for long.
 run = '''
 if [ "$(uname -s)" = "Linux" ]; then
-    cargo clippy --workspace --all-targets -- -D warnings
+    cargo clippy --workspace --all-targets --locked -- -D warnings
 else
-    cargo clippy --workspace --exclude wusel-fuse --all-targets -- -D warnings
+    cargo clippy --workspace --exclude wusel-fuse --all-targets --locked -- -D warnings
     echo ">> wusel-fuse skipped: Linux-only. It is linted by 'mise run fuse-test'."
 fi
 '''
@@ -95,14 +97,14 @@ run = "cargo run -q -p wusel-mock --"
 
 [tasks.build-release]
 description = "Optimised release build of wusel with FUSE (Linux)"
-run = "cargo build --release --features fuse -p wusel"
+run = "cargo build --release --features fuse -p wusel --locked"
 
 # Debug counterpart, and the single spelling of "build the product with the
 # mount". CI, the E2E workflow and the podman scripts all call this task instead
 # of repeating the cargo invocation, so the flags cannot drift between them.
 [tasks.build-fuse]
 description = "Debug build of wusel with FUSE (Linux) — used by CI and the E2E"
-run = "cargo build -p wusel --features fuse"
+run = "cargo build -p wusel --features fuse --locked"
 
 # The mount is Linux-only. On macOS, test it via podman (see the fuse-* tasks
 # below and documentation/.../trying-it-out.adoc).

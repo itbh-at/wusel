@@ -2702,7 +2702,7 @@ dependencies = [
 
 [[package]]
 name = "wusel"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2721,7 +2721,7 @@ dependencies = [
 
 [[package]]
 name = "wusel-core"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "diffy",
@@ -2746,7 +2746,7 @@ dependencies = [
 
 [[package]]
 name = "wusel-desktop"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "tracing",
  "wusel-core",
@@ -2755,11 +2755,11 @@ dependencies = [
 
 [[package]]
 name = "wusel-fsm"
-version = "0.3.2"
+version = "0.4.0"
 
 [[package]]
 name = "wusel-fuse"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "fuser",
@@ -2775,7 +2775,7 @@ dependencies = [
 
 [[package]]
 name = "wusel-ipc"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "libc",
  "reqwest",
@@ -2790,7 +2790,7 @@ dependencies = [
 
 [[package]]
 name = "wusel-mock"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "reqwest",
  "rusqlite",
