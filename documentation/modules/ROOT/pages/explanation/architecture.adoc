@@ -7,10 +7,13 @@
 :description: A platform-independent engine plus thin, interchangeable frontends — where the seam runs, and why the mount is the replaceable part.
 :page-aliases: architecture.adoc
 
-Nextcloud's official client avoids a Linux VFS because a single Qt/C++ code base
-is maintained for Windows/macOS/Linux, and Linux would need its own,
-platform-specific path (FUSE). `wusel` turns this around: a platform-independent
-engine plus interchangeable, thin frontends.
+Nextcloud's official client keeps one Qt/C++ code base for Windows/macOS/Linux,
+so its Linux VFS arrives as an attachment: an external FUSE process
+(https://github.com/opencloud-eu/openvfs[openvfs]) dehydrates a directory the
+mirroring engine has already synced, and is driven over a socket
+(xref:explanation/compared-to-the-official-client.adoc[Compared to the official Nextcloud client]). `wusel` turns this around: a platform-independent engine plus
+interchangeable, thin frontends, with the virtual filesystem as the starting
+point instead of a layer on top.
 
 . `wusel-core` — engine, no kernel. Tests natively on Linux and macOS.
 . `wusel-fuse` — thin FUSE frontend (library), Linux (libfuse3).
@@ -44,7 +47,7 @@ wusel-core::runtime          the substrate that carries the steps out
    N database readers · 1 writer · network pool · file pool
 
 wusel-fuse          (Linux)   — FUSE callbacks       → intents   [exists]
-wusel-fileprovider  (macOS)   — File Provider ext.   → intents   [planned]
+wusel-fileprovider  (macOS)   — File Provider ext.   → intents   [experimental]
 wusel-cfapi         (Windows) — Cloud Filter API     → intents   [planned]
 ....
 

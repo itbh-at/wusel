@@ -6,15 +6,15 @@
 = Develop on macOS
 :description: Work on Wusel from a Mac — engine and CLI natively, the Linux mount inside a podman container.
 
-This page is for people writing code for Wusel from a Mac. If that is not you,
-you can skip it entirely: Wusel does not run on macOS, and nothing here will
-make it.
+This page is for people writing code for Wusel from a Mac — the engine and the
+CLI. The Linux mount is a FUSE filesystem, and macOS has no FUSE, so that
+frontend is built and tested inside a container.
 
-The mount is a FUSE filesystem, and macOS has no FUSE. A native macOS frontend
-would be a File Provider Extension, which is far-future work — see
-xref:reference/platform-support.adoc[Platform support]. What macOS *can* do
-today is build and test everything that is not the mount, which is most of the
-code.
+macOS also has its own native frontend now — a File Provider extension,
+experimental; this page does not cover building it, and
+xref:reference/platform-support.adoc[Platform support] says what it does today.
+What follows is the engine work: everything that is not the FUSE mount builds and
+tests on macOS with no container, which is most of the code.
 
 On Linux none of this applies; follow
 xref:tutorials/set-up-a-development-environment.adoc[Set up a development

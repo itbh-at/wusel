@@ -364,7 +364,9 @@ fn revalidate_loop(
 /// identify objects their own way, and naming the field after one platform's
 /// word for it would quietly make this channel FUSE-only. The frontend
 /// translates; this enum says what changed.
-#[derive(Debug)]
+// `Clone` because a mount that also hosts the IPC socket tees each change to
+// both: the frontend's own emblem refresh and the socket's `watch` subscribers.
+#[derive(Debug, Clone)]
 pub enum Invalidation {
     /// An entry in a directory changed — added, removed, or its *availability*
     /// flipped: hydrated, evicted, pinned, unpinned.
@@ -408,8 +410,22 @@ pub enum FileState {
     OnlineOnly,
     /// A fresh copy is cached locally but evictable (not pinned).
     Cached,
-    /// Kept offline on purpose — pinned, or under a pinned directory/root.
+    /// Kept offline on purpose — pinned, or under a pinned directory/root —
+    /// **and** the copy is here. A pin alone is not enough: see
+    /// [`FileState::PinnedPending`].
     Pinned,
+    /// Pinned, but **nothing is here yet**: the promise has been made and the
+    /// bytes have not arrived.
+    ///
+    /// The gap is ordinary, not exotic. A pin on a directory covers files the
+    /// server grows later, and a pin on the account root covers everything that
+    /// will ever exist in it — neither downloads a file that did not exist when
+    /// the pin was made. Reporting those as [`FileState::Pinned`] claims an
+    /// offline copy the user does not have, which is exactly the promise they
+    /// would act on before boarding a train.
+    ///
+    /// `wusel update <path>` fetches them; so does the `auto` refresh policy.
+    PinnedPending,
     /// Pinned, and the copy we keep is **out of date**: the server has moved on.
     ///
     /// Only pinned files get this. For an ordinary cached file, going stale
@@ -429,22 +445,6 @@ pub enum FileState {
     /// conflict, no quota). The bytes are safe locally and the user has been
     /// told; it will not retry on its own.
     SyncError,
-}
-
-impl FileState {
-    /// The stable value for the `user.wusel.state` xattr that file-manager
-    /// extensions read. **A public contract — keep these strings stable.**
-    pub fn as_xattr(self) -> &'static str {
-        match self {
-            FileState::OnlineOnly => "online-only",
-            FileState::Cached => "cached",
-            FileState::Pinned => "pinned",
-            FileState::PinnedStale => "pinned-stale",
-            FileState::Modified => "modified",
-            FileState::Uploading => "uploading",
-            FileState::SyncError => "sync-error",
-        }
-    }
 }
 
 /// How deep the sync walk descends — a guard against a pathological tree, far
@@ -1322,9 +1322,14 @@ impl Provider {
                 .state
                 .node_by_inode(inode)?
                 .ok_or_else(|| Error::Other(format!("update: vanished: {path}")))?;
-            if !self.content.is_stale(&node) {
+            if self.content.is_cached(&node) {
                 return Ok(0);
             }
+            // Not `is_stale`: that is only true of a copy that is *here* and
+            // outdated, and a pinned file can equally well have no copy at all
+            // (pinned as part of a directory, added on the server afterwards).
+            // Both are the same promise left unkept, and both are mended by the
+            // same fetch.
             self.content.pin_file(&node)?;
             Ok(1)
         }
@@ -1341,7 +1346,8 @@ impl Provider {
         for child in self.state.children_of(inode)? {
             if child.is_dir {
                 done += self.refresh_dir(child.inode, depth + 1)?;
-            } else if self.content.is_stale(&child) {
+            } else if !self.content.is_cached(&child) {
+                // Outdated or never fetched — see `refresh`.
                 self.content.pin_file(&child)?;
                 done += 1;
             }
@@ -1375,7 +1381,13 @@ impl Provider {
 
     /// Remove the pin on `path` and drop eviction protection for the files it no
     /// longer covers (they become normal, evictable cache entries).
-    pub fn unpin(&mut self, path: &str) -> Result<()> {
+    ///
+    /// Returns whether `path` is *still* kept offline afterwards — which happens
+    /// when it is covered by a pinned ancestor folder, so removing its own pin
+    /// changes nothing. When it does, a [`Notice::PinnedByFolder`] tells the user
+    /// why the file stayed offline and what to do instead (act on the folder);
+    /// without it, unpinning a file inside a pinned folder looks broken.
+    pub fn unpin(&mut self, path: &str) -> Result<bool> {
         let path = path.trim_matches('/');
         self.pins.remove(path)?;
         for (node_path, file_id) in self.state.descendant_file_ids(path)? {
@@ -1383,7 +1395,13 @@ impl Provider {
                 self.content.unpin_file(file_id);
             }
         }
-        Ok(())
+        let still_pinned = self.pins.is_pinned(path)?;
+        if still_pinned {
+            self.desktop.notify(&Notice::PinnedByFolder {
+                path: path.to_string(),
+            });
+        }
+        Ok(still_pinned)
     }
 
     /// All pins as `(path, is_dir)`.
@@ -1392,6 +1410,26 @@ impl Provider {
     /// If the pins file cannot be read.
     pub fn pins(&self) -> Result<Vec<(String, bool)>> {
         self.pins.all()
+    }
+
+    /// Whether `path` is kept offline — pinned itself, under a pinned directory,
+    /// or covered by a root pin. A read accessor over the same pin store `pin`
+    /// and `unpin` write, so a frontend can show the current state (a Finder
+    /// "make available offline" toggle).
+    ///
+    /// # Errors
+    /// If the pins file cannot be read.
+    pub fn is_pinned(&self, path: &str) -> Result<bool> {
+        self.pins.is_pinned(path)
+    }
+
+    /// Whether `node`'s offline copy is out of date — a newer version exists on
+    /// the server than the blob we hold. Combined with [`is_pinned`](Self::is_pinned)
+    /// this is the `PinnedStale` state: a kept file that the server has moved past.
+    /// `false` for anything not cached.
+    #[must_use]
+    pub fn is_stale(&self, node: &NodeRow) -> bool {
+        self.content.is_stale(node)
     }
 
     /// Ensure a directory's children are in the state and fresh. Skips the

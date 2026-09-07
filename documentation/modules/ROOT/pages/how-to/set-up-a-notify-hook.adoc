@@ -62,7 +62,7 @@ set -eu
 
 kind=$(printf '%s' "$WUSEL_NOTICE_JSON" | jq -r .kind)
 case "$kind" in
-  upload-failed|connection-lost)
+  upload-failed|connection-lost|server-unavailable)
     curl -fsS -d "$WUSEL_NOTICE_BODY" "https://ntfy.example.org/wusel-alerts"
     ;;
   *)

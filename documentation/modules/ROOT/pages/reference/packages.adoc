@@ -120,7 +120,12 @@ install by default.
   xref:reference/file-states.adoc[File states].
 
 | `/usr/share/icons/hicolor/scalable/apps/at.itbh.Wusel.svg`
-| The application icon, used by the sidebar entry and the search results.
+| The full-colour application icon — the app-grid / launcher entry and the search
+  results.
+
+| `/usr/share/icons/hicolor/symbolic/apps/at.itbh.Wusel-symbolic.svg`
+| The monochrome variant GTK re-tints to the theme foreground. The file-manager
+  sidebar entry uses it, so it stays legible in Dark Mode.
 
 | `/usr/share/applications/at.itbh.Wusel.desktop`
 | The launcher entry the search provider resolves its identity from.

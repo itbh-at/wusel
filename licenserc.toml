@@ -26,6 +26,7 @@ includes = [
   "documentation/*.yml",
   "documentation/diagrams/*.d2",
   "documentation/modules/**/*.adoc",
+  "macos/**",
 ]
 
 excludes = [

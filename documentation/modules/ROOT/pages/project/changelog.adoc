@@ -14,6 +14,52 @@ the RPM is terse because a package changelog is, this page has room to say why.
 The format follows https://keepachangelog.com/en/1.1.0/[Keep a Changelog]; the
 project uses https://semver.org/[Semantic Versioning].
 
+== 0.4.0 — 2026-09-07
+
+=== Added
+
+* **Experimental macOS support** — a native File Provider frontend. Your Nextcloud
+  appears in Finder, with macOS's own downloaded / online-only indicators, an
+  emblem for files kept offline, and pin / unpin from the Finder context menu; it
+  runs on the same engine as Linux. Experimental, and built from source for now —
+  see xref:reference/platform-support.adoc[Platform support].
+
+* **Real storage quota.** `df ~/Wusel` now shows the account's actual total and
+  free space where the server sets a quota, instead of a fixed placeholder; where
+  the server sets none, the used figure is still reported truthfully.
+
+* **Team and Group folder roots are marked**, so a file manager can tell a
+  group-folder root from an ordinary folder.
+
+* **An opt-in notify hook** turns each engine notice into a script call — desktop
+  notifications on a headless box, and on any platform. See
+  xref:how-to/set-up-a-notify-hook.adoc[Set up a notify hook].
+
+* **The documentation is searchable** — a client-side index, no server.
+
+* **A page on how Wusel compares to Nextcloud's own client.** Nextcloud's desktop
+  client now has an open beta for on-demand files on Linux, built on a separate
+  FUSE helper; xref:explanation/compared-to-the-official-client.adoc[Compared to
+  the official Nextcloud client] lays out how a filesystem differs from a sync
+  client with an on-demand layer, and where the official client is ahead.
+
+=== Changed
+
+* **Per-file status is served over the wusel-ipc socket**, not written onto the
+  file as an extended attribute. A file's status no longer travels with it when
+  it is copied out of the mount, and one protocol serves every file manager and
+  platform. See xref:explanation/status-protocol.adoc[the status protocol].
+
+* **The GNOME Shell search is more responsive** — queries are cached, and a
+  pending row shows while one runs.
+
+=== Fixed
+
+* A saved file shows its new size at once in the mount.
+
+* Desktop polish: the launcher no longer says "(Nextcloud)", and the app-grid
+  icons are corrected.
+
 == 0.3.2 — 2026-08-27
 
 === Fixed

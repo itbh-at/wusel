@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 IT Beratung Hermann GmbH
+
+[package]
+name = "wusel-ipc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Wusel — a socket frontend that speaks the engine's intent protocol"
+publish.workspace = true
+
+# The Rust half of a future macOS File Provider extension: it exposes the
+# engine's intent API over a local Unix-domain socket, so a platform frontend
+# (Swift/File Provider, a Windows Cloud Filter host) can drive reads without
+# linking the engine or reaching past its intent boundary. Platform-independent
+# and fully testable natively — no FUSE, no OS integration.
+
+[dependencies]
+wusel-core = { path = "../wusel-core" }
+wusel-fsm = { path = "../wusel-fsm" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+# For `geteuid` alone: the socket carries full account access, so it must prove
+# a connecting peer is the user running the daemon. Already in the tree (the
+# mount and the CLI use it); no new third-party surface.
+libc = "0.2"
+
+[dev-dependencies]
+# The integration test builds the real engine against the in-process mock,
+# exactly as the mount does, and drives it over the socket.
+wusel-mock = { path = "../wusel-mock" }
+reqwest = { workspace = true }
+tokio = { workspace = true }

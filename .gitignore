@@ -32,3 +32,7 @@ documentation/build/
 
 # Native Nautilus extension build output
 integration/nautilus/*.so
+
+# Written by documentation/build.sh: a symlink to the mise-installed lunr
+# extension, so antora resolves the playbook's `require:` entry.
+documentation/node_modules/

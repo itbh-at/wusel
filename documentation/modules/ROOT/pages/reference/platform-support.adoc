@@ -17,27 +17,33 @@ it links here rather than restating it.
 
 | Linux
 | supported
-| The mount is a FUSE filesystem (libfuse3). This is the only platform where
-  Wusel is a usable drive.
+| The mount is a FUSE filesystem (libfuse3). This is the reference platform — the
+  most complete and most heavily tested.
 
 | macOS
-| not supported
-| No FUSE, so the FUSE frontend is compiled out and the daemon returns a clear
-  error rather than a broken mount. The engine and CLI do build and test
-  natively, which is what makes development from a Mac possible — see
+| experimental
+| A native File Provider extension (not FUSE): files appear in Finder, macOS's
+  own indicators show downloaded vs online-only, an extra emblem marks items kept
+  offline, and pin / unpin run from the Finder context menu. It is a macOS app
+  bundle with a sandboxed File Provider extension, bridged to the same engine
+  Linux uses over the xref:explanation/status-protocol.adoc[wusel-ipc socket].
+  Treat it as experimental: there is no packaged build yet — to try it you build
+  the Xcode project in the repository yourself — and a signed App Store build is
+  the goal (xref:project/roadmap.adoc[roadmap]). Building the engine from a Mac is
   xref:how-to/develop-on-macos.adoc[Develop on macOS].
 
 | Windows
 | not supported
-| As macOS.
+| Not built yet — planned as a native Cloud Filter frontend, not FUSE. See the
+  xref:project/roadmap.adoc[roadmap].
 |===
 
-Native frontends for macOS (File Provider Extension) and Windows (Cloud Filter)
-are far-future, experimental work — each an adapter over the same facade, and
-deliberately *not* a FUSE-compatibility shim. If Wusel ever ships there, it
-rides the native framework. See xref:project/roadmap.adoc[the roadmap] for the
-order, and xref:explanation/portability.adoc[Portability] for what has to be
-true now for that to stay affordable.
+The macOS frontend (File Provider) is here now, as experimental work; the Windows
+one (Cloud Filter) is still ahead. Each is an adapter over the same facade —
+deliberately *not* a FUSE-compatibility shim, but the native framework. See
+xref:project/roadmap.adoc[the roadmap] for the order, and
+xref:explanation/portability.adoc[Portability] for what has to stay true for that
+to remain affordable.
 
 IMPORTANT: Running the mount inside a podman container on macOS or Windows is a
 *development and test* path, not a product. The mount then lives inside podman's

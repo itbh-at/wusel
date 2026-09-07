@@ -257,7 +257,17 @@ impl Engine {
     }
 
     pub fn unpin(&mut self, path: &str) -> wusel_core::Result<()> {
+        self.provider.unpin(path).map(|_| ())
+    }
+
+    /// Like [`unpin`](Self::unpin) but returns whether the path stays offline
+    /// afterwards (covered by a pinned ancestor).
+    pub fn unpin_reports_covered(&mut self, path: &str) -> wusel_core::Result<bool> {
         self.provider.unpin(path)
+    }
+
+    pub fn is_pinned(&self, path: &str) -> wusel_core::Result<bool> {
+        self.provider.is_pinned(path)
     }
 
     pub fn pins(&self) -> wusel_core::Result<Vec<(String, bool)>> {

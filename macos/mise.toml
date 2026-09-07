@@ -1,0 +1,50 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 IT Beratung Hermann GmbH
+
+# macOS-only toolchain and tasks for the File Provider frontend.
+#
+# This lives under `macos/` on purpose: the Linux test container reads the
+# repository-root mise.toml, and XcodeGen (a macOS-only, Xcode-dependent tool)
+# has no Linux build — pinning it at the root would break `mise install` in the
+# container. mise merges configs from the cwd upward, so a task run from `macos/`
+# sees this file *and* the root one; a task run from the root never sees this.
+# It also keeps the whole macOS frontend self-contained, ready to split into its
+# own repository later.
+
+[tools]
+xcodegen = "2.46.0"   # generate Wusel.xcodeproj from project.yml (aqua backend)
+
+# --- macOS frontend tasks (run from macos/) ---------------------------------
+
+# Regenerate the Xcode project from project.yml. The .xcodeproj is a generated
+# artifact and git-ignored — project.yml is the source of truth (the same reason
+# the docs render SVGs from D2 rather than committing hand-drawn ones).
+[tasks.project]
+description = "Generate Wusel.xcodeproj from project.yml (XcodeGen)"
+run = "xcodegen generate --spec project.yml"
+
+# Build the engine binary and copy it into the app's Resources, so the agent can
+# launch `wusel serve` from inside its own bundle. `wusel` builds without the
+# `fuse` feature (serve needs no mount), so it is a plain macOS CLI binary here.
+# Run before building the app whenever the engine changed.
+[tasks.bundle-wusel]
+description = "Build the engine binary and bundle it into the app (Resources/wusel)"
+run = """
+cargo build --release -p wusel --manifest-path ../Cargo.toml
+mkdir -p Resources
+cp ../target/release/wusel Resources/wusel
+echo ">> bundled $(../target/release/wusel --version 2>/dev/null || echo wusel) into Resources/"
+"""
+
+# Build both targets without a signing identity, so anyone can compile the
+# skeleton with no Apple Developer account. Signing and Finder registration are
+# each contributor's own responsibility (see README.adoc) and never live in the
+# repository.
+[tasks.build]
+description = "Build the agent app + File Provider extension (unsigned)"
+depends = ["project"]
+run = """
+xcodebuild -project Wusel.xcodeproj -scheme WuselAgent -configuration Debug \
+  -destination 'platform=macOS' \
+  CODE_SIGNING_ALLOWED=NO build
+"""

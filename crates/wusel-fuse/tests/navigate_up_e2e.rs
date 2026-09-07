@@ -79,22 +79,11 @@ fn navigating_a_loaded_stale_directory_under_load_does_not_hang() {
                         continue;
                     };
                     for entry in rd.flatten() {
-                        // getattr + the emblem xattr, per entry — the flood.
+                        // getattr per entry — the flood. The emblem read
+                        // that used to accompany it is a socket query now, not
+                        // a syscall, so it is no longer part of what the kernel
+                        // path has to survive.
                         let _ = std::fs::symlink_metadata(entry.path());
-                        let mut buf = [0u8; 64];
-                        unsafe {
-                            let c = std::ffi::CString::new(
-                                entry.path().as_os_str().to_string_lossy().as_bytes(),
-                            )
-                            .unwrap();
-                            let name = std::ffi::CString::new("user.wusel.state").unwrap();
-                            libc::getxattr(
-                                c.as_ptr(),
-                                name.as_ptr(),
-                                buf.as_mut_ptr().cast(),
-                                buf.len(),
-                            );
-                        }
                     }
                 }
             }

@@ -18,19 +18,17 @@
 //! [`Intent`]: wusel_fsm::Intent
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use fuser::{
     Errno, FileHandle, FileType, FopenFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
-    ReplyEmpty, ReplyEntry, ReplyWrite, ReplyXattr,
+    ReplyEmpty, ReplyEntry, ReplyWrite,
 };
-use wusel_core::provider::FileState;
-use wusel_core::runtime::{Answered, Payload};
+use wusel_core::runtime::{Answered, Payload, SubmitHandle};
 use wusel_core::state::NodeRow;
 use wusel_fsm::{Failure, Outcome, RequestId};
 
-use crate::fs::{reply_xattr, to_attr, DirStreams, GENERATION, TTL};
+use crate::fs::{to_attr, DirStreams, GENERATION, TTL};
 
 /// Map a machine failure onto the errno the kernel expects.
 ///
@@ -58,35 +56,12 @@ pub fn errno_for(failure: Failure) -> Errno {
 ///
 /// One variant per shape the kernel expects back, because a reply object can
 /// only be completed one way and the compiler should enforce which.
-/// Which extended attribute a `getxattr` asked for. Both are answered from one
-/// state read, so the choice is carried with the pending reply.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum XattrName {
-    State,
-    Kind,
-}
-
 pub enum Pending {
     Attr(ReplyAttr),
     Entry(ReplyEntry),
     Data(ReplyData),
     Empty(ReplyEmpty),
     Written(ReplyWrite),
-    /// The xattr protocol asks twice: first for the size, then for the value.
-    Xattr {
-        reply: ReplyXattr,
-        size: u32,
-        /// Which attribute was asked for — both are answered from the one
-        /// state read, so the request does not say it twice.
-        want: XattrName,
-    },
-    /// `listxattr`: the names we expose, and only those the object actually
-    /// has — so `getfattr -d` on an unpinned directory shows nothing rather
-    /// than an empty-valued attribute.
-    XattrList {
-        reply: ReplyXattr,
-        size: u32,
-    },
     Created(ReplyCreate),
     /// A directory chunk. The listing is assembled here and kept for the
     /// stream's continuation chunks — a snapshot, so a background refresh
@@ -141,46 +116,6 @@ impl Pending {
                 (Some(e), _) => reply.error(e),
                 (None, _) => reply.error(Errno::EIO),
             },
-            Pending::Xattr { reply, size, want } => match (failure, payload) {
-                (None, Payload::State { state, group_root }) => match want {
-                    // A directory carries no content state (`None`); reporting
-                    // its state attribute as absent is the honest answer, the
-                    // same one an unpinned file's caller would expect.
-                    XattrName::State => match state {
-                        Some(s) => reply_xattr(reply, state_bytes(*s).as_bytes(), size),
-                        None => reply.error(Errno::ENODATA),
-                    },
-                    // Absent, not empty, on everything that is not one: an
-                    // attribute that exists with no value would make every
-                    // ordinary folder look like it had been considered and
-                    // rejected.
-                    XattrName::Kind if *group_root => {
-                        reply_xattr(reply, crate::fs::KIND_GROUP_FOLDER.as_bytes(), size);
-                    }
-                    XattrName::Kind => reply.error(Errno::ENODATA),
-                },
-                // No state is not an error the caller should see as one: an
-                // unpinned directory simply has no emblem.
-                (None, _) | (Some(Errno::ENOENT), _) => reply.error(Errno::ENODATA),
-                (Some(e), _) => reply.error(e),
-            },
-            Pending::XattrList { reply, size } => {
-                let mut list = Vec::new();
-                if let (None, Payload::State { state, group_root }) = (failure, payload) {
-                    // Only list an attribute that actually answers: a directory
-                    // with no state omits `state`, a group-folder root adds
-                    // `kind`. `getxattr` and `listxattr` must agree on presence.
-                    if state.is_some() {
-                        list.extend_from_slice(crate::fs::STATE_XATTR.as_bytes());
-                        list.push(0); // NUL-separated and NUL-terminated
-                    }
-                    if *group_root {
-                        list.extend_from_slice(crate::fs::KIND_XATTR.as_bytes());
-                        list.push(0);
-                    }
-                }
-                reply_xattr(reply, &list, size);
-            }
             Pending::Created(reply) => match (failure, node(payload)) {
                 (None, Some(n)) => reply.created(
                     &TTL,
@@ -211,7 +146,6 @@ impl Pending {
             Pending::Data(r) => r.error(errno),
             Pending::Empty(r) => r.error(errno),
             Pending::Written(r) => r.error(errno),
-            Pending::Xattr { reply, .. } | Pending::XattrList { reply, .. } => reply.error(errno),
             Pending::Created(r) => r.error(errno),
             Pending::Dir { reply, .. } => reply.error(errno),
         }
@@ -285,28 +219,28 @@ fn node(payload: &Payload) -> Option<&NodeRow> {
     }
 }
 
-fn state_bytes(state: FileState) -> &'static str {
-    state.as_xattr()
-}
-
 /// The ticket list: replies parked while their work runs.
 pub struct Replies {
     pending: Mutex<HashMap<RequestId, Pending>>,
-    next: AtomicU64,
+    /// Ids come from the substrate, not from a counter of our own: the IPC
+    /// socket serves the file manager off the *same* substrate, and two
+    /// allocators would hand out one number twice. Whichever frontend then held
+    /// that id first would take the other's answer.
+    ids: SubmitHandle,
 }
 
 impl Replies {
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(ids: SubmitHandle) -> Self {
         Self {
             pending: Mutex::new(HashMap::new()),
-            next: AtomicU64::new(1),
+            ids,
         }
     }
 
     /// Park a reply and return the ticket to submit with.
     pub fn park(&self, reply: Pending) -> RequestId {
-        let id = RequestId(self.next.fetch_add(1, Ordering::Relaxed));
+        let id = self.ids.next_request_id();
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -333,20 +267,30 @@ impl Replies {
             .remove(&id)
     }
 
-    fn deliver(&self, answered: &Answered, ctx: &PumpContext) {
+    /// Complete every reply this answer belongs to. An id we do not hold is
+    /// handed to `extra` — the other frontend on this substrate (see
+    /// [`ExtraRoute`]).
+    ///
+    /// Per id, not per answer, because one [`Answered`] can carry several: a
+    /// second reader joins a transfer already running, and the two callers may
+    /// well be different frontends — a Nautilus status query joining the read a
+    /// user's editor started. Routing the whole answer to one side would strand
+    /// the other's caller.
+    fn deliver(&self, answered: &Answered, ctx: &PumpContext, extra: Option<&ExtraRoute>) {
         for id in &answered.requests {
             if let Some(pending) = self.take(*id) {
                 pending.complete(answered.outcome, &answered.payload, ctx);
+            } else if let Some(extra) = extra {
+                extra(*id, answered);
             }
         }
     }
 }
 
-impl Default for Replies {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+/// A second consumer of the substrate's answer stream, tried for any id the
+/// mount's own ticket list does not hold. Defined beside the engine, so the
+/// mount and the socket name one type rather than two identical ones.
+pub use wusel_core::runtime::AnswerRoute as ExtraRoute;
 
 /// Drain answers and complete the replies they belong to.
 ///
@@ -357,12 +301,13 @@ pub fn spawn_pump(
     answers: std::sync::mpsc::Receiver<Answered>,
     replies: Arc<Replies>,
     ctx: PumpContext,
+    extra: Option<ExtraRoute>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("wusel-fuse-replies".into())
         .spawn(move || {
             while let Ok(answered) = answers.recv() {
-                replies.deliver(&answered, &ctx);
+                replies.deliver(&answered, &ctx, extra.as_ref());
             }
         })
         .expect("spawn the reply pump")

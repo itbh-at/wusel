@@ -163,6 +163,84 @@ impl DiagHandle {
     }
 }
 
+/// Where an answer goes when the frontend that owns the substrate does not hold
+/// its request id — the *other* frontend riding the same engine.
+///
+/// One substrate can carry two frontends (a FUSE mount and the IPC socket a file
+/// manager queries). Both mint ids from one [`SubmitHandle`], so every id belongs
+/// to exactly one of them, and the owner's reply pump completes what is its own
+/// and hands the rest here. Per id rather than per [`Answered`], because one
+/// answer can carry several: a second reader joining a running transfer may well
+/// be the other frontend.
+pub type AnswerRoute = Arc<dyn Fn(RequestId, &Answered) + Send + Sync>;
+
+/// A cloneable, `Send + Sync` handle onto a running substrate's request path:
+/// mint an id, submit, abandon. Everything a frontend needs to ask the engine
+/// something, and nothing that owns the engine's lifetime — the same split
+/// [`DiagHandle`] makes for diagnostics.
+///
+/// It exists because one substrate serves **two** frontends at once: the FUSE
+/// mount and the IPC socket a file manager queries. The [`Substrate`] itself
+/// moves into the FUSE session and cannot be shared; this can.
+///
+/// The id allocator rides along deliberately, rather than each frontend keeping
+/// its own counter. Two counters over one answer stream would hand out the same
+/// number twice, and an answer would go to whichever frontend held that id first
+/// — one caller's directory listing surfacing as another's file read. One
+/// allocator makes that unrepresentable.
+#[derive(Clone)]
+pub struct SubmitHandle {
+    to_fsm: Sender<Event>,
+    inbox: Inbox,
+    next_id: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl SubmitHandle {
+    /// The next request id on this substrate, unique across every frontend
+    /// sharing it.
+    #[must_use]
+    pub fn next_request_id(&self) -> RequestId {
+        RequestId(
+            self.next_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// Hand a request to the deciding thread. See [`Substrate::submit`].
+    ///
+    /// # Errors
+    /// If the substrate has stopped.
+    pub fn submit(&self, request: Request) -> crate::Result<()> {
+        self.to_fsm
+            .send(Event::Request(request))
+            .map_err(|_| crate::Error::Other("the decider is gone".into()))
+    }
+
+    /// Hand a request that carries bytes. See [`Substrate::submit_write`].
+    ///
+    /// # Errors
+    /// If the substrate has stopped.
+    pub fn submit_write(&self, request: Request, data: Vec<u8>) -> crate::Result<()> {
+        self.inbox
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(request.object)
+            .or_default()
+            .push_back(data);
+        self.submit(request)
+    }
+
+    /// Give up on a request. See [`Substrate::abandon`].
+    ///
+    /// # Errors
+    /// If the substrate has stopped.
+    pub fn abandon(&self, request: RequestId) -> crate::Result<()> {
+        self.to_fsm
+            .send(Event::Abandon(request))
+            .map_err(|_| crate::Error::Other("the decider is gone".into()))
+    }
+}
+
 /// What a step produced, on its way to whoever is waiting.
 ///
 /// Kept beside the machine rather than inside it: results are not decisions,
@@ -494,6 +572,9 @@ pub struct Substrate {
     uploader_shutdown: Option<Sender<()>>,
     /// See [`Context::quota`].
     quota: Option<Arc<QuotaCache>>,
+    /// The one request-id allocator for every frontend on this substrate. See
+    /// [`SubmitHandle`] for why it is shared rather than per-frontend.
+    next_id: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Substrate {
@@ -645,9 +726,24 @@ impl Substrate {
                 done: Mutex::new(Some(done_rx)),
                 uploader_shutdown,
                 quota: ctx.quota.clone(),
+                // Ids start at 1: zero is left free so a frontend's "no request
+                // yet" sentinel can never be mistaken for a real one.
+                next_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             },
             answers_rx,
         ))
+    }
+
+    /// A cloneable handle onto this substrate's request path, for a frontend
+    /// that does not own it — the IPC socket served beside the FUSE mount. See
+    /// [`SubmitHandle`].
+    #[must_use]
+    pub fn submit_handle(&self) -> SubmitHandle {
+        SubmitHandle {
+            to_fsm: self.to_fsm.clone(),
+            inbox: Arc::clone(&self.inbox),
+            next_id: Arc::clone(&self.next_id),
+        }
     }
 
     /// The account's real storage quota right now, or `None` if this substrate
@@ -1512,13 +1608,11 @@ impl Worker {
         base_etag: &str,
         mtime: Option<i64>,
     ) -> crate::Result<()> {
-        // The upload target, resolved now and stored — not re-walked later, when
-        // a rename may have moved the object.
-        let remote_path = self
-            .db
-            .node_by_inode(object.0)?
-            .map(|n| n.path)
-            .unwrap_or_default();
+        // Fetch the row once: its path is the upload target — resolved now and
+        // stored, not re-walked later when a rename may have moved the object —
+        // and its parent/name identify the entry whose emblem refreshes below.
+        let node = self.db.node_by_inode(object.0)?;
+        let remote_path = node.as_ref().map(|n| n.path.clone()).unwrap_or_default();
         // The bytes must be on disk before "saved" is true: the pending record
         // points at this buffer, and a crash must not leave it pointing at a
         // half-written file.
@@ -1535,7 +1629,23 @@ impl Worker {
             let _ = self.db.set_size(object.0, meta.len());
         }
         self.db
-            .mark_pending_upload(object, &remote_path, base_etag, mtime)
+            .mark_pending_upload(object, &remote_path, base_etag, mtime)?;
+        // Nudge the file manager to re-read this file's emblem, so it shows
+        // "uploading" the moment the save commits — the same Entry the hydrator
+        // and the sync walk emit. Emblem only: the frontend turns Entry into an
+        // extension re-read, never a kernel notification (see the FUSE drain
+        // thread), so it carries none of the storm risk that keeps the kernel
+        // path closed.
+        if let (Some(node), Some(write)) = (node.as_ref(), self.write.as_ref()) {
+            let _ = write
+                .invalidations
+                .send(crate::provider::Invalidation::Entry {
+                    parent: node.parent,
+                    name: node.name.clone(),
+                    path: node.path.clone(),
+                });
+        }
+        Ok(())
     }
 
     /// Carry out one job.
@@ -1817,6 +1927,20 @@ impl Worker {
         if self.stale_copy_ok(&node) {
             node.permissions = withdraw_write(&node.permissions);
         }
+        // While a file is being written locally its true length lives in the
+        // write buffer; the row's `size` is only committed at flush. Report the
+        // buffer's length so `getattr`/`lookup` reflect the growing size at once
+        // — the way a native filesystem does. Without it a `stat` mid-write sees
+        // the pre-write size (0 for a fresh file), and every atomic save trips on
+        // exactly that: an editor writes a `.goutputstream-*`/temp, the file
+        // manager stats it while it is still being written (0), then the temp is
+        // renamed over the target and the stale 0 is carried onto it until the
+        // directory is reloaded.
+        if !node.is_dir {
+            if let Ok(meta) = std::fs::metadata(self.buffer_path(ObjectId(node.inode))) {
+                node.size = meta.len();
+            }
+        }
         let facts = self.facts_for(&node);
         (Completion::Node(facts), Payload::Node(Box::new(node)))
     }
@@ -1896,12 +2020,25 @@ impl Worker {
             return Err(crate::Error::NotFound);
         };
         if self.pins.is_pinned(&node.path)? {
-            // Kept on purpose, but the server has moved on: say so now rather
-            // than let the user find out when they are already offline.
-            return Ok(if self.content.is_stale(&node) {
+            // A pin is a promise, and the emblem must report the promise as it
+            // actually stands — anything else is read as "this is on your disk"
+            // by someone about to lose the network. A directory pin covers files
+            // the server grows afterwards, so "pinned but not here" is the
+            // everyday case, not an edge one.
+            //
+            // A directory is exempt: it has no content of its own to be here or
+            // missing, and its pin is a promise about the subtree.
+            if node.is_dir {
+                return Ok(FileState::Pinned);
+            }
+            return Ok(if self.content.is_cached(&node) {
+                FileState::Pinned
+            } else if self.content.is_stale(&node) {
+                // Here, but the server has moved on: say so now rather than let
+                // the user find out when they are already offline.
                 FileState::PinnedStale
             } else {
-                FileState::Pinned
+                FileState::PinnedPending
             });
         }
         if node.is_dir {

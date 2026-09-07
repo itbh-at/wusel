@@ -213,25 +213,48 @@ pub fn notify(_notice: &wusel_core::desktop::Notice) -> Result<(), String> {
     Err("desktop notifications are only implemented on Linux".to_string())
 }
 
-/// Run the GNOME Shell search provider (`org.gnome.Shell.SearchProvider2`) until
-/// the process is killed. `search` answers a query (typically via Nextcloud
-/// Unified Search) and `activate` opens a chosen result. This is a D-Bus
-/// service GNOME Shell activates on demand — independent of the mount daemon.
-/// Blocks; returns only on a setup error.
+/// Announce one file's changed state **synchronously**, for a short-lived
+/// process — `wusel pin`/`unpin`, which perform the change in their own process
+/// and are gone moments later.
+///
+/// [`backend`] cannot serve them: it hands the signal to a worker thread that
+/// first connects to the bus and registers as a cloud provider, and the process
+/// exits long before any of that finishes, so the signal is never written. It
+/// also has no business owning the daemon's bus name for the half-second it
+/// lives. This is the one call it actually needs, and it returns only once the
+/// signal is on the bus.
 #[cfg(target_os = "linux")]
-pub fn run_search_provider<S, A>(search: S, activate: A) -> Result<(), String>
-where
-    S: Fn(&str) -> Vec<wusel_core::search::SearchHit> + Send + Sync + 'static,
-    A: Fn(&wusel_core::search::SearchHit) + Send + Sync + 'static,
-{
-    linux::run_search_provider(Box::new(search), Box::new(activate))
+pub fn announce_file_changed(abs_path: &str) -> Result<(), String> {
+    linux::file_changed_once(abs_path)
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn run_search_provider<S, A>(_search: S, _activate: A) -> Result<(), String>
+pub fn announce_file_changed(_abs_path: &str) -> Result<(), String> {
+    Err("the file-manager status signal is only implemented on Linux".to_string())
+}
+
+/// Run the GNOME Shell search provider (`org.gnome.Shell.SearchProvider2`) until
+/// the process is killed. `search` answers a query (typically via Nextcloud
+/// Unified Search), `activate` opens a chosen result, and `launch` opens the
+/// full result list (GNOME calls it when the user clicks the "N more" row or the
+/// provider header). This is a D-Bus service GNOME Shell activates on demand —
+/// independent of the mount daemon. Blocks; returns only on a setup error.
+#[cfg(target_os = "linux")]
+pub fn run_search_provider<S, A, L>(search: S, activate: A, launch: L) -> Result<(), String>
 where
     S: Fn(&str) -> Vec<wusel_core::search::SearchHit> + Send + Sync + 'static,
     A: Fn(&wusel_core::search::SearchHit) + Send + Sync + 'static,
+    L: Fn(&[String]) + Send + Sync + 'static,
+{
+    linux::run_search_provider(Box::new(search), Box::new(activate), Box::new(launch))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn run_search_provider<S, A, L>(_search: S, _activate: A, _launch: L) -> Result<(), String>
+where
+    S: Fn(&str) -> Vec<wusel_core::search::SearchHit> + Send + Sync + 'static,
+    A: Fn(&wusel_core::search::SearchHit) + Send + Sync + 'static,
+    L: Fn(&[String]) + Send + Sync + 'static,
 {
     Err("the search provider is only implemented on Linux".to_string())
 }
@@ -636,7 +659,7 @@ mod linux {
                 Account {
                     name: display,
                     path: mount.to_string(),
-                    icon: "at.itbh.Wusel".to_string(),
+                    icon: "at.itbh.Wusel-symbolic".to_string(),
                     status,
                     status_details: String::new(),
                 },
@@ -685,6 +708,29 @@ mod linux {
         let conn = connect_session_bus().map_err(|e| format!("no session D-Bus: {e}"))?;
         show(&conn, notice, &desktop::ui_locale())
             .map_err(|e| format!("the Notify D-Bus call failed: {e}"))
+    }
+
+    /// Open a session connection, emit one `FileChanged`, and wait until it is
+    /// really on the bus — the path a short-lived `wusel pin`/`unpin` takes.
+    ///
+    /// The `Ping` afterwards is the wait: a signal is fire-and-forget, so
+    /// without a round-trip behind it the process could exit with the message
+    /// still in the connection's write queue — exactly the race that made the
+    /// emblem never update. The bus answers `Ping` only after it has taken the
+    /// signal, so a reply proves the signal went out.
+    pub fn file_changed_once(abs_path: &str) -> Result<(), String> {
+        let conn = connect_session_bus().map_err(|e| format!("no session D-Bus: {e}"))?;
+        emit_file_changed(&conn, abs_path)
+            .map_err(|e| format!("the FileChanged signal failed: {e}"))?;
+        conn.call_method(
+            Some("org.freedesktop.DBus"),
+            "/org/freedesktop/DBus",
+            Some("org.freedesktop.DBus.Peer"),
+            "Ping",
+            &(),
+        )
+        .map_err(|e| format!("the session bus did not answer: {e}"))?;
+        Ok(())
     }
 
     /// Render one notice as a localized, severity-styled freedesktop notification —
@@ -736,10 +782,12 @@ mod linux {
 
     type SearchFn = Box<dyn Fn(&str) -> Vec<SearchHit> + Send + Sync>;
     type ActivateFn = Box<dyn Fn(&SearchHit) + Send + Sync>;
+    type LaunchFn = Box<dyn Fn(&[String]) + Send + Sync>;
 
     struct SearchProvider {
         search: SearchFn,
         activate: ActivateFn,
+        launch: LaunchFn,
         /// Results from the last query, keyed by the id we handed GNOME Shell, so
         /// `GetResultMetas`/`ActivateResult` can resolve an id back to its hit.
         cache: std::sync::Mutex<HashMap<String, SearchHit>>,
@@ -814,16 +862,23 @@ mod linux {
         }
 
         #[zbus(name = "LaunchSearch")]
-        fn launch_search(&self, _terms: Vec<String>, _timestamp: u32) {
-            // No standalone search UI to open; results already appear in the
-            // overview. (Could open the Nextcloud web search later.)
+        fn launch_search(&self, terms: Vec<String>, _timestamp: u32) {
+            // Clicking the provider header or the "N more" row lands here. The
+            // Shell only ever shows the first few hits, so this is the way to
+            // reach the rest — open the query in the Nextcloud web UI.
+            (self.launch)(&terms);
         }
     }
 
-    pub fn run_search_provider(search: SearchFn, activate: ActivateFn) -> Result<(), String> {
+    pub fn run_search_provider(
+        search: SearchFn,
+        activate: ActivateFn,
+        launch: LaunchFn,
+    ) -> Result<(), String> {
         let provider = SearchProvider {
             search,
             activate,
+            launch,
             cache: std::sync::Mutex::new(HashMap::new()),
         };
         // Keep the connection alive for the process's lifetime; its object server

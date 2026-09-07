@@ -27,11 +27,12 @@ sync.
 </div>
 ++++
 
-It needs Linux. The mount works on any desktop, and on a server with none at
-all; the parts that make it feel native — the sidebar entry, the per-file
-emblems, the search — are GNOME and Nautilus for now.
-xref:reference/platform-support.adoc[Platform support] says exactly what is
-tested where.
+It runs best on Linux, where the mount is a FUSE filesystem — on any desktop, or
+on a server with none at all — and the parts that make it feel native (the
+sidebar entry, the per-file emblems, the search) are GNOME and Nautilus. macOS
+has experimental support too, as a native Finder integration.
+xref:reference/platform-support.adoc[Platform support] says exactly what runs
+where.
 
 == Where do you want to start?
 
@@ -70,8 +71,10 @@ xref:explanation/vfs-first.adoc[Why nothing is downloaded up front]
 == What it is
 
 Wusel is written in Rust and is *VFS-first*: files are online-only by default
-and are fetched on access. That is what the official Nextcloud client still does
-not offer on Linux, where it can only mirror everything to disk.
+and are fetched on access. No released version of the official Nextcloud client
+offers that on Linux, where it mirrors everything to disk; an opt-in beta mode
+built on a separate FUSE process is in review
+(xref:explanation/compared-to-the-official-client.adoc[Compared to the official Nextcloud client]).
 
 It is also deliberately *more than a FUSE mount*. FUSE only makes the files
 appear; on top of it Wusel behaves like a part of the desktop rather than a
@@ -85,8 +88,8 @@ provides — the file manager's sidebar, the shell's search, the system's
 notifications, the OS keyring — over reinventing them in an app window or a tray
 icon. Fewer moving parts, and an experience that feels native because it is.
 
-Native frontends for macOS (File Provider) and Windows (Cloud Filter) are
-planned but not built; see the xref:project/roadmap.adoc[roadmap].
+A native macOS frontend (File Provider) exists and is **experimental**; a
+Windows one (Cloud Filter) is planned. See the xref:project/roadmap.adoc[roadmap].
 
 Wusel is built by https://itbh.at/en/wusel/[IT Beratung Hermann], who also offer
 commercial support for it. The source is the whole product and always will be —

@@ -1,0 +1,18 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 IT Beratung Hermann GmbH
+//
+// Template for your own signing. Copy this file to `Local.xcconfig` (same
+// directory) and set your Apple Developer Team ID. `Local.xcconfig` is
+// git-ignored, so your identity never enters the repository.
+//
+//   cp Config/Local.xcconfig.example Config/Local.xcconfig
+//   # then set DEVELOPMENT_TEAM below, then: mise run project
+//
+// Find your Team ID with:
+//   security find-identity -v -p codesigning   # the 10-char id in parentheses
+//
+// Signing style is already Automatic (project.yml); this only supplies the team.
+// A File Provider extension needs a real team to load in Finder — ad-hoc will
+// register but then fail with providerNotFound.
+
+DEVELOPMENT_TEAM = YOUR_TEAM_ID

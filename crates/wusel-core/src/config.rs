@@ -59,6 +59,28 @@ pub fn state_dir() -> PathBuf {
     xdg_dir("XDG_STATE_HOME", ".local/state").join("wusel")
 }
 
+/// Where the IPC socket lives: `$XDG_RUNTIME_DIR/wusel` when there is a session
+/// runtime directory, else [`state_dir`].
+///
+/// Deliberately **not** [`runtime_dir`], whose fallback is the temp directory.
+/// That is the right trade for the diagnostics socket, which serves name-free
+/// counters; this socket carries the whole intent protocol — file contents,
+/// writes to the server, the change stream — and a world-traversable `/tmp` is
+/// no place for it. `XDG_RUNTIME_DIR` really is absent in the cases that matter
+/// (a systemd *system* unit, cron, `su`, a container), which is exactly when the
+/// fallback would be used. `$HOME` is private and survives the same cases.
+///
+/// The socket is per-user in either location; `wusel_ipc::serve` proves the
+/// directory is ours and 0700 before it binds.
+pub fn ipc_dir() -> PathBuf {
+    if let Ok(val) = std::env::var("XDG_RUNTIME_DIR") {
+        if !val.is_empty() {
+            return PathBuf::from(val).join("wusel");
+        }
+    }
+    state_dir()
+}
+
 /// `$XDG_CACHE_HOME/wusel` or `~/.cache/wusel`.
 pub fn cache_dir() -> PathBuf {
     xdg_dir("XDG_CACHE_HOME", ".cache").join("wusel")

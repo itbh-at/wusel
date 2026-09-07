@@ -35,6 +35,8 @@ override_dh_auto_install:
 
 	install -Dm644 integration/icons/at.itbh.Wusel.svg \
 	    debian/wusel/usr/share/icons/hicolor/scalable/apps/at.itbh.Wusel.svg
+	install -Dm644 integration/icons/at.itbh.Wusel-symbolic.svg \
+	    debian/wusel/usr/share/icons/hicolor/symbolic/apps/at.itbh.Wusel-symbolic.svg
 
 	install -Dm644 integration/gnome-search/at.itbh.Wusel.desktop \
 	    debian/wusel/usr/share/applications/at.itbh.Wusel.desktop

@@ -192,11 +192,11 @@ It names the uploads still owed to the server, anything coming down, and the
 rest of the work in flight. `--watch` redraws once a second.
 
 And check any file's state directly, which is what a desktop would draw an
-emblem from:
+emblem from — the daemon serves this socket alongside the mount:
 
 [source,sh]
 ----
-getfattr -n user.wusel.state ~/Wusel/Some.txt
+wusel ipc stat /Some.txt
 ----
 
 xref:reference/file-states.adoc[File states] lists the five values.

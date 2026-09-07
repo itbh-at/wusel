@@ -109,10 +109,29 @@ impl Error {
     /// a status code as [`Error::HttpStatus`] and everything without one as
     /// [`Error::Http`], and "no status" is precisely "nobody answered". It is
     /// what [`crate::health`] watches: an unreachable server is a user-facing
-    /// event ("your folder cannot be reached"), a 500 is not.
+    /// event ("your folder cannot be reached"), a 500 is a different one (see
+    /// [`Self::is_server_fault`]).
     #[must_use]
     pub fn is_transport(&self) -> bool {
         matches!(self, Error::Http(_))
+    }
+
+    /// Whether the server answered, but with a fault of its own — the 5xx range:
+    /// down for maintenance, a backup window, a reverse proxy with nothing
+    /// behind it.
+    ///
+    /// The counterpart to [`Self::is_transport`], and just as user-facing: the
+    /// mount is equally unusable either way, and the two need different advice —
+    /// "check your network" against "the server is busy, wait". Only
+    /// [`crate::health`] acts on it.
+    ///
+    /// `507 Insufficient Storage` is excluded on purpose: it is a real, specific
+    /// answer about the user's quota, not the server being unwell, and it is
+    /// already reported where it belongs (a parked upload).
+    #[must_use]
+    pub fn is_server_fault(&self) -> bool {
+        matches!(self, Error::HttpStatus { status, .. }
+                 if (500..600).contains(status) && *status != 507)
     }
 
     /// Whether retrying this failure is pointless. Used by the asynchronous

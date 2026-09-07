@@ -47,6 +47,7 @@
 * xref:explanation/status-protocol.adoc[One status protocol for every file manager]
 * xref:explanation/portability.adoc[Portability]
 * xref:explanation/compatibility.adoc[Compatibility and stability]
+* xref:explanation/compared-to-the-official-client.adoc[Compared to the official Nextcloud client]
 
 .Project
 * xref:project/roadmap.adoc[Roadmap]

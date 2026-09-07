@@ -25,6 +25,13 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# The manifest is a sorted list, so the sort order is part of the file format.
+# A locale-aware `sort` ignores punctuation in its primary weight, which puts
+# `_steps.d2` among the `s`-names on a German or French system and first under
+# C/POSIX — the same sources, a different order, and a "stale diagram" error
+# that no re-render can fix. Pin the collation instead.
+export LC_ALL=C
+
 MANIFEST="diagrams/rendered.sha256"
 IMAGES="modules/ROOT/images"
 

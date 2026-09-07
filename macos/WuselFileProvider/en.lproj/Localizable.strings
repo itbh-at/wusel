@@ -1,0 +1,8 @@
+/* Finder context-menu action names (NSExtensionFileProviderActions) and the
+   emblem labels (NSFileProviderDecorations). File Provider localizes these
+   through Localizable.strings — not InfoPlist.strings — keyed by the name/label
+   from the Info.plist. */
+"Make Available Offline" = "Make Available Offline";
+"Remove Offline Availability" = "Remove Offline Availability";
+"Available Offline" = "Available Offline";
+"Offline Copy Outdated" = "Offline Copy Outdated";

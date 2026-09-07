@@ -13,19 +13,28 @@
 //! kill the daemon, unmount, or re-install. Telling them plainly ("wusel cannot
 //! reach *server*") turns an inexplicable freeze into an ordinary, patient wait.
 //!
-//! So this is the [`Notice::ConnectionLost`] / [`Notice::ConnectionRestored`]
-//! pair from the architecture's _User-facing notifications_, wired to the one
-//! thing that can actually observe it: the outcome of every HTTP request.
+//! So this is the [`Notice::ConnectionLost`] / [`Notice::ServerUnavailable`] /
+//! [`Notice::ConnectionRestored`] set from the architecture's _User-facing
+//! notifications_, wired to the one thing that can actually observe it: the
+//! outcome of every HTTP request.
 //!
 //! **The bar stays high.** Every network-touching path reports here — a
 //! directory listing, a content read, an upload, the notify_push discovery —
 //! which is thousands of events, and exactly one notification per outage. Three
 //! rules make that true:
 //!
-//! * *Only transport failures count* ([`crate::Error::is_transport`]): no answer
-//!   at all — DNS, connect, TLS, timeout, a dropped connection. A server that
-//!   answers, even with a 500, is reachable; that is a different problem with a
-//!   different message.
+//! * *Only a failure of the server itself counts*: no answer at all
+//!   ([`crate::Error::is_transport`] — DNS, connect, TLS, timeout, a dropped
+//!   connection), or an answer that is the server saying it cannot serve
+//!   ([`crate::Error::is_server_fault`] — the 5xx range: maintenance, a backup
+//!   window, a proxy with nothing behind it). A refusal about *one request* — a
+//!   404, a rejected password — is somebody else's problem and passes through.
+//!
+//!   The two get **different messages** ([`Notice::ConnectionLost`] against
+//!   [`Notice::ServerUnavailable`]) because they need different action from the
+//!   user: one sends them to their network, the other tells them to wait. They
+//!   share one incident and one clock, since the mount is equally unusable
+//!   either way.
 //! * *A blip is not an outage.* The first failure only starts the clock; the user
 //!   is told when failures are **still** happening [`CONFIRM_AFTER`] later. The
 //!   WebDAV client already retries a dropped keep-alive connection internally, so
@@ -77,12 +86,32 @@ pub struct Reachability {
 }
 
 /// The outage in progress, if any.
+/// What is wrong with the server, as the last failure saw it.
+///
+/// Two kinds, because they need different advice: nobody answering sends the
+/// user to their network, a server answering `502` sends them to wait. They
+/// share one incident and one clock — the mount is equally unusable either way,
+/// and an outage that starts as one and ends as the other (a proxy that first
+/// refuses connections, then answers 502 as it comes up) is still one outage,
+/// so it must still be one notification.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fault {
+    /// No answer at all: DNS, connect, TLS, timeout, a dropped connection.
+    Unreachable,
+    /// The server answered, with a fault of its own (5xx).
+    Refusing { status: u16 },
+}
+
 #[derive(Default)]
 struct State {
-    /// When the current run of transport failures started.
+    /// When the current run of failures started.
     since: Option<Instant>,
     /// Whether the user has already been told about *this* outage.
     announced: bool,
+    /// The most recent failure's kind — what the message will say. The latest
+    /// one wins: it describes the state the server is in *now*, which is what
+    /// the user is about to act on.
+    fault: Option<Fault>,
 }
 
 impl Reachability {
@@ -132,14 +161,16 @@ impl Reachability {
         }
     }
 
-    /// A request failed. Only a transport failure counts (see the module docs);
-    /// anything else is somebody else's problem and returns immediately.
+    /// A request failed. Only a failure of the *server or the way there* counts
+    /// (see the module docs); anything else is somebody else's problem and
+    /// returns immediately.
     pub fn failed(&self, error: &Error) {
-        if !error.is_transport() {
+        let Some(fault) = classify(error) else {
             return;
-        }
+        };
         let announce = {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.fault = Some(fault);
             match state.since {
                 // First failure: start the clock, say nothing yet.
                 None => {
@@ -158,22 +189,53 @@ impl Reachability {
             }
         };
         if announce {
-            tracing::warn!(
-                server = %self.server, error = %error,
-                "the server has been unreachable for a while — telling the user"
-            );
-            self.desktop.notify(&Notice::ConnectionLost {
-                server: self.server.clone(),
-            });
+            let notice = match fault {
+                Fault::Unreachable => {
+                    tracing::warn!(
+                        server = %self.server, error = %error,
+                        "the server has been unreachable for a while — telling the user"
+                    );
+                    Notice::ConnectionLost {
+                        server: self.server.clone(),
+                    }
+                }
+                Fault::Refusing { status } => {
+                    tracing::warn!(
+                        server = %self.server, error = %error, status,
+                        "the server has been refusing requests for a while — telling the user"
+                    );
+                    Notice::ServerUnavailable {
+                        server: self.server.clone(),
+                        status,
+                    }
+                }
+            };
+            self.desktop.notify(&notice);
             self.desktop.set_status(Status::Error);
         }
     }
 
-    /// Whether a transport failure is currently outstanding. For callers that
-    /// want to behave differently while offline; the notification decision is
-    /// made here, not by them.
+    /// Whether the server is currently unusable — unreachable or refusing. For
+    /// callers that want to behave differently while it is; the notification
+    /// decision is made here, not by them.
     pub fn is_down(&self) -> bool {
         self.down.load(Ordering::Relaxed)
+    }
+}
+
+/// Which kind of incident this error is, or `None` if it is not one at all.
+///
+/// The two questions are asked in this order because only one of them can be
+/// true: an error either carries a status (the server answered) or it does not.
+fn classify(error: &Error) -> Option<Fault> {
+    if error.is_transport() {
+        return Some(Fault::Unreachable);
+    }
+    match error {
+        Error::HttpStatus { status, .. } if error.is_server_fault() => {
+            Some(Fault::Refusing { status: *status })
+        }
+        _ => None,
     }
 }
 
@@ -311,21 +373,78 @@ mod tests {
         );
     }
 
+    fn status(status: u16) -> Error {
+        Error::HttpStatus {
+            status,
+            message: "test".into(),
+        }
+    }
+
+    /// A 4xx is the server dealing with *this request*; the mount as a whole is
+    /// fine, and nothing about it is the user's to act on here.
     #[test]
-    fn a_server_that_answers_is_not_an_outage() {
+    fn an_answer_about_one_request_is_not_an_incident() {
         let (spy, reach) = immediate();
         for _ in 0..5 {
-            // A 500 is an answer: the server is reachable and something else is
-            // wrong. So are a 404 and a rejected password.
-            reach.failed(&Error::HttpStatus {
-                status: 500,
-                message: "boom".into(),
-            });
+            reach.failed(&status(404));
+            reach.failed(&status(403));
+            // 507 is 5xx by number only: it is a precise answer about the
+            // user's quota, reported where the upload is parked.
+            reach.failed(&status(507));
             reach.failed(&Error::NotFound);
             reach.failed(&Error::Auth("nope".into()));
         }
         assert!(!reach.is_down());
-        assert!(spy.notices().is_empty(), "answers are not unreachability");
+        assert!(
+            spy.notices().is_empty(),
+            "one refused request is not an outage"
+        );
+    }
+
+    /// The case this whole distinction exists for: a backup window, where the
+    /// proxy answers `502` and the server is perfectly reachable. Telling the
+    /// user their connection is gone would send them to the router for nothing.
+    #[test]
+    fn a_server_that_refuses_is_its_own_incident() {
+        let (spy, reach) = immediate();
+        reach.failed(&status(502));
+        reach.failed(&status(502));
+        assert!(reach.is_down(), "unusable is unusable, whichever way");
+        assert_eq!(
+            spy.notices(),
+            vec![Notice::ServerUnavailable {
+                server: "cloud.example.org".into(),
+                status: 502,
+            }],
+            "the message names the status, not a lost connection"
+        );
+
+        // And it resolves like any other incident: once, on the first success.
+        reach.ok();
+        reach.ok();
+        assert_eq!(spy.notices().len(), 2);
+        assert!(matches!(
+            spy.notices()[1],
+            Notice::ConnectionRestored { .. }
+        ));
+    }
+
+    /// A proxy coming up refuses connections first and answers `503` a moment
+    /// later. That is one outage the user sits through, so it is one message —
+    /// and it should describe where things stand when it is sent.
+    #[test]
+    fn one_outage_that_changes_shape_is_still_one_message() {
+        let (spy, reach) = immediate();
+        reach.failed(&offline());
+        reach.failed(&status(503));
+        assert_eq!(
+            spy.notices(),
+            vec![Notice::ServerUnavailable {
+                server: "cloud.example.org".into(),
+                status: 503,
+            }],
+            "the clock kept running; the latest failure chose the words"
+        );
     }
 
     #[test]

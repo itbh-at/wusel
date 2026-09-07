@@ -91,7 +91,7 @@ enable --now wusel@<account>` does the same thing.
 
 == Keeping files offline
 
-=== `wusel pin [PATH]`
+=== `wusel pin <PATH>` / `wusel pin --all`
 
 Keep a file or directory offline permanently. Downloads it now — a directory
 recursively — and exempts it from cache eviction.
@@ -100,10 +100,18 @@ recursively — and exempts it from cache eviction.
 |===
 | Argument | Meaning
 
-| `[PATH]`
-| The remote path to pin, for example `Photos`. Omitted, the *whole account* is
-  pinned: the old desktop client's "download everything".
+| `<PATH>`
+| The remote path to pin, for example `Photos`. Required.
+
+| `--all`
+| The *whole account*: the old desktop client's "download everything". The only
+  way to make that pin — a path that resolves to the account root is refused and
+  points here instead.
 |===
+
+The path is not optional, and neither is the flag: an account-wide pin downloads
+everything the account holds and marks every file in it as kept offline, so it
+has to be asked for. Leaving the argument out used to do exactly that.
 
 A directory pin covers its whole subtree, including entries not yet listed.
 Needs no running mount.
@@ -115,8 +123,10 @@ deleted from the server. Omitting `PATH` removes the whole-account pin.
 
 === `wusel update [PATH]`
 
-Fetch the current version of pinned files whose local copy has gone out of date,
-in place. Omitting `PATH` updates every pin in the account.
+Fetch what a pin promised and the disk does not have: a copy that has gone out
+of date, and one that was never fetched at all (a directory pin covers files the
+server grows afterwards). In place, and omitting `PATH` covers every pin in the
+account.
 
 Deliberately not the same as unpinning and pinning again, which would drop the
 eviction marker first — a re-download that then failed would leave the file both

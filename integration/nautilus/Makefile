@@ -32,9 +32,10 @@ ICONDIR   ?= /usr/share/icons/hicolor
 EMBLEMDIR := $(ICONDIR)/scalable/emblems
 
 LIB := libwusel-nautilus.so
+SRC := wusel-nautilus.c wusel-status.c
 
-$(LIB): wusel-nautilus.c
-	$(CC) $(CFLAGS) -shared -o $@ $< $(LDLIBS)
+$(LIB): $(SRC) wusel-status.h
+	$(CC) $(CFLAGS) -shared -o $@ $(SRC) $(LDLIBS)
 
 install: $(LIB)
 	@test -n "$(EXTDIR)" || { echo "could not determine Nautilus extension dir"; exit 1; }

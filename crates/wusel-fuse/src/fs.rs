@@ -15,7 +15,7 @@ use fuser::{
     BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
     Generation, INodeNo, LockOwner, MountOption, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate,
     ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite,
-    ReplyXattr, Request as Request_, TimeOrNow, WriteFlags,
+    Request as Request_, TimeOrNow, WriteFlags,
 };
 
 use std::sync::Arc;
@@ -25,11 +25,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use wusel_core::provider::{Invalidation, Provider};
-use wusel_core::runtime::{Pools, Substrate};
+use wusel_core::runtime::{Pools, SubmitHandle, Substrate};
 use wusel_core::state::NodeRow;
 use wusel_fsm::{Intent, ObjectId, Request, RequestId};
 
-use crate::dispatch::{spawn_pump, Pending, PumpContext, Replies};
+use crate::dispatch::{spawn_pump, ExtraRoute, Pending, PumpContext, Replies};
 
 /// Unix seconds → `SystemTime`, both signs. `SystemTime` has no signed
 /// constructor, but it does represent pre-1970 instants as `UNIX_EPOCH -
@@ -69,37 +69,6 @@ fn unix_from_system_time(t: SystemTime) -> i64 {
 /// active invalidation on remote changes comes later (see architecture docs).
 pub(crate) const TTL: Duration = Duration::from_secs(1);
 pub(crate) const GENERATION: Generation = Generation(0);
-
-/// The single xattr we expose: a file's availability state (`online-only` /
-/// `cached` / `pinned` / `modified`), read by file-manager extensions to draw
-/// per-file emblems. See [`wusel_core::provider::FileState`].
-pub(crate) const STATE_XATTR: &str = "user.wusel.state";
-
-/// The object's *kind*, for a file manager that wants to draw a Team/Group
-/// folder differently — `group-folder` on such a folder's root, absent
-/// everywhere else. **A public contract**, like `STATE_XATTR`.
-///
-/// Deliberately a second attribute rather than another value of the first:
-/// kind and sync state are independent (a group folder is online-only or
-/// cached like any other), and a reader wanting one must not have to parse
-/// the other.
-pub(crate) const KIND_XATTR: &str = "user.wusel.kind";
-
-/// The one value [`KIND_XATTR`] currently takes.
-pub(crate) const KIND_GROUP_FOLDER: &str = "group-folder";
-
-/// Reply to an xattr get/list following the kernel's two-call protocol: a
-/// `size == 0` probe asks only for the length; a sized call copies the bytes if
-/// they fit, else `ERANGE`.
-pub(crate) fn reply_xattr(reply: ReplyXattr, value: &[u8], size: u32) {
-    if size == 0 {
-        reply.size(value.len() as u32);
-    } else if (size as usize) < value.len() {
-        reply.error(Errno::ERANGE);
-    } else {
-        reply.data(value);
-    }
-}
 
 /// Synthetic, local-only marker files exposed at the mount root when
 /// `exclude_from_indexers` is on. GNOME Tracker/LocalSearch skips any directory
@@ -488,31 +457,6 @@ impl Filesystem for NcFs {
         );
     }
 
-    fn getxattr(&self, _req: &Request_, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
-        let want = if name == OsStr::new(STATE_XATTR) {
-            crate::dispatch::XattrName::State
-        } else if name == OsStr::new(KIND_XATTR) {
-            crate::dispatch::XattrName::Kind
-        } else {
-            return reply.error(Errno::ENODATA);
-        };
-        let ino = ino.0;
-        if self.markers && marker_name(ino).is_some() {
-            // A fabrication has no availability state to report — the same
-            // answer a real, unpinned directory gets.
-            return reply.error(Errno::ENODATA);
-        }
-        self.go(Pending::Xattr { reply, size, want }, ino, Intent::State);
-    }
-
-    fn listxattr(&self, _req: &Request_, ino: INodeNo, size: u32, reply: ReplyXattr) {
-        let ino = ino.0;
-        if self.markers && marker_name(ino).is_some() {
-            return reply_xattr(reply, &[], size);
-        }
-        self.go(Pending::XattrList { reply, size }, ino, Intent::State);
-    }
-
     fn write(
         &self,
         _req: &Request_,
@@ -834,8 +778,46 @@ impl Drop for Teardown {
     }
 }
 
+/// Handed the engine's request path and the shared Provider once the substrate
+/// is up, and returns the route its answers should take. See
+/// [`Extras::on_ready`], which is the only place one is used.
+pub type OnReady = Box<dyn FnOnce(SubmitHandle, Arc<Mutex<Provider>>) -> Option<ExtraRoute> + Send>;
+
+/// What the daemon wires into a mount besides the engine itself — everything a
+/// *second* frontend on this one substrate needs.
+///
+/// It is a struct rather than more parameters because both fields are about the
+/// same thing (the co-hosted IPC socket) and both are `None` for a plain mount.
+#[derive(Default)]
+pub struct Extras {
+    /// Called once the substrate is up, with a handle onto its request path;
+    /// whatever route it returns then receives answers whose id the mount does
+    /// not hold (see [`ExtraRoute`]).
+    ///
+    /// A callback rather than two parameters because of an ordering that has to
+    /// hold: the handle does not exist before `Substrate::start`, and after the
+    /// reply pump is running an answer could already have arrived for a route
+    /// not yet installed. Between the two is the only correct moment, and the
+    /// signature is what makes that impossible to get wrong.
+    pub on_ready: Option<OnReady>,
+    /// A second sink for the engine's invalidations. The mount consumes that
+    /// channel for its own per-file emblem refreshes, so a co-hosted `watch`
+    /// subscriber needs a copy rather than the original.
+    pub invalidations: Option<std::sync::mpsc::Sender<wusel_core::provider::Invalidation>>,
+}
+
 /// Mounts the filesystem at `mountpoint` (blocks until unmount).
-pub fn mount(mountpoint: &std::path::Path, mut provider: Provider) -> anyhow::Result<()> {
+pub fn mount(mountpoint: &std::path::Path, provider: Provider) -> anyhow::Result<()> {
+    mount_with(mountpoint, provider, Extras::default())
+}
+
+/// Mounts the filesystem, additionally hosting a second frontend on the same
+/// engine. See [`Extras`].
+pub fn mount_with(
+    mountpoint: &std::path::Path,
+    mut provider: Provider,
+    extras: Extras,
+) -> anyhow::Result<()> {
     tracing::info!(mountpoint = %mountpoint.display(), "mounting wusel");
 
     // fuser 0.18 takes a structured `Config` instead of a `&[MountOption]`. It is
@@ -891,7 +873,23 @@ pub fn mount(mountpoint: &std::path::Path, mut provider: Provider) -> anyhow::Re
     };
     let (substrate, answers) = Substrate::start(&ctx, pools)?;
 
-    let replies = Arc::new(Replies::new());
+    // The Provider is no longer on the request path — the substrate is — but it
+    // still owns the background syncer and the revalidator, so it has to
+    // outlive the session rather than be dropped here. Shared, because a
+    // co-hosted IPC driver needs it too: `pin`/`unpin` and the pinned/stale
+    // reads on the status path are direct Provider calls, not intents.
+    let engine = Arc::new(Mutex::new(provider));
+
+    // Hand the daemon a grip on the engine now that there is one, and take back
+    // the route for whatever second frontend it built with it — the IPC socket.
+    // Between `Substrate::start` and `spawn_pump` is the only correct moment:
+    // the handle does not exist before it, and after it an answer could already
+    // arrive for a route that is not installed yet.
+    let extra_route = extras
+        .on_ready
+        .and_then(|f| f(substrate.submit_handle(), Arc::clone(&engine)));
+
+    let replies = Arc::new(Replies::new(substrate.submit_handle()));
 
     // Serve the engine's internal state on a per-user socket, so `wusel doctor`
     // can read what the mount is doing — the stuck flow, the parked replies —
@@ -918,12 +916,8 @@ pub fn mount(mountpoint: &std::path::Path, mut provider: Provider) -> anyhow::Re
             dirs: Arc::clone(&dirs),
             markers,
         },
+        extra_route,
     );
-
-    // The Provider is no longer on the request path — the substrate is — but it
-    // still owns the background syncer and the revalidator, so it has to
-    // outlive the session rather than be dropped here.
-    let _engine = provider;
 
     let fs = NcFs {
         substrate,
@@ -951,6 +945,7 @@ pub fn mount(mountpoint: &std::path::Path, mut provider: Provider) -> anyhow::Re
         finished: finished.clone(),
     };
     unmount_on_signal(session.unmount_callable(), finished);
+    let inval_sink = extras.invalidations;
     if let Some(rx) = invalidations {
         // The kernel notifier is deliberately not taken here: its two calls are
         // disabled below (see the note). Re-add `session.notifier()` when they
@@ -976,6 +971,13 @@ pub fn mount(mountpoint: &std::path::Path, mut provider: Provider) -> anyhow::Re
                     // The desktop emblem refresh (`file_changed`) is kept: it goes
                     // through the file manager's own extension, not the kernel, so
                     // it cannot cause this.
+                    // Tee first: a co-hosted IPC `watch` subscriber needs the
+                    // same change, and this thread is the channel's only
+                    // reader. A sink whose receiver is gone just fails the
+                    // send — the mount's own refresh below must still happen.
+                    if let Some(sink) = &inval_sink {
+                        let _ = sink.send(inv.clone());
+                    }
                     match inv {
                         Invalidation::Entry { path, .. } => {
                             desktop.file_changed(&mount_root.join(&path).to_string_lossy());

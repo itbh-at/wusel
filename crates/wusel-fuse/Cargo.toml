@@ -48,6 +48,10 @@ tokio = { workspace = true }
 # wusel-mock server. It runs only on Linux with /dev/fuse (the podman container).
 [dev-dependencies]
 wusel-mock = { path = "../wusel-mock" }
+# `ipc_beside_mount_e2e` drives the status socket the mount now hosts, so it
+# needs the socket's own crate. No cycle: wusel-ipc depends on the engine, not
+# on this frontend.
+wusel-ipc = { path = "../wusel-ipc" }
 reqwest = { workspace = true }
 tokio = { workspace = true }
 

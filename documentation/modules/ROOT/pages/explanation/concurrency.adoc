@@ -20,10 +20,10 @@ xref:explanation/architecture.adoc[Architecture]) — but the thread itself stay
 hard serialisation point. Two effects survive the mitigations:
 
 * A hydration is chunked, but every chunk is still a network round-trip on the
-  dispatch thread. The file manager's per-file `getxattr` calls — individually
-  microseconds — queue behind it. The extension's assumption that reading the
-  xattr is "cheap and local" is true of the *handler* and false of the *queue*,
-  so a large transfer can make the file manager look frozen.
+  dispatch thread. The file manager's per-file status queries — individually
+  microseconds — queue behind it. The assumption that reading a file's state is
+  "cheap and local" is true of the *handler* and false of the *queue*, so a
+  large transfer can make the file manager look frozen.
 * Two users of the mount cannot proceed in parallel at all: a `cp` from the mount
   and an `ls` in another terminal take turns, however unrelated they are.
 
@@ -348,7 +348,7 @@ open — does exactly the wrong thing.
 
 === Make staleness visible, and let the user spend the bandwidth
 
-The engine already surfaces per-file state through the `user.wusel.state` xattr
+The engine already surfaces per-file state over the status socket
 (xref:reference/file-states.adoc[File states]), and the design principle
 there is that every state is *always visible*. Staleness gets the same treatment:
 

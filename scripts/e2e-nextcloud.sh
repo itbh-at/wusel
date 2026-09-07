@@ -309,18 +309,21 @@ if [ -n "${GROUPFOLDER:-}" ]; then
         sleep 1
     done
     [ -d "$gf_root" ] || fail "the Team folder never appeared in the mount"
-    kind="$(getfattr --only-values -n user.wusel.kind "$gf_root" 2>/dev/null || true)"
-    [ "$kind" = "group-folder" ] \
-        || fail "the Team folder's root is not marked (user.wusel.kind = '${kind:-<absent>}')"
+    # Asked over the status socket the mount serves — the one channel a file
+    # manager has. `wusel ipc` derives the same default path the mount binds.
+    kind="$("$WUSEL" ipc stat "/$GROUPFOLDER" 2>/dev/null || true)"
+    echo "$kind" | grep -q '"folder_kind":"group_folder"' \
+        || fail "the Team folder's root is not marked: $kind"
 
     mkdir -p "$gf_root/inside"
-    inside_kind="$(getfattr --only-values -n user.wusel.kind "$gf_root/inside" 2>/dev/null || true)"
-    [ -z "$inside_kind" ] \
-        || fail "a folder inside the Team folder is marked too ('$inside_kind') — the whole subtree would be"
+    inside="$("$WUSEL" ipc stat "/$GROUPFOLDER/inside" 2>/dev/null || true)"
+    echo "$inside" | grep -q '"folder_kind":"plain"' \
+        || fail "a folder inside the Team folder is marked too — the whole subtree would be: $inside"
 
     mkdir -p "$MNT/plain-folder"
-    plain_kind="$(getfattr --only-values -n user.wusel.kind "$MNT/plain-folder" 2>/dev/null || true)"
-    [ -z "$plain_kind" ] || fail "an ordinary folder is marked as a group folder ('$plain_kind')"
+    plain="$("$WUSEL" ipc stat /plain-folder 2>/dev/null || true)"
+    echo "$plain" | grep -q '"folder_kind":"plain"' \
+        || fail "an ordinary folder is marked as a group folder: $plain"
     ok "Team folder marked at its root only"
 else
     echo "!! SKIPPED: step 4b - Team folder marking (the groupfolders app was not available)"
@@ -601,7 +604,9 @@ fi
 # --- 13. An account with NO quota must fall back safely --------------------
 # The common case in the field: no quota configured, so Nextcloud answers
 # `quota-available-bytes` with a negative sentinel — no free-space figure a
-# filesystem can advertise. Last, because it changes the account for good.
+# filesystem can advertise. Runs after every gate that wants a real quota; only
+# the socket lifecycle below follows, and that one neither mounts nor measures
+# free space, so the changed account cannot affect it.
 # What matters is not the exact number but that the mount stays *usable*:
 # free space must never come out as 0, or applications that check before
 # saving refuse to write at all. Runs after every other gate so the quota is
@@ -648,6 +653,80 @@ fb_used=$(( fb_total - fb_free ))
 [ "$fb_used" -gt 0 ] \
   || fail "the fallback reported 0 bytes used, though the server still knows the real figure"
 ok "no quota on the account → usable fallback ($fb_used bytes used, $fb_free free)"
+
+# --- 14. The IPC socket: full read+write lifecycle over `wusel serve` -------
+# The macOS File Provider frontend will speak this socket, not FUSE. Prove both
+# paths against the *real* Nextcloud in one self-contained lifecycle: create a
+# file over the socket, publish it (verified on the server over plain WebDAV),
+# read it back over the socket, then rename and delete it. Seeding through the
+# write path — rather than a curl PUT behind the engine's back — is what makes
+# the read assertions deterministic without notify_push (which this image does
+# not ship; live change signalling is covered by the mock test `serve_watch.rs`).
+#
+# Last, and it has to be: the socket needs the engine slot to itself, so this
+# unmounts before it starts. Every step that reads through $MNT must precede it.
+echo ">> testing the IPC socket (wusel serve + wusel ipc) ..."
+
+# One engine at a time: stop the mount, then run serve in its slot so the EXIT
+# trap still cleans it up.
+fusermount3 -u "$MNT" 2>/dev/null || true
+kill "$WUSEL_PID" 2>/dev/null || true
+wait "$WUSEL_PID" 2>/dev/null || true
+
+SOCK="$WORK/ipc.sock"
+"$WUSEL" serve --socket "$SOCK" > "$WORK/serve.log" 2>&1 &
+WUSEL_PID=$!
+for _ in $(seq 1 30); do [ -S "$SOCK" ] && break; sleep 1; done
+[ -S "$SOCK" ] || fail "wusel serve never bound the socket; log: $(cat "$WORK/serve.log" 2>/dev/null)"
+
+# --- write path: create + write + publish, verified on the server over WebDAV.
+# The driver publishes synchronously, so a `done` answer means the upload landed.
+printf 'over the socket, onto the server\n' > "$WORK/wsock.txt"
+WSOCK_SIZE=$(wc -c < "$WORK/wsock.txt" | tr -d ' ')
+
+out=$("$WUSEL" ipc create /wsock.txt --socket "$SOCK")
+echo "$out" | grep -q '"kind":"node"' || fail "ipc create did not return a node: $out"
+out=$("$WUSEL" ipc write /wsock.txt --socket "$SOCK" < "$WORK/wsock.txt")
+echo "$out" | grep -q "\"len\":$WSOCK_SIZE" || fail "ipc write did not accept every byte: $out"
+out=$("$WUSEL" ipc publish /wsock.txt --socket "$SOCK")
+echo "$out" | grep -q '"kind":"done"' || fail "ipc publish did not report done: $out"
+
+curl -fsS "${AUTH[@]}" "$DAV/wsock.txt" > "$WORK/wsock.server" \
+  || fail "the published file is not on the server"
+cmp -s "$WORK/wsock.txt" "$WORK/wsock.server" \
+  || fail "the server's copy differs from what was written over the socket"
+ok "ipc create+write+publish uploads to the real server"
+
+# --- read path: the same object comes back over the socket, deterministically,
+# because create put it in the engine's state (no out-of-band change to observe).
+enum=$("$WUSEL" ipc enumerate / --socket "$SOCK")
+echo "$enum" | grep -q '"name":"wsock.txt"' || fail "ipc enumerate did not list wsock.txt: $enum"
+ok "ipc enumerate lists the file over the socket"
+
+node=$("$WUSEL" ipc stat /wsock.txt --socket "$SOCK")
+echo "$node" | grep -q "\"size\":$WSOCK_SIZE" || fail "ipc stat reported the wrong size: $node"
+echo "$node" | grep -q '"is_dir":false' || fail "ipc stat: wsock.txt should be a file: $node"
+ok "ipc stat reports the file's attributes"
+
+"$WUSEL" ipc fetch /wsock.txt --socket "$SOCK" 2>/dev/null > "$WORK/wsock.got"
+cmp -s "$WORK/wsock.txt" "$WORK/wsock.got" || fail "ipc fetch returned different content"
+ok "ipc fetch reads the file content over the socket"
+
+# --- move: the rename must take on the server — new path present, old one gone.
+out=$("$WUSEL" ipc move /wsock.txt --to /wsock-renamed.txt --socket "$SOCK")
+echo "$out" | grep -q '"kind":"done"' || fail "ipc move did not report done: $out"
+curl -fsS "${AUTH[@]}" "$DAV/wsock-renamed.txt" >/dev/null \
+  || fail "the renamed file is not on the server"
+code=$(curl -o /dev/null -sS -w '%{http_code}' "${AUTH[@]}" "$DAV/wsock.txt")
+[ "$code" = "404" ] || fail "the old path still exists on the server (HTTP $code)"
+ok "ipc move renames on the real server"
+
+# --- remove: it must be gone from the server.
+out=$("$WUSEL" ipc remove /wsock-renamed.txt --socket "$SOCK")
+echo "$out" | grep -q '"kind":"done"' || fail "ipc remove did not report done: $out"
+code=$(curl -o /dev/null -sS -w '%{http_code}' "${AUTH[@]}" "$DAV/wsock-renamed.txt")
+[ "$code" = "404" ] || fail "the removed file still exists on the server (HTTP $code)"
+ok "ipc remove deletes on the real server"
 
 if [ "$SKIPPED" -gt 0 ]; then
     echo ">> E2E PASSED — but $SKIPPED step(s) were SKIPPED for want of link shaping."

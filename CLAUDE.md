@@ -1,7 +1,9 @@
 # CLAUDE.md — Ground Rules for LLMs in this Project
 
 This file tells coding agents (Claude Code and others) exactly how work is done
-in **wusel**. It takes precedence over default behaviour.
+in **wusel**. It takes precedence over default behaviour. It carries standing
+rules and settled facts only — never plans, rationale or design (those live in
+the docs).
 
 ## Project in one sentence
 
@@ -11,29 +13,52 @@ online-only, on-demand hydration) — more than just FUSE. See the
 
 ## Language
 
-- **Source code and documentation are exclusively in English** — comments,
-  doc-comments, AsciiDoc pages, README, config comments, commit messages, logs,
-  CLI output, and terminal-facing errors.
+- **Everything in this repository is English** — code, comments, doc-comments,
+  AsciiDoc pages, README, config comments, commit messages, logs, CLI output,
+  terminal-facing errors, and this file.
 - **One exception: end-user *notification* text is localized** (translated to the
   user's language). Non-technical users see OS notifications and many do not read
-  English; logs and everything else stay English. Translations live behind the
-  structured `desktop::Notice` enum (`Notice::localize`), never as scattered
-  strings — so this stays the single, contained place we speak the user's language.
-- Chat with the user is in the language the user uses; **repository artefacts are
-  English, except localized notification strings.**
+  English. Translations live behind the structured `desktop::Notice` enum
+  (`Notice::localize`), never as scattered strings — so this stays the single,
+  contained place we speak the user's language.
+- Chat with the user is in the language the user uses.
 
 ## Communication
 
 Answers are crisp, specific, and to the point — no filler, no slang, no
-marketing tone, no self-praise. Substance over polish: state facts, give a
-recommendation instead of listing every option.
+marketing tone, no self-praise. Adopt the stance of a seasoned, pragmatic
+old-school senior developer: direct and minimal.
+
+- **No small talk, no preamble, no narration.** Start straight with the answer or
+  the code. Do not announce what you are about to do, do not retell the steps at
+  the end.
+- **No jargon, no buzzwords, no marketing language.** No flowery description of
+  your thought process ("I solved this elegantly…"), no self-congratulatory
+  explanations.
+- **Report only failures and assumptions** — a failing test or check, and any
+  assumption you had to make. Nothing else: no summary of what was done.
+- **Explain only on request.** When code is asked for, deliver only the code plus
+  the minimum necessary inline comments — no prose around it.
+- **Recommend, do not enumerate.** Give one recommendation instead of listing
+  every option.
+
+## Scope
+
+- **Change nothing that is not directly related to the request.** The one
+  expected exception is the pre-commit hook (`mise run setup-hooks`), which
+  reformats what it touches.
+- A genuine problem with the request is worth one or two sentences — then finish
+  the work under a stated assumption rather than stopping.
 
 ## Toolchain — mise only
 
-- **All** binaries/toolchains are managed via `mise` and pinned in `mise.toml`.
-  No direct `rustup`/`brew`/global `npm` for toolchains.
-- Invoke tools via `mise exec -- <cmd>` or `mise run <task>`.
+- **All** language toolchains and dev tools are pinned in `mise.toml` and used
+  through `mise`. No direct `rustup`/`brew`/global `npm`.
+- `mise run <task>` when a task exists (the list is in `mise.toml`), otherwise
+  `mise exec -- <cmd>`.
 - Use mise inside container images too (same `mise.toml`), not a `rust:` base image.
+- Not managed by mise, and therefore host prerequisites: `podman` and the FUSE
+  driver (`/dev/fuse`, libfuse3).
 
 ## Dependencies
 
@@ -47,8 +72,8 @@ XDG paths by hand instead of adding the `dirs` crate.)
 ## Git — feature-branch model
 
 - **Never commit directly to `main`.** Create a feature branch for every change
-  (`feat/…`, `fix/…`, `docs/…`) and integrate via pull/merge request.
-- `main` stays buildable and green at all times.
+  (`feat/…`, `fix/…`, `docs/…`) and integrate via merge request. `main` stays
+  buildable and green — the gates are under [Build & test](#build--test).
 - Commit messages follow **Conventional Commits 1.0.0**
   (https://www.conventionalcommits.org/en/v1.0.0/): `type(scope): summary`,
   English, imperative, topically focused (no catch-all commits).
@@ -69,36 +94,41 @@ XDG paths by hand instead of adding the `dirs` crate.)
 
 ## Architecture & crates
 
+- `wusel-fsm` — the decision core: occupancy and flow steps as decisions over
+  plain data. No I/O, no dependencies at all.
 - `wusel-core` — engine (auth, webdav, model, state/SQLite, config); platform-independent.
+- `wusel-ipc` — socket frontend speaking the engine's intent protocol, for
+  out-of-process frontends; platform-independent.
 - `wusel-fuse` — FUSE frontend as a **library**, cfg-gated to Linux (`target_os = "linux"`).
 - `wusel-desktop` — OS integration (notifications, D-Bus, GNOME search provider); Linux, no-op elsewhere.
 - `wusel-mock` — mock Nextcloud server for the tests.
 - `wusel` — daemon/CLI binary (the product); FUSE behind the `fuse` Cargo feature.
-- Design and rationale live in the
-  [Architecture](documentation/modules/ROOT/pages/explanation/architecture.adoc) docs, not
-  here.
 
 ## Build & test
 
-- Engine + CLI natively on macOS: `mise run check`, `mise run test`, `mise run clippy`.
-- The FUSE mount needs a driver:
-  - **Linux:** in the podman container — `mise run fuse-build` / `mise run fuse-shell`.
-    The scripts probe where the podman VM sees the repo (`scripts/podman-lib.sh`):
-    directly, via a `/Volumes/<disk>` → `/var/mnt/<disk>` disk share, or — as the
-    fallback — an rsync mirror under `/private/tmp` (see the development docs).
-  - **macOS:** the mount is Linux-only, so test it via the podman container
-    (`mise run fuse-shell`). Native macOS support (a File Provider frontend, not
-    FUSE) is far-future, experimental work.
-- **Keep `main` green:** `check` + `test` must pass before merging.
+- **Linux** — the target platform, and what CI builds. Everything runs natively:
+  `mise run check`, `mise run test`, `mise run clippy`, `mise run build-fuse`.
+  The mount tests additionally need `/dev/fuse`: `mise run fuse-test`, or
+  `mise run fuse-shell` for an interactive mount.
+- **macOS** — a deviation for developing from a Mac. `wusel-fuse` cannot be
+  compiled without the Linux FUSE driver, so `check`/`test`/`clippy` cover engine
+  and CLI only; anything FUSE goes through the podman container
+  (`mise run fuse-build` / `fuse-shell` / `fuse-test`). Those scripts probe how
+  the podman VM sees the repo (`scripts/podman-lib.sh`): directly, via a
+  `/Volumes/<disk>` → `/var/mnt/<disk>` disk share, or — as the fallback — an
+  rsync mirror under `/private/tmp` (see the development docs). Native macOS
+  support (a File Provider frontend, not FUSE) is far-future, experimental work.
+- **Keep `main` green:** the full CI gate is `fmt-check`, `headers-check`,
+  `shellcheck`, `clippy`, `check`, `test`, `build-fuse` — all of them, before
+  merging.
 
 ## Project plans & decisions
 
-What is *planned* — priorities, roadmap, design, and decisions — lives
-**only in the docs**, never here. Start at the
-[Roadmap](documentation/modules/ROOT/pages/project/roadmap.adoc) and
-[Architecture](documentation/modules/ROOT/pages/explanation/architecture.adoc).
-(The licence is decided: Apache-2.0 — see
-[Licence](documentation/modules/ROOT/pages/project/licence.adoc).)
+Everything *planned or argued* — priorities, roadmap, design, rationale,
+decisions — lives **only in the docs**, never here. Start at the
+[Roadmap](documentation/modules/ROOT/pages/project/roadmap.adoc). The licence is
+settled: Apache-2.0, headers applied by `mise run headers` (see
+[Licence](documentation/modules/ROOT/pages/project/licence.adoc)).
 
 ## Documentation
 
@@ -106,6 +136,8 @@ What is *planned* — priorities, roadmap, design, and decisions — lives
 - Build: `mise exec -- ./documentation/build.sh` (official) or
   `mise exec -- ./documentation/build.sh watch` (live). `mise exec` puts `antora`
   (pinned via the npm backend in `mise.toml`) on PATH.
+- Diagrams are d2 sources; re-render with `mise run docs-diagrams` after editing
+  one.
 - UI bundle under `documentation/ui-bundle` (adapted from the Antora Default
   UI; MPL-2.0 — see its `LICENSE` and `NOTICE`).
 - The docs follow **Diátaxis** (https://diataxis.fr/): `tutorials/`, `how-to/`,

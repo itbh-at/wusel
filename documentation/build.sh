@@ -13,15 +13,18 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 # The lunr search extension is a library, not a command: antora `require`s it
-# while building. mise gives every npm package its own prefix, so it is not a
-# sibling of antora's own node_modules and plain module resolution misses it —
-# NODE_PATH is what makes `require: '@antora/lunr-extension'` in the playbooks
-# resolve. mise gives every npm package its own prefix; the module lives *some*
-# levels below it, but not always at the same subpath — mise 2027.x changed the
-# npm layout, and a hardcoded `$prefix/lib/node_modules` (correct on 2026.x)
-# then pointed at nothing, so antora failed with "Cannot find module". Find the
-# module wherever mise actually put it and set NODE_PATH to the directory that
-# holds its `@antora/` scope, so this survives the next layout change too.
+# while building, and it resolves a playbook's `require:` entries with an
+# explicit search list — the playbook's own directory first, then antora's
+# install. That kind of lookup ignores NODE_PATH, so setting NODE_PATH (what
+# this script used to do) cannot help. mise gives every npm package its own
+# prefix, so the extension is not a sibling of antora's node_modules either.
+#
+# What is searched, and what we therefore provide, is `node_modules` beside the
+# playbook: a symlink to wherever mise actually put the module. The module lives
+# *some* levels below the prefix but not always at the same subpath — mise
+# 2027.x changed the npm layout — so the path is found rather than assumed, and
+# the link is refreshed on every build, which keeps it correct across upgrades.
+# The directory is git-ignored; nothing but this script writes it.
 if ! lunr_prefix="$(mise where "npm:@antora/lunr-extension" 2>/dev/null)" || [ -z "$lunr_prefix" ]; then
   echo "build.sh: @antora/lunr-extension is missing — run: mise install 'npm:@antora/lunr-extension'" >&2
   exit 1
@@ -31,9 +34,8 @@ if [ -z "$lunr_module" ]; then
   echo "build.sh: @antora/lunr-extension installed at $lunr_prefix but its module dir was not found" >&2
   exit 1
 fi
-# NODE_PATH must hold the dir *containing* the @antora scope, i.e. two up.
-NODE_PATH="$(cd "$lunr_module/../.." && pwd)"
-export NODE_PATH
+mkdir -p node_modules/@antora
+ln -sfn "$lunr_module" node_modules/@antora/lunr-extension
 
 # Diagrams are pre-rendered committed SVGs (see diagrams/ and `mise run
 # docs-diagrams`), so this build needs nothing beyond antora — no server.
