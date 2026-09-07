@@ -27,7 +27,7 @@ mod status;
 #[command(
     name = "wusel",
     about = "virtual Nextcloud filesystem",
-    version,
+    version = wusel_core::VERSION,
     after_help = "Without --account, the default account is used. `mount` without a mountpoint \
                   uses config.toml's [mount] point or ~/Wusel[-<account>]."
 )]
@@ -58,17 +58,67 @@ enum Command {
         /// Where to mount; defaults to config.toml's [mount] point or ~/Wusel.
         mountpoint: Option<String>,
     },
+    /// Run the engine and serve its intent protocol over a Unix-domain socket
+    /// (the macOS File Provider IPC spike — read path only, no FUSE).
+    Serve {
+        /// Socket to bind; defaults to a per-account path under the runtime dir.
+        #[arg(long)]
+        socket: Option<String>,
+    },
+    /// Call a running `wusel serve` socket — a client for diagnostics and tests.
+    ///
+    /// Read path: stat | enumerate | fetch | watch. Write path: create | write |
+    /// publish | remove | move | setattr. A `write` reads its bytes from stdin.
+    Ipc {
+        /// The operation (see the command summary).
+        op: String,
+        /// Account-relative path (default "/"); ignored by `watch`.
+        path: Option<String>,
+        /// Socket to connect to; defaults to the per-account path.
+        #[arg(long)]
+        socket: Option<String>,
+        /// `fetch`/`write` only: how many bytes from `--offset` (fetch default 1 MiB).
+        #[arg(long)]
+        len: Option<u32>,
+        /// `fetch`/`write` only: the byte offset (default 0).
+        #[arg(long)]
+        offset: Option<u64>,
+        /// `move` only: the destination path.
+        #[arg(long)]
+        to: Option<String>,
+        /// `create` only: make a directory rather than a file.
+        #[arg(long)]
+        dir: bool,
+        /// `setattr` only: the new size.
+        #[arg(long)]
+        size: Option<u64>,
+        /// `setattr` only: the new modification time (Unix seconds).
+        #[arg(long)]
+        mtime: Option<i64>,
+    },
     /// Manage the systemd user service (Linux).
     Service {
         #[command(subcommand)]
         action: ServiceCmd,
     },
-    /// Keep a file/dir offline (no path = the whole account).
+    /// Keep a file/dir offline.
+    ///
+    /// The path is required. Pinning the whole account downloads everything it
+    /// holds and marks every file in it as kept offline, so that takes `--all`:
+    /// it is asked for, never the result of leaving an argument out.
     Pin {
-        /// Path to pin; empty = the whole account ("download everything").
+        /// Path to pin: relative to the account root, or absolute in the mount.
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
         path: Option<String>,
+        /// Pin the whole account: download everything and keep it offline.
+        #[arg(long)]
+        all: bool,
     },
     /// Remove a pin; its files become normal (evictable) cache again.
+    ///
+    /// No path is fine here, unlike `pin`: dropping the account-wide pin only
+    /// withdraws a promise — nothing is deleted, nothing is downloaded — and it
+    /// is the way back out of one.
     Unpin {
         /// Path to unpin; empty = the whole-account pin.
         path: Option<String>,
@@ -142,12 +192,20 @@ enum CacheCmd {
 
 #[derive(Subcommand)]
 enum DesktopCmd {
-    /// Send a test notification through the real backend, to verify the desktop's
-    /// notification channel works (independent of any sync event).
+    /// Send a test notification, to verify the desktop's notification channel
+    /// works (independent of any sync event). On Linux it posts straight to the
+    /// notification bus; on macOS it injects into the running agent over its
+    /// socket (only the agent app may post to Notification Center), so the agent
+    /// must be running.
     Notify {
         /// Which severity to send: info, warning, error, or all.
         #[arg(value_enum, default_value = "all")]
         severity: TestSeverity,
+        /// macOS only: the agent's socket. Defaults to auto-discovering the
+        /// running agent's socket (the App Group container, then the personal-team
+        /// fallback under Application Support).
+        #[arg(long, value_name = "PATH")]
+        socket: Option<String>,
     },
     /// Install the file-manager cloud-provider registration for this account so a
     /// file manager (Nautilus) shows the mount. System-wide, so it needs root
@@ -222,8 +280,33 @@ fn main() -> anyhow::Result<()> {
         // The mountpoint is optional: without it we use config.toml's
         // `[mount] point` or the account's default mountpoint.
         Command::Mount { mountpoint } => cmd_mount(&account, mountpoint.as_deref()),
+        Command::Serve { socket } => cmd_serve(&account, socket.as_deref()),
+        Command::Ipc {
+            op,
+            path,
+            socket,
+            len,
+            offset,
+            to,
+            dir,
+            size,
+            mtime,
+        } => cmd_ipc(
+            &account,
+            IpcArgs {
+                op: &op,
+                path: path.as_deref(),
+                socket: socket.as_deref(),
+                offset,
+                len,
+                to: to.as_deref(),
+                dir,
+                size,
+                mtime,
+            },
+        ),
         Command::Service { action } => cmd_service(&account, action),
-        Command::Pin { path } => cmd_pin(&account, path.as_deref().unwrap_or("")),
+        Command::Pin { path, all } => cmd_pin(&account, path.as_deref(), all),
         Command::Unpin { path } => cmd_unpin(&account, path.as_deref().unwrap_or("")),
         Command::Update { path } => cmd_update(&account, path.as_deref().unwrap_or("")),
         Command::Pins => cmd_pins(&account),
@@ -251,7 +334,9 @@ fn main() -> anyhow::Result<()> {
             no_logs,
         }),
         Command::Desktop { action } => match action {
-            DesktopCmd::Notify { severity } => cmd_desktop_notify(severity),
+            DesktopCmd::Notify { severity, socket } => {
+                cmd_desktop_notify(severity, socket.as_deref())
+            }
             DesktopCmd::InstallProvider { dir } => {
                 cmd_desktop_install_provider(&account, dir.as_deref())
             }
@@ -320,35 +405,36 @@ fn cmd_desktop_uninstall_provider(account: &Account, dir: Option<&str>) -> anyho
     }
 }
 
-/// Fire test notification(s) straight through the platform backend, so the user
-/// can confirm the desktop notification channel works without waiting for a real
-/// sync event. Reports the D-Bus outcome per notice.
-fn cmd_desktop_notify(severity: TestSeverity) -> anyhow::Result<()> {
+/// The severities a `desktop notify` run covers, and their wire labels — one
+/// canonical sample each, single-sourced in `Notice::sample`.
+fn test_severities(severity: TestSeverity) -> Vec<(&'static str, wusel_core::desktop::Severity)> {
+    use wusel_core::desktop::Severity;
+    match severity {
+        TestSeverity::Info => vec![("info", Severity::Success)],
+        TestSeverity::Warning => vec![("warning", Severity::Warning)],
+        TestSeverity::Error => vec![("error", Severity::Error)],
+        TestSeverity::All => vec![
+            ("info", Severity::Success),
+            ("warning", Severity::Warning),
+            ("error", Severity::Error),
+        ],
+    }
+}
+
+/// Fire test notification(s) so the user can confirm the desktop notification
+/// channel works without waiting for a real sync event.
+///
+/// On Linux this posts straight through the platform backend (the D-Bus bus). On
+/// macOS the CLI cannot post — only the agent app may — so it injects each sample
+/// into the running agent over its socket, which drives the very path a real
+/// notice takes. `socket` overrides the auto-discovered agent socket (macOS).
+#[cfg(not(target_os = "macos"))]
+fn cmd_desktop_notify(severity: TestSeverity, _socket: Option<&str>) -> anyhow::Result<()> {
     use wusel_core::desktop::Notice;
-
-    // Representative notices, one per severity (see `Notice::severity`).
-    let info = || Notice::ConnectionRestored {
-        server: "cloud.example.org".into(),
-    };
-    let warning = || Notice::ConflictCopy {
-        path: "Documents/report.odt".into(),
-        copy: "Documents/report (conflicted copy 2026-07-23).odt".into(),
-    };
-    let error = || Notice::UploadFailed {
-        path: "Documents/report.odt".into(),
-        reason: "storage quota exceeded".into(),
-    };
-
-    let notices: Vec<(&str, Notice)> = match severity {
-        TestSeverity::Info => vec![("info", info())],
-        TestSeverity::Warning => vec![("warning", warning())],
-        TestSeverity::Error => vec![("error", error())],
-        TestSeverity::All => vec![("info", info()), ("warning", warning()), ("error", error())],
-    };
-
     let mut failed = false;
-    for (label, notice) in &notices {
-        match wusel_desktop::notify(notice) {
+    for (label, sev) in test_severities(severity) {
+        let notice = Notice::sample(sev);
+        match wusel_desktop::notify(&notice) {
             Ok(()) => println!("✓ sent {label} notification ({:?})", notice.severity()),
             Err(e) => {
                 failed = true;
@@ -361,6 +447,110 @@ fn cmd_desktop_notify(severity: TestSeverity) -> anyhow::Result<()> {
     }
     println!("All notifications were accepted by the notification daemon.");
     Ok(())
+}
+
+/// macOS: inject each sample into the running agent over its socket. The agent's
+/// `NoticeWatcher` receives it and posts the banner, so this verifies the whole
+/// chain — engine backend, socket, agent, Notification Center.
+#[cfg(target_os = "macos")]
+fn cmd_desktop_notify(severity: TestSeverity, socket: Option<&str>) -> anyhow::Result<()> {
+    let socket_path = match socket {
+        Some(s) => std::path::PathBuf::from(s),
+        None => resolve_agent_socket().ok_or_else(|| {
+            anyhow::anyhow!(
+                "no running Wusel agent found — start it (or ⌘R in Xcode), or pass --socket"
+            )
+        })?,
+    };
+    let mut client = wusel_ipc::Client::connect(&socket_path)
+        .with_context(|| format!("could not reach the agent at {}", socket_path.display()))?;
+
+    let mut unheard = false;
+    let severities = test_severities(severity);
+    for (index, (label, sev)) in severities.iter().enumerate() {
+        // Space the notices out: macOS coalesces a burst of banners into
+        // Notification Center (no banner shown), so a rapid `notify all` would
+        // look like nothing popped up. A short gap lets each one banner. Real
+        // notices arrive naturally spaced, so this is only the self-test's need.
+        if index > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        }
+        let request = wusel_ipc::Request {
+            op: "test-notice".into(),
+            path: wire_severity_label(*sev).into(),
+            ..Default::default()
+        };
+        let (response, _) = client
+            .call(&request)
+            .with_context(|| format!("could not send the {label} test notice"))?;
+        match response {
+            wusel_ipc::Response::Notified { delivered, .. } if delivered > 0 => {
+                println!("✓ sent {label} notice to the agent ({delivered} listener(s))");
+            }
+            wusel_ipc::Response::Notified { .. } => {
+                unheard = true;
+                eprintln!(
+                    "⚠ sent {label}, but no listener received it — the agent may be starting up \
+                     or notifications may be denied (System Settings ▸ Notifications ▸ Wusel)"
+                );
+            }
+            // An unknown op means the running agent still runs an older `serve`
+            // that predates this command; a restart re-spawns the current one.
+            wusel_ipc::Response::Error {
+                error: wusel_ipc::ErrorKind::BadRequest,
+                ..
+            } => {
+                bail!(
+                    "the running Wusel agent is out of date (it does not know 'test-notice') — \
+                     restart it (⌘R in Xcode, or relaunch the app) and try again"
+                );
+            }
+            other => bail!("unexpected reply to the {label} test notice: {other:?}"),
+        }
+    }
+    if unheard {
+        bail!("a test notice reached no listener — is the Wusel agent running?");
+    }
+    println!("All test notices were delivered to the agent; watch for the banners.");
+    Ok(())
+}
+
+/// The wire label a `test-notice` carries for a severity (see `parse_severity`
+/// in `wusel-ipc`).
+#[cfg(target_os = "macos")]
+fn wire_severity_label(severity: wusel_core::desktop::Severity) -> &'static str {
+    use wusel_core::desktop::Severity;
+    match severity {
+        Severity::Success => "success",
+        Severity::Warning => "warning",
+        Severity::Error => "error",
+    }
+}
+
+/// Find the running agent's IPC socket, mirroring `SharedPaths.socketPath` in the
+/// Swift agent: the App Group container first (the paid-team layout, whose Team ID
+/// prefix is unknown here, so scan for the `*.at.itbh.wusel` group), then the
+/// fixed personal-team fallback under Application Support.
+#[cfg(target_os = "macos")]
+fn resolve_agent_socket() -> Option<std::path::PathBuf> {
+    let home = std::path::PathBuf::from(std::env::var_os("HOME")?);
+    let groups = home.join("Library/Group Containers");
+    if let Ok(entries) = std::fs::read_dir(&groups) {
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".at.itbh.wusel")
+            {
+                let sock = entry.path().join("ipc.sock");
+                if sock.exists() {
+                    return Some(sock);
+                }
+            }
+        }
+    }
+    let fallback = home.join("Library/Application Support/at.itbh.wusel/ipc.sock");
+    fallback.exists().then_some(fallback)
 }
 
 /// Runs through the Nextcloud Login Flow v2 and stores the credentials for
@@ -553,9 +743,65 @@ fn cmd_mount(account: &Account, mountpoint: Option<&str>) -> anyhow::Result<()> 
     // `cache clear` reads this to notice a live daemon (see
     // `live_mount_for_account`); the marker goes away again on clean exit.
     write_mount_marker(account, &target);
-    let result = wusel_fuse::mount(&target, provider);
+    let result = wusel_fuse::mount_with(&target, provider, ipc_extras(account));
     remove_mount_marker(account);
     result
+}
+
+/// Serve the IPC socket beside the mount, off the same engine.
+///
+/// This is what a file manager asks for per-file status. Until now the socket
+/// existed only under `wusel serve`, which cannot run while a mount does — one
+/// engine per state database — so on Linux, where the unit runs `wusel mount`,
+/// there was nothing to query.
+///
+/// Everything here is best-effort: a socket that will not bind must never stop
+/// the mount. The mount is the product; the socket is how the desktop decorates
+/// it.
+///
+/// Two deliberate differences from `wusel serve`'s socket. Uploads keep the
+/// mount's asynchronous write-back, so a `publish` here means "durable locally
+/// and on its way", not "the server has it" — changing that would trade away the
+/// latency the mount is tuned for, and no file-manager status query publishes
+/// anything. And `notices` has no producer: on Linux the engine's notices go to
+/// the desktop backend (D-Bus, the notify hook), not down this channel.
+#[cfg(feature = "fuse")]
+fn ipc_extras(account: &Account) -> wusel_fuse::Extras {
+    // The mount consumes the engine's invalidation channel for its own emblem
+    // refreshes, so `watch` subscribers get a tee of it rather than the original.
+    let (inval_tx, inval_rx) = std::sync::mpsc::channel();
+    let events = wusel_ipc::Events::start(inval_rx);
+    let notices = wusel_ipc::IpcDesktop::new();
+    let socket_path = default_ipc_socket(account);
+
+    wusel_fuse::Extras {
+        invalidations: Some(inval_tx),
+        on_ready: Some(Box::new(move |ids, provider| {
+            let driver = std::sync::Arc::new(wusel_ipc::Driver::attach(ids, provider));
+            // Take the route before the driver moves into the serve thread: it
+            // is what the mount's reply pump calls for ids it does not hold.
+            let route = driver.route();
+            match std::thread::Builder::new()
+                .name("wusel-ipc-serve".into())
+                .spawn(move || {
+                    if let Err(e) = wusel_ipc::serve(driver, events, notices, &socket_path) {
+                        tracing::warn!(
+                            path = %socket_path.display(), error = %e,
+                            "the status socket is not being served; \
+                             the file manager will show no sync emblems"
+                        );
+                    }
+                }) {
+                Ok(_) => Some(route),
+                Err(e) => {
+                    tracing::warn!(error = %e, "could not start the status socket thread");
+                    // No thread, no answers to route — and an installed route
+                    // whose waiters nobody serves would leak every id it saw.
+                    None
+                }
+            }
+        })),
+    }
 }
 
 /// Warn (do not block) if another account already syncs the same server + user:
@@ -623,6 +869,261 @@ fn cmd_mount(_account: &Account, _mountpoint: Option<&str>) -> anyhow::Result<()
         "This binary was built without FUSE support.\n\
          Rebuild with:  cargo build -p wusel --features fuse"
     )
+}
+
+// --- socket frontend (macOS File Provider IPC spike) ------------------------
+
+/// Run the engine for `account` and serve its intent protocol over a
+/// Unix-domain socket. Deliberately **not** behind the `fuse` feature: driving
+/// the engine without a FUSE mount is exactly what this proves, and what a
+/// platform frontend (a macOS File Provider extension) will do — speak the
+/// engine's intent API over the socket rather than link it.
+///
+/// Read path only for now: `stat`, `enumerate`, `fetch`. The socket defaults to
+/// a per-account path in the runtime directory; `--socket` overrides it.
+fn cmd_serve(account: &Account, socket: Option<&str>) -> anyhow::Result<()> {
+    // A mounted account already serves this socket itself, off the engine the
+    // mount owns. Starting `serve` too would do two forbidden things at once:
+    // stand up a second substrate over the one state database, and rebind the
+    // socket path out from under the file manager — `serve` clears what it
+    // finds there as stale, which is right for its own leftovers and wrong for
+    // a live mount's socket. Refuse instead, and say where the socket already
+    // is. (Linux only; nothing else mounts, so `live_mount` is always `None`.)
+    if let Some(live) = live_mount(account) {
+        bail!(
+            "account '{}' is mounted at {} and already serves its socket at {} — \
+             use that one. Running `serve` as well would start a second engine over \
+             the same state database and take the socket over. Unmount first if you \
+             really want a standalone `serve`.",
+            account.name(),
+            live.display(),
+            default_ipc_socket(account).display(),
+        );
+    }
+
+    // Say which engine this actually is, first thing: the bundled binary and the
+    // running process can otherwise be impossible to tell apart (a stale macOS
+    // bundle cost real debugging time).
+    tracing::info!(version = wusel_core::VERSION, "wusel serve starting");
+
+    // Reap ourselves if the agent that spawned us dies — before anything else, so
+    // even a failure during setup cannot leave us orphaned on notify_push.
+    spawn_parent_death_watchdog();
+
+    // Credentials up front: the notice pipeline's connection-health tracker needs
+    // the server URL, and the push connection needs the whole set.
+    let creds = wusel_core::credentials::load(&account.credentials_path(), account.name())
+        .context("could not load credentials for the push connection")?;
+
+    // The OS-integration backend for this path: the socket notice fan-out. The
+    // engine reports notices (conflict copy, upload failed, connection lost/
+    // restored) through this; it localizes each once and pushes it to every
+    // `notices` subscriber — the macOS agent, which alone may post to Notification
+    // Center. A `notices` channel, separate from the `watch` change channel. This
+    // one object is both the engine's `Desktop` and what the server subscribes to.
+    let desktop = wusel_ipc::IpcDesktop::new();
+
+    // One shared answer to "can we reach the server?", fed by every request the
+    // engine makes and the only thing allowed to notify about it — exactly as
+    // `cmd_mount` wires it. This is what makes ConnectionLost/Restored fire.
+    let health = std::sync::Arc::new(wusel_core::health::Reachability::new(
+        &creds.server,
+        std::sync::Arc::clone(&desktop) as std::sync::Arc<dyn wusel_core::desktop::Desktop>,
+    ));
+
+    // The same creds → http → dav → state → provider steps `cmd_mount` runs,
+    // already factored out for pin/unpin — reuse it rather than replicate, now
+    // with the health tracker attached so DAV outcomes reach the notifier.
+    let mut provider = build_provider(account, Some(&health))?;
+
+    // Take the change stream *before* the provider is moved into the driver, and
+    // fan it out to `watch` subscribers.
+    let invalidations = provider
+        .take_invalidations()
+        .ok_or_else(|| anyhow::anyhow!("the provider handed out no invalidation channel"))?;
+    let events = wusel_ipc::Events::start(invalidations);
+
+    // Live change signalling over notify_push, exactly as `cmd_mount` sets up —
+    // it degrades to the TTL revalidate loop when the app is absent. Its retry
+    // loops are the mount's heartbeat: an otherwise idle daemon still learns the
+    // connection went away — and came back — and tells the user through `health`.
+    // The guard must outlive `serve`, which blocks below.
+    let _push = wusel_core::push::spawn(
+        &creds.server,
+        &creds.login_name,
+        &creds.app_password,
+        account.settings().tls.clone(),
+        provider.invalidation_handle(),
+        provider.sync_trigger(),
+        Some(std::sync::Arc::clone(&health)),
+    );
+
+    // Route engine notices to the fan-out for the life of the daemon.
+    provider.set_desktop(
+        std::sync::Arc::clone(&desktop) as std::sync::Arc<dyn wusel_core::desktop::Desktop>
+    );
+
+    let driver = wusel_ipc::Driver::start(provider, wusel_core::runtime::Pools::default())
+        .context("could not start the engine substrate")?;
+    let driver = std::sync::Arc::new(driver);
+
+    let socket_path = match socket {
+        Some(s) => std::path::PathBuf::from(s),
+        None => default_ipc_socket(account),
+    };
+    if let Some(dir) = socket_path.parent() {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("could not create the socket directory {}", dir.display()))?;
+    }
+
+    println!("wusel serve: listening on {}", socket_path.display());
+    println!(
+        "(read: stat, enumerate, fetch; write: create, write, publish, remove, move, setattr; \
+         plus watch for change signals and notices for user notifications)"
+    );
+    wusel_ipc::serve(driver, events, desktop, &socket_path)
+        .with_context(|| format!("could not serve on {}", socket_path.display()))?;
+    Ok(())
+}
+
+/// Exit when the process that spawned us dies. The macOS agent runs `serve` as a
+/// child; on Unix a child does not die with its parent, so an abruptly-killed
+/// agent (Xcode stop, logout, crash) would otherwise leave `serve` alive — still
+/// bound to notify_push, still owning the socket the next agent needs to bind.
+/// Poll the parent pid and exit when it changes (the kernel reparents an orphan
+/// to launchd). A no-op when there is no distinct parent to watch.
+fn spawn_parent_death_watchdog() {
+    // SAFETY: getppid has no preconditions and cannot fail.
+    let orig = unsafe { libc::getppid() };
+    if orig <= 1 {
+        return; // launched detached — no agent parent to track.
+    }
+    let _ = std::thread::Builder::new()
+        .name("wusel-serve-parent-watch".into())
+        .spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            // SAFETY: as above.
+            if unsafe { libc::getppid() } != orig {
+                tracing::info!("the agent that spawned serve exited; shutting down");
+                std::process::exit(0);
+            }
+        });
+}
+
+/// The default IPC socket for an account: a per-account file in the per-user
+/// runtime directory (the same tmpfs the diagnostics socket uses), so two
+/// accounts never collide and nothing lingers past logout.
+fn default_ipc_socket(account: &Account) -> std::path::PathBuf {
+    wusel_core::config::ipc_dir().join(format!("ipc-{}.sock", account.name()))
+}
+
+/// The parsed `wusel ipc` invocation, bundled so the dispatcher passes one value
+/// rather than a long argument list.
+struct IpcArgs<'a> {
+    op: &'a str,
+    path: Option<&'a str>,
+    socket: Option<&'a str>,
+    offset: Option<u64>,
+    len: Option<u32>,
+    to: Option<&'a str>,
+    dir: bool,
+    size: Option<u64>,
+    mtime: Option<i64>,
+}
+
+/// A client for a running `wusel serve` socket. `stat`/`enumerate` and the
+/// write ops print their JSON response on stdout; `fetch` writes the content to
+/// stdout and the header to stderr (so it pipes cleanly); `write` reads its
+/// bytes from stdin; `watch` prints one JSON change per line until the daemon
+/// closes the stream.
+fn cmd_ipc(account: &Account, args: IpcArgs) -> anyhow::Result<()> {
+    let socket_path = match args.socket {
+        Some(s) => std::path::PathBuf::from(s),
+        None => default_ipc_socket(account),
+    };
+    let mut client = wusel_ipc::Client::connect(&socket_path)
+        .with_context(|| format!("could not connect to {}", socket_path.display()))?;
+
+    if args.op == "watch" {
+        client.watch().context("could not start watching")?;
+        eprintln!(
+            "watching {} — one JSON change per line",
+            socket_path.display()
+        );
+        while let Some(change) = client.next_push().context("the watch stream failed")? {
+            println!("{}", serde_json::to_string(&change)?);
+        }
+        return Ok(());
+    }
+
+    if args.op == "notices" {
+        client.notices().context("could not subscribe to notices")?;
+        eprintln!(
+            "listening for notices on {} — one JSON notice per line",
+            socket_path.display()
+        );
+        while let Some(notice) = client.next_push().context("the notice stream failed")? {
+            println!("{}", serde_json::to_string(&notice)?);
+        }
+        return Ok(());
+    }
+
+    const OPS: &[&str] = &[
+        "stat",
+        "enumerate",
+        "fetch",
+        "write",
+        "create",
+        "publish",
+        "remove",
+        "move",
+        "setattr",
+        "pin",
+        "unpin",
+    ];
+    if !OPS.contains(&args.op) {
+        bail!(
+            "unknown ipc op '{}' ({} | watch | notices)",
+            args.op,
+            OPS.join(" | ")
+        );
+    }
+    let request = wusel_ipc::Request {
+        op: args.op.to_string(),
+        path: args.path.unwrap_or("/").to_string(),
+        offset: args.offset.unwrap_or(0),
+        // `fetch` defaults to a 1 MiB window; `write` takes its length from the
+        // bytes it actually reads, so this value is moot there.
+        len: args.len.unwrap_or(1 << 20),
+        to: args.to.unwrap_or_default().to_string(),
+        dir: args.dir,
+        size: args.size,
+        mtime: args.mtime,
+        since: 0,
+    };
+
+    // `write` streams its payload from stdin in the frame after the request.
+    if args.op == "write" {
+        let mut data = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::stdin(), &mut data)
+            .context("could not read the write payload from stdin")?;
+        let response = client
+            .call_write(&request, &data)
+            .context("the write failed")?;
+        println!("{}", serde_json::to_string(&response)?);
+        return Ok(());
+    }
+
+    let (response, body) = client.call(&request).context("the request failed")?;
+    match body {
+        // `fetch`: the header on stderr keeps the content on stdout unpolluted.
+        Some(bytes) => {
+            eprintln!("{}", serde_json::to_string(&response)?);
+            std::io::Write::write_all(&mut std::io::stdout(), &bytes)?;
+        }
+        None => println!("{}", serde_json::to_string(&response)?),
+    }
+    Ok(())
 }
 
 // --- systemd user service ---------------------------------------------------
@@ -909,7 +1410,17 @@ fn systemctl(args: &[&str]) -> anyhow::Result<()> {
 // --- Pinning ("always keep offline") ----------------------------------------
 
 /// Build a `Provider` for an account (no FUSE needed) — used by pin/unpin.
-fn build_provider(account: &Account) -> anyhow::Result<wusel_core::provider::Provider> {
+/// Build a provider for `account`, optionally attaching a connection-health
+/// tracker so DAV outcomes reach a notifier.
+///
+/// A one-shot command (search, diagnostics) passes `None`: its failures show in
+/// the terminal the user is watching, so a desktop notification would be
+/// redundant noise. A long-running frontend (`serve`, and the FUSE mount) passes
+/// `Some`, so a lost or restored connection becomes a user notice.
+fn build_provider(
+    account: &Account,
+    health: Option<&std::sync::Arc<wusel_core::health::Reachability>>,
+) -> anyhow::Result<wusel_core::provider::Provider> {
     let creds = wusel_core::credentials::load(&account.credentials_path(), account.name())
         .with_context(|| {
             format!(
@@ -918,15 +1429,14 @@ fn build_provider(account: &Account) -> anyhow::Result<wusel_core::provider::Pro
             )
         })?;
     let http = build_http_client(&account.settings().tls)?;
-    // No reachability tracking here: this builds a provider for a one-shot
-    // command (search, diagnostics), where a failure is reported in the terminal
-    // the user is looking at — a desktop notification would be redundant noise.
+    // This is usually the mount's first request, so it is also where an outage is
+    // first seen: the outcome goes to `health` (when present) like any other.
     let dav_user = resolve_dav_user(
         &http,
         &creds.server,
         &creds.login_name,
         &creds.app_password,
-        None,
+        health.map(std::sync::Arc::as_ref),
     );
     let dav = wusel_core::webdav::WebDavClient::new(
         http,
@@ -934,6 +1444,10 @@ fn build_provider(account: &Account) -> anyhow::Result<wusel_core::provider::Pro
         &creds.login_name,
         &creds.app_password,
     );
+    let dav = match health {
+        Some(h) => dav.with_health(std::sync::Arc::clone(h)),
+        None => dav,
+    };
     let dav = match dav_user {
         Some(uid) => dav.with_dav_user(&uid),
         None => dav,
@@ -1046,20 +1560,14 @@ fn cmd_cache_clear(account: &Account, path: Option<&str>) -> anyhow::Result<()> 
     // DB and blob cache open, and deleting them under a live mount corrupts
     // the session. (Only detectable on Linux — the only platform that mounts —
     // via /proc/self/mountinfo; elsewhere the printed hint below remains.)
-    {
-        let configured = account_mount_point(account);
-        let configured = std::fs::canonicalize(&configured).unwrap_or(configured);
-        let marker = read_mount_marker(account);
-        let (_, ours) = read_active_mounts();
-        if let Some(live) = live_mount_for_account(&configured, marker.as_deref(), &ours) {
-            bail!(
-                "account '{}' is currently mounted at {} — unmount first \
-                 (`wusel service disable{}` or stop the running `wusel mount`)",
-                account.name(),
-                live.display(),
-                account_flag(account),
-            );
-        }
+    if let Some(live) = live_mount(account) {
+        bail!(
+            "account '{}' is currently mounted at {} — unmount first \
+             (`wusel service disable{}` or stop the running `wusel mount`)",
+            account.name(),
+            live.display(),
+            account_flag(account),
+        );
     }
     // Normalise: `cache clear /` means the whole account too.
     let path = path.map(|p| p.trim_matches('/')).filter(|p| !p.is_empty());
@@ -1232,6 +1740,19 @@ fn live_mount_for_account(
         .map(|p| p.to_path_buf())
 }
 
+/// Where this account is mounted right now, or `None`. The marker says where to
+/// look, the kernel says whether anything is there — see
+/// [`live_mount_for_account`] for why that split makes a stale marker harmless.
+///
+/// `None` off Linux, which does not mount at all.
+fn live_mount(account: &Account) -> Option<std::path::PathBuf> {
+    let configured = account_mount_point(account);
+    let configured = std::fs::canonicalize(&configured).unwrap_or(configured);
+    let marker = read_mount_marker(account);
+    let (_, ours) = read_active_mounts();
+    live_mount_for_account(&configured, marker.as_deref(), &ours)
+}
+
 /// Where a mounting daemon records the mountpoint it actually used, so other
 /// commands of the same account can find it even when it came from the command
 /// line. It lives in the account's state dir (per-account by construction, and
@@ -1275,10 +1796,43 @@ fn account_mount_point(account: &Account) -> std::path::PathBuf {
         .unwrap_or_else(|| account.default_mountpoint())
 }
 
+/// What `pin` acts on: the account and the remote path, with the whole-account
+/// pin reachable only through `--all`.
+///
+/// The empty remote path means "everything", and it is one slip away from any
+/// path that resolves to the mount root — so it is not enough for the *flag* to
+/// exist, the accidental spellings have to be refused too. `wusel pin` with the
+/// argument left out and `wusel pin ~/Wusel` (a right-click on the mount itself)
+/// both used to download the entire account and mark every file in it as kept
+/// offline, quietly.
+fn pin_target(
+    account: &Account,
+    path: Option<&str>,
+    all: bool,
+) -> anyhow::Result<(Account, String)> {
+    match (path, all) {
+        // Clap enforces exactly one of the two; the arms are here so a change to
+        // the argument definition cannot turn "neither" back into a root pin.
+        (None, true) => Ok((Account::new(account.name()), String::new())),
+        (Some(path), false) => {
+            let (account, remote) = resolve_pin_target(account, path)?;
+            if remote.is_empty() {
+                bail!(
+                    "'{path}' is the account root — pinning it downloads the whole account. \
+                     Say so explicitly with `wusel pin --all` if that is what you want."
+                );
+            }
+            Ok((account, remote))
+        }
+        (None, false) => bail!("`wusel pin` needs a path (or `--all` for the whole account)"),
+        (Some(_), true) => bail!("give a path or `--all`, not both"),
+    }
+}
+
 /// Pin a path and hydrate it now (a directory recursively).
-fn cmd_pin(account: &Account, path: &str) -> anyhow::Result<()> {
-    let (account, remote) = resolve_pin_target(account, path)?;
-    let mut provider = build_provider(&account)?;
+fn cmd_pin(account: &Account, path: Option<&str>, all: bool) -> anyhow::Result<()> {
+    let (account, remote) = pin_target(account, path, all)?;
+    let mut provider = build_provider(&account, None)?;
     let count = provider.pin(&remote).context("could not pin")?;
     announce_emblem(&account, &remote);
     println!(
@@ -1295,7 +1849,7 @@ fn cmd_pin(account: &Account, path: &str) -> anyhow::Result<()> {
 /// re-fetches in place, so a failure leaves exactly what was there.
 fn cmd_update(account: &Account, path: &str) -> anyhow::Result<()> {
     let (account, remote) = resolve_pin_target(account, path)?;
-    let mut provider = build_provider(&account)?;
+    let mut provider = build_provider(&account, None)?;
     let count = provider
         .refresh(&remote)
         .context("could not bring the pinned copy up to date")?;
@@ -1313,10 +1867,21 @@ fn cmd_update(account: &Account, path: &str) -> anyhow::Result<()> {
 /// Remove a pin; its files become normal (evictable) cache entries again.
 fn cmd_unpin(account: &Account, path: &str) -> anyhow::Result<()> {
     let (account, remote) = resolve_pin_target(account, path)?;
-    let mut provider = build_provider(&account)?;
-    provider.unpin(&remote).context("could not unpin")?;
+    let mut provider = build_provider(&account, None)?;
+    let still_pinned = provider.unpin(&remote).context("could not unpin")?;
     announce_emblem(&account, &remote);
-    println!("Unpinned {}.", pin_label(&remote));
+    if still_pinned {
+        // Covered by a pinned ancestor folder: removing its own pin changed
+        // nothing. (The desktop notice fires only where a desktop backend is
+        // installed; in the terminal, say it plainly.)
+        println!(
+            "{} stays offline because a parent folder is kept offline. \
+             Unpin the folder to change it.",
+            pin_label(&remote)
+        );
+    } else {
+        println!("Unpinned {}.", pin_label(&remote));
+    }
     Ok(())
 }
 
@@ -1331,14 +1896,20 @@ fn cmd_unpin(account: &Account, path: &str) -> anyhow::Result<()> {
 /// that is not there, a headless machine — none of that should make an unpin
 /// fail. The state is already correct either way; this is only how quickly it
 /// is *shown*.
+///
+/// Synchronous on purpose: this process exits within milliseconds of the pin,
+/// so a signal handed to a background worker would still be queued when it
+/// does — the file manager would then keep drawing the old emblem until it is
+/// restarted, since its status cache is only ever dropped on this signal.
 fn announce_emblem(account: &Account, remote: &str) {
     let settings = account.settings();
     let mount = settings
         .mount_point
         .clone()
         .unwrap_or_else(|| account.default_mountpoint());
-    let desktop = wusel_desktop::backend(account.name(), &mount, settings.notify_hook.as_deref());
-    desktop.file_changed(&mount.join(remote).to_string_lossy());
+    if let Err(e) = wusel_desktop::announce_file_changed(&mount.join(remote).to_string_lossy()) {
+        tracing::debug!(%e, "could not announce the emblem change");
+    }
 }
 
 /// Run the GNOME Shell search provider: forward queries to Nextcloud Unified
@@ -1362,17 +1933,129 @@ fn cmd_search_provider(account: &Account) -> anyhow::Result<()> {
         creds.login_name.clone(),
         creds.app_password.clone(),
     );
-    let search = move |term: &str| match rt.block_on(wusel_core::search::unified_search(
-        &http, &server, &login, &password, term,
-    )) {
-        Ok(hits) => hits,
-        Err(e) => {
-            tracing::debug!(%e, "unified search failed");
-            Vec::new()
+    // GNOME Shell fires one search per keystroke and re-issues the same term
+    // whenever the user pauses, backspaces to an earlier prefix, or repeats a
+    // search — each otherwise a fresh round-trip to the server's Unified Search.
+    // Keep the last results per term: a fresh entry is served straight from
+    // memory, a stale one is served at once and refreshed in the background so
+    // the next lookup of that term is instant too. (The SearchProvider2 protocol
+    // never re-reads a query it has already answered, so the background refresh
+    // can only speed up the next lookup, not results already on screen.)
+    type CacheEntry = (std::time::Instant, Vec<wusel_core::search::SearchHit>);
+    let cache: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, CacheEntry>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    // How long a cached entry is served without a background refresh.
+    const FRESH_FOR: std::time::Duration = std::time::Duration::from_secs(30);
+    // On a cold miss we wait this long for the real results before falling back
+    // to a "searching" placeholder — long enough for a snappy server to answer
+    // in place, short enough that a slow one still shows the Wusel section at
+    // once rather than seconds after the other providers.
+    const PLACEHOLDER_AFTER: std::time::Duration = std::time::Duration::from_millis(600);
+
+    let web_base = creds.server.trim_end_matches('/').to_string();
+    let placeholder_base = web_base.clone();
+    // Localized once: the placeholder row is end-user UI text, so it follows the
+    // user's language via the same seam as notifications (`desktop::Label`).
+    let placeholder_title =
+        wusel_core::desktop::Label::SearchPending.localize(&wusel_core::desktop::ui_locale());
+
+    let search = move |term: &str| -> Vec<wusel_core::search::SearchHit> {
+        let key = term.to_string();
+
+        // Read the cache (results and their age) without holding the lock across
+        // the network wait below.
+        let cached = {
+            let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+            guard
+                .get(&key)
+                .map(|(at, hits)| (at.elapsed(), hits.clone()))
+        };
+
+        match cached {
+            Some((age, hits)) if age < FRESH_FOR => hits,
+            Some((_, stale)) => {
+                // Serve the stale hits now; refresh the entry off-thread.
+                let (http, server, login, password, cache, key) = (
+                    http.clone(),
+                    server.clone(),
+                    login.clone(),
+                    password.clone(),
+                    cache.clone(),
+                    key.clone(),
+                );
+                rt.spawn(async move {
+                    if let Ok(hits) =
+                        wusel_core::search::unified_search(&http, &server, &login, &password, &key)
+                            .await
+                    {
+                        cache
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(key, (std::time::Instant::now(), hits));
+                    }
+                });
+                stale
+            }
+            None => {
+                // Cold miss: run the real search off-thread — it fills the cache
+                // when done — and wait a moment for it. A snappy server returns
+                // real results on this very keystroke; a slow one yields a
+                // "searching" placeholder at once, so the Wusel section shows up
+                // with the others instead of popping in seconds later. GNOME
+                // never re-reads a query it has answered, so if the user stops
+                // typing on a brand-new term the placeholder is what stays until
+                // the next keystroke re-queries and finds the now-cached results.
+                let handle = {
+                    let (http, server, login, password, cache, key) = (
+                        http.clone(),
+                        server.clone(),
+                        login.clone(),
+                        password.clone(),
+                        cache.clone(),
+                        key.clone(),
+                    );
+                    rt.spawn(async move {
+                        let hits = match wusel_core::search::unified_search(
+                            &http, &server, &login, &password, &key,
+                        )
+                        .await
+                        {
+                            Ok(hits) => hits,
+                            Err(e) => {
+                                tracing::debug!(%e, "unified search failed");
+                                Vec::new()
+                            }
+                        };
+                        cache
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(key, (std::time::Instant::now(), hits.clone()));
+                        hits
+                    })
+                };
+                // Build the timeout *inside* the runtime: `tokio::time::timeout`
+                // arms a timer on construction and panics if that happens off a
+                // Tokio context (this runs on the zbus executor thread). Dropping
+                // the handle on timeout does not abort the task, so it keeps
+                // running and still populates the cache for next time.
+                match rt.block_on(async { tokio::time::timeout(PLACEHOLDER_AFTER, handle).await }) {
+                    Ok(Ok(hits)) => hits,
+                    _ => vec![wusel_core::search::SearchHit {
+                        title: placeholder_title.clone(),
+                        subline: key,
+                        resource_url: placeholder_base.clone(),
+                        rel_path: None,
+                    }],
+                }
+            }
         }
     };
 
-    let web_base = creds.server.trim_end_matches('/').to_string();
+    // Clicking "N more" / the provider header opens the query in the web UI.
+    // Unified Search has no stable deep-link, so open the account's start page,
+    // where the search bar is one keystroke away.
+    let launch_base = web_base.clone();
+    let launch = move |_terms: &[String]| open_uri(&launch_base);
     let activate = move |hit: &wusel_core::search::SearchHit| {
         // Local-first: open the mount copy if the path resolves and exists.
         if let Some(rel) = &hit.rel_path {
@@ -1390,7 +2073,7 @@ fn cmd_search_provider(account: &Account) -> anyhow::Result<()> {
         open_uri(&url);
     };
 
-    wusel_desktop::run_search_provider(search, activate).map_err(|e| anyhow::anyhow!("{e}"))
+    wusel_desktop::run_search_provider(search, activate, launch).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 /// Open a path or URL with the desktop's default handler (fire-and-forget).

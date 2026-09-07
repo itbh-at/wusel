@@ -143,9 +143,23 @@ impl WebDavClient {
     async fn send(&self, req: reqwest::RequestBuilder) -> Result<reqwest::Response> {
         match send_retrying(req).await {
             Ok(resp) => {
-                // An answer is an answer: a 500 says the server is *there*.
                 if let Some(health) = &self.health {
-                    health.ok();
+                    // An answer is not automatically good news. A `404` or a
+                    // `401` is the server working — it looked, it decided — and
+                    // proves it is there. A `5xx` is the server saying it cannot
+                    // serve at all: maintenance, a backup window, a proxy with
+                    // nothing behind it. Counting that as "reachable" is what
+                    // kept a mount silent through an outage in which *every*
+                    // request failed.
+                    //
+                    // `error_for_status_ref` borrows, so the response still goes
+                    // to the caller untouched: what a status *means* for the
+                    // operation stays the caller's decision, and only what it
+                    // means for the server's health is settled here.
+                    match resp.error_for_status_ref().err().map(Error::from) {
+                        Some(e) if e.is_server_fault() => health.failed(&e),
+                        _ => health.ok(),
+                    }
                 }
                 Ok(resp)
             }

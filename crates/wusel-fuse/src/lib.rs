@@ -35,6 +35,26 @@ pub fn mount(
     fs::mount(mountpoint, provider)
 }
 
+/// Everything the daemon wires into a mount besides the engine itself — a
+/// second frontend sharing the one substrate. See [`mount_with`].
+#[cfg(target_os = "linux")]
+pub use fs::Extras;
+
+/// Mounts the filesystem, additionally hosting a second frontend on the same
+/// engine: the IPC socket a file manager queries for per-file status.
+///
+/// The mount and the socket cannot each start their own substrate — two engines
+/// over one state database — so the mount starts it and lends the other a
+/// [`wusel_core::runtime::SubmitHandle`] plus a route for its answers.
+#[cfg(target_os = "linux")]
+pub fn mount_with(
+    mountpoint: &std::path::Path,
+    provider: wusel_core::provider::Provider,
+    extras: Extras,
+) -> anyhow::Result<()> {
+    fs::mount_with(mountpoint, provider, extras)
+}
+
 /// Stub for non-Linux platforms (no FUSE driver).
 #[cfg(not(target_os = "linux"))]
 pub fn mount(

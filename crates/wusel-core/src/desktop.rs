@@ -72,6 +72,12 @@ pub enum Notice {
     /// The server is unreachable or the app password was rejected — the mount is
     /// now silently stale until it recovers.
     ConnectionLost { server: String },
+    /// The server answers, but with a fault of its own — 5xx: maintenance, a
+    /// backup window, a proxy with nothing behind it. Deliberately not
+    /// [`Notice::ConnectionLost`]: the difference decides what the user does
+    /// next, and telling somebody their connection is gone while it is fine
+    /// sends them to the router for nothing.
+    ServerUnavailable { server: String, status: u16 },
     /// Pinned files have gone out of date on the server. One message for all of
     /// them: a colleague reorganising a shared folder can change hundreds at
     /// once, and hundreds of notifications is a denial of service dressed as
@@ -85,13 +91,41 @@ pub enum Notice {
     /// message: waiting for a connection is not the same advice as "update it
     /// when you want to".
     StaleCopyServed { path: String, reason: Stale },
-    /// Good news: the connection is back after a [`Notice::ConnectionLost`]. We
-    /// notify success only when it *resolves* a problem the user was told about —
-    /// never routine success (the "sync finished" spam).
+    /// Good news: the server is usable again, after a [`Notice::ConnectionLost`]
+    /// **or** a [`Notice::ServerUnavailable`]. One resolution for both, because
+    /// the user asked one question — "is it working again?" — and the answer is
+    /// the same sentence either way. We notify success only when it *resolves* a
+    /// problem the user was told about — never routine success (the "sync
+    /// finished" spam).
     ConnectionRestored { server: String },
+    /// The user tried to make a file available-on-demand again, but it sits in a
+    /// folder that is kept offline as a whole, so it stays offline. Nothing
+    /// failed — the action simply does not apply at the file level — but without
+    /// a word it looks broken. The message names what to do instead: act on the
+    /// folder.
+    PinnedByFolder { path: String },
 }
 
 impl Notice {
+    /// A representative notice of the given severity, for the `desktop notify`
+    /// self-test — one canonical example per severity, so the test path and every
+    /// backend render the same sample rather than each inventing its own.
+    pub fn sample(severity: Severity) -> Notice {
+        match severity {
+            Severity::Success => Notice::ConnectionRestored {
+                server: "cloud.example.org".into(),
+            },
+            Severity::Warning => Notice::ConflictCopy {
+                path: "Documents/report.odt".into(),
+                copy: "Documents/report (conflicted copy 2026-07-23).odt".into(),
+            },
+            Severity::Error => Notice::UploadFailed {
+                path: "Documents/report.odt".into(),
+                reason: "storage quota exceeded".into(),
+            },
+        }
+    }
+
     /// How this notice reads (good / attention / bad), for the backend's urgency
     /// and icon.
     pub fn severity(&self) -> Severity {
@@ -99,22 +133,27 @@ impl Notice {
             Notice::ConnectionRestored { .. } => Severity::Success,
             Notice::ConflictCopy { .. } => Severity::Warning,
             Notice::StaleCopyServed { .. } | Notice::PinnedOutOfDate { .. } => Severity::Warning,
-            Notice::UploadFailed { .. } | Notice::ConnectionLost { .. } => Severity::Error,
+            Notice::PinnedByFolder { .. } => Severity::Warning,
+            Notice::UploadFailed { .. }
+            | Notice::ConnectionLost { .. }
+            | Notice::ServerUnavailable { .. } => Severity::Error,
         }
     }
 
     /// Stable, unlocalized identifier for this notice's kind — the `"kind"` field
     /// in [`Notice::to_json`]. **A public contract** — keep these strings stable,
-    /// like [`FileState::as_xattr`](crate::provider::FileState::as_xattr): a
-    /// notify-hook script may already be matching on them.
+    /// like the status protocol's own `state` values: a notify-hook script may
+    /// already be matching on them.
     fn kind(&self) -> &'static str {
         match self {
             Notice::ConflictCopy { .. } => "conflict-copy",
             Notice::UploadFailed { .. } => "upload-failed",
             Notice::ConnectionLost { .. } => "connection-lost",
+            Notice::ServerUnavailable { .. } => "server-unavailable",
             Notice::PinnedOutOfDate { .. } => "pinned-out-of-date",
             Notice::StaleCopyServed { .. } => "stale-copy-served",
             Notice::ConnectionRestored { .. } => "connection-restored",
+            Notice::PinnedByFolder { .. } => "pinned-by-folder",
         }
     }
 
@@ -132,6 +171,9 @@ impl Notice {
                 serde_json::json!({ "path": path, "reason": reason })
             }
             Notice::ConnectionLost { server } => serde_json::json!({ "server": server }),
+            Notice::ServerUnavailable { server, status } => {
+                serde_json::json!({ "server": server, "status": status })
+            }
             Notice::PinnedOutOfDate { count, first } => {
                 serde_json::json!({ "count": count, "first": first })
             }
@@ -143,6 +185,7 @@ impl Notice {
                 },
             }),
             Notice::ConnectionRestored { server } => serde_json::json!({ "server": server }),
+            Notice::PinnedByFolder { path } => serde_json::json!({ "path": path }),
         };
         // `fields` is always an object literal from the arms above, so indexing
         // it to add two more members cannot panic.
@@ -188,12 +231,7 @@ impl Notice {
     /// read English. Logs and CLI output stay English. Unknown locales fall back to
     /// English. Add a language by adding one arm.
     pub fn localize(&self, locale: &str) -> Message {
-        let lang = locale
-            .split(['_', '-', '.', ':'])
-            .next()
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        match lang.as_str() {
+        match lang_of(locale).as_str() {
             "de" => self.de(),
             _ => self.en(),
         }
@@ -218,8 +256,16 @@ impl Notice {
             Notice::ConnectionLost { server } => Message {
                 title: "Connection lost".into(),
                 body: format!(
-                    "wusel cannot reach {server} at the moment. Your Nextcloud folder may be \
+                    "Wusel cannot reach {server} at the moment. Your Nextcloud folder may be \
                      out of date until the connection returns."
+                ),
+            },
+            Notice::ServerUnavailable { server, status } => Message {
+                title: "Server not available".into(),
+                body: format!(
+                    "{server} is answering, but cannot serve your files right now (error \
+                     {status}) — usually maintenance or a backup. Wusel keeps trying; your \
+                     Nextcloud folder may be out of date until it is back."
                 ),
             },
             Notice::PinnedOutOfDate { count, first } => Message {
@@ -259,8 +305,15 @@ impl Notice {
                 ),
             },
             Notice::ConnectionRestored { server } => Message {
-                title: "Connection restored".into(),
-                body: format!("wusel is connected to {server} again; your folder is up to date."),
+                title: "Server available again".into(),
+                body: format!("Wusel can reach {server} again; your folder is up to date."),
+            },
+            Notice::PinnedByFolder { path } => Message {
+                title: "Kept offline by its folder".into(),
+                body: format!(
+                    "'{path}' stays available offline because the folder it is in is kept \
+                     offline as a whole. To change it, remove the folder's offline availability."
+                ),
             },
         }
     }
@@ -284,8 +337,16 @@ impl Notice {
             Notice::ConnectionLost { server } => Message {
                 title: "Verbindung verloren".into(),
                 body: format!(
-                    "wusel erreicht {server} gerade nicht. Ihr Nextcloud-Ordner ist \
+                    "Wusel erreicht {server} gerade nicht. Ihr Nextcloud-Ordner ist \
                      möglicherweise nicht aktuell, bis die Verbindung zurück ist."
+                ),
+            },
+            Notice::ServerUnavailable { server, status } => Message {
+                title: "Server nicht verfügbar".into(),
+                body: format!(
+                    "{server} antwortet, kann Ihre Dateien aber gerade nicht ausliefern \
+                     (Fehler {status}) — meist Wartung oder eine Sicherung. Wusel versucht es \
+                     weiter; Ihr Nextcloud-Ordner ist bis dahin möglicherweise nicht aktuell."
                 ),
             },
             Notice::PinnedOutOfDate { count, first } => Message {
@@ -327,8 +388,16 @@ impl Notice {
                 ),
             },
             Notice::ConnectionRestored { server } => Message {
-                title: "Verbindung wiederhergestellt".into(),
-                body: format!("wusel ist wieder mit {server} verbunden; Ihr Ordner ist aktuell."),
+                title: "Server wieder verfügbar".into(),
+                body: format!("Wusel erreicht {server} wieder; Ihr Ordner ist aktuell."),
+            },
+            Notice::PinnedByFolder { path } => Message {
+                title: "Durch den Ordner offline gehalten".into(),
+                body: format!(
+                    "„{path}“ bleibt offline verfügbar, weil der Ordner, in dem sie liegt, \
+                     insgesamt offline gehalten wird. Heben Sie dazu die Offline-Verfügbarkeit \
+                     des Ordners auf."
+                ),
             },
         }
     }
@@ -346,6 +415,39 @@ pub fn ui_locale() -> String {
         }
     }
     "en".to_string()
+}
+
+/// Reduce a POSIX/BCP-47 locale (`de_AT.UTF-8`, `fr-FR`) to its lower-case
+/// language subtag (`de`, `fr`) — the key both [`Notice::localize`] and
+/// [`Label::localize`] match on.
+fn lang_of(locale: &str) -> String {
+    locale
+        .split(['_', '-', '.', ':'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
+/// End-user UI text *outside* the notification path that must still appear in the
+/// user's language — a GNOME search-result row, for one. It lives beside
+/// [`Notice`] on purpose: every translated string stays in this one module (the
+/// single place we speak the user's language), never scattered across frontends.
+/// Unknown locales fall back to English; add a language by adding a match arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Label {
+    /// The placeholder row shown while a Nextcloud search is still running.
+    SearchPending,
+}
+
+impl Label {
+    /// The label in `locale`'s language (see [`ui_locale`] for the tag source).
+    pub fn localize(&self, locale: &str) -> String {
+        match (lang_of(locale).as_str(), self) {
+            ("de", Label::SearchPending) => "Nextcloud wird durchsucht …",
+            (_, Label::SearchPending) => "Searching Nextcloud …",
+        }
+        .to_string()
+    }
 }
 
 /// The overall sync state a file manager / cloud-provider surface shows.
@@ -417,6 +519,21 @@ mod tests {
     }
 
     #[test]
+    fn labels_localize_like_notices() {
+        assert_eq!(
+            Label::SearchPending.localize("de_AT.UTF-8"),
+            "Nextcloud wird durchsucht …"
+        );
+        for loc in ["en_US.UTF-8", "fr_FR", "C", "", "xx"] {
+            assert_eq!(
+                Label::SearchPending.localize(loc),
+                "Searching Nextcloud …",
+                "locale {loc:?} → English"
+            );
+        }
+    }
+
+    #[test]
     fn localizes_to_german_and_falls_back_to_english() {
         // German for a `de*` locale.
         let de = conflict().localize("de_AT.UTF-8");
@@ -442,8 +559,15 @@ mod tests {
             Notice::ConnectionLost {
                 server: "https://cloud.example.org".into(),
             },
+            Notice::ServerUnavailable {
+                server: "https://cloud.example.org".into(),
+                status: 502,
+            },
             Notice::ConnectionRestored {
                 server: "https://cloud.example.org".into(),
+            },
+            Notice::PinnedByFolder {
+                path: "Angebote/servus.md".into(),
             },
         ];
         for n in &notices {
@@ -452,6 +576,24 @@ mod tests {
                 assert!(!m.title.is_empty() && !m.body.is_empty(), "{loc}: {n:?}");
             }
         }
+    }
+
+    /// The status is the whole reason this notice is separate from
+    /// `ConnectionLost`: without it the message would say "something is wrong"
+    /// and leave the user exactly as informed as the silence did.
+    #[test]
+    fn the_unavailable_message_names_the_server_and_its_status() {
+        let n = Notice::ServerUnavailable {
+            server: "collab.example.org".into(),
+            status: 502,
+        };
+        for loc in ["de", "en"] {
+            let m = n.localize(loc);
+            assert!(m.body.contains("collab.example.org"), "{loc}: {}", m.body);
+            assert!(m.body.contains("502"), "{loc}: {}", m.body);
+        }
+        assert_eq!(n.to_json()["status"], 502);
+        assert_eq!(n.to_json()["kind"], "server-unavailable");
     }
 
     #[test]
@@ -499,6 +641,10 @@ mod tests {
                 reason: "y".into(),
             },
             Notice::ConnectionLost { server: "x".into() },
+            Notice::ServerUnavailable {
+                server: "x".into(),
+                status: 503,
+            },
             Notice::ConnectionRestored { server: "x".into() },
             Notice::PinnedOutOfDate {
                 count: 1,
@@ -512,6 +658,6 @@ mod tests {
         .iter()
         .map(|n| n.to_json()["kind"].as_str().unwrap().to_string())
         .collect();
-        assert_eq!(kinds.len(), 6, "every variant must have a distinct kind");
+        assert_eq!(kinds.len(), 7, "every variant must have a distinct kind");
     }
 }

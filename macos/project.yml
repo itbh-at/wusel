@@ -1,0 +1,218 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 IT Beratung Hermann GmbH
+
+# XcodeGen spec — the single source of truth for the Xcode project. Generate it
+# with `mise run project` (which runs `xcodegen generate`). The resulting
+# Wusel.xcodeproj is git-ignored: this file is what gets reviewed and merged,
+# not a 3000-line project.pbxproj.
+#
+# Two targets, mirroring documentation/.../frontends.adoc:
+#   * WuselAgent        — a background agent .app (LSUIElement, no Dock icon). It
+#                         will host the Rust engine + `wusel serve` socket and
+#                         post Notification Center notices. The File Provider
+#                         extension is embedded inside it.
+#   * WuselFileProvider — an NSFileProviderReplicatedExtension that maps Finder's
+#                         callbacks onto the socket protocol (wusel-ipc).
+#
+# The shared socket client (WuselKit/) is compiled into both targets directly
+# rather than via an embedded framework: a skeleton gains nothing from the extra
+# rpath/embedding machinery, and this keeps the graph trivial.
+
+name: Wusel
+
+options:
+  bundleIdPrefix: at.itbh.wusel
+  deploymentTarget:
+    macOS: "13.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: true
+
+# Applied to every target and configuration: the signing defaults that let the
+# project compile with no Apple Developer account (see Config/Base.xcconfig).
+configFiles:
+  Debug: Config/Base.xcconfig
+  Release: Config/Base.xcconfig
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MACOSX_DEPLOYMENT_TARGET: "13.0"
+    ENABLE_HARDENED_RUNTIME: YES
+    # CRITICAL for the extension: Xcode 16+ Debug builds default to a "debug
+    # dylib" — the real code is split into a separate .debug.dylib and the binary
+    # is a tiny @rpath loader stub. For an app extension that stub has no
+    # launchable principal class, so the system reports the File Provider domain
+    # as `applicationExtensionNotFound` (-2014). Compile the code into the binary.
+    # Quoted so YAML does not fold NO into the boolean false (which XcodeGen drops).
+    ENABLE_DEBUG_DYLIB: "NO"
+    # Automatic signing; the Team ID comes from the git-ignored Config/Local.xcconfig
+    # (nothing team-specific in the repo). A File Provider extension will not load
+    # ad-hoc, so a real team is required to run it in Finder. `mise run build`
+    # passes CODE_SIGNING_ALLOWED=NO, so a no-team checkout still compiles.
+    CODE_SIGN_STYLE: Automatic
+
+targets:
+  # --- The background agent app -------------------------------------------
+  WuselAgent:
+    type: application
+    platform: macOS
+    sources:
+      - path: WuselAgent
+      - path: WuselKit
+      # The bundled `wusel` engine binary (built by `mise run bundle-wusel`).
+      # The directory is committed (with a .gitkeep); the binary inside it is a
+      # build artifact and git-ignored.
+      - path: Resources
+        buildPhase: resources
+    # Rebuild and re-stage the engine before every build. Xcode compiles only
+    # Swift and copies `Resources/wusel`, so without this a pull that changed the
+    # engine would ship a weeks-stale binary — the emblem, the change protocol,
+    # everything engine-side silently runs on old code. `cargo` caches, so an
+    # unchanged engine is near-instant; a changed one rebuilds. Runs the same
+    # `bundle-wusel` task a developer runs by hand, so the two cannot drift.
+    #
+    # Xcode's GUI build has a minimal PATH with neither mise nor cargo on it, and
+    # mise may live anywhere (it is not on a well-known path). So run through a
+    # login+interactive shell (`-lic`), which sources the developer's own
+    # `.zprofile`/`.zshrc` where mise is set up — nothing about its location is
+    # hard-coded here. stdin is closed so the interactive shell cannot block.
+    preBuildScripts:
+      - name: Bundle the wusel engine
+        basedOnDependencyAnalysis: false
+        script: |
+          "${SHELL:-/bin/zsh}" -lic 'cd "$PROJECT_DIR" && mise run bundle-wusel' </dev/null || {
+            echo "error: engine bundling failed — ensure mise is set up in your login shell, or run 'cd macos && mise run bundle-wusel' manually" >&2
+            exit 1
+          }
+          # Copy the freshly built engine straight into the product bundle.
+          # "Copy Bundle Resources" caches the Resources *folder* reference and
+          # misses the file the step above just rewrote, so on an incremental
+          # build the bundle otherwise keeps a stale engine — indistinguishable
+          # at a glance, and a repeated debugging trap. On a clean build the
+          # bundle dir does not exist yet; there the resources phase copies it,
+          # so a skip here is fine.
+          dst="${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}"
+          if [ -d "$dst" ]; then
+            cp -f "${PROJECT_DIR}/Resources/wusel" "${dst}/wusel" && echo ">> refreshed bundled engine at ${dst}/wusel"
+          fi
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: at.itbh.wusel.agent
+        PRODUCT_NAME: Wusel
+        INFOPLIST_KEY_NSHumanReadableCopyright: "Copyright 2026 IT Beratung Hermann GmbH"
+        # The pre-build script shells out to cargo/mise and writes Resources/wusel
+        # outside DerivedData, which script sandboxing forbids.
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+    info:
+      path: WuselAgent/Info.plist
+      properties:
+        CFBundleDisplayName: Wusel
+        # A background agent: no Dock icon, no menu bar. launchd starts it.
+        LSUIElement: true
+        # The resolved App Group id, so SharedPaths can find the shared container
+        # at runtime without hard-coding the Team ID.
+        WUSELAppGroup: $(WUSEL_APP_GROUP)
+    # Non-sandboxed daemon (spawns `wusel serve`, reads credentials), but a
+    # member of the App Group so it shares the extension's container (the socket
+    # meeting point). WUSEL_APP_GROUP is composed from the Team ID at build time
+    # (see Base.xcconfig), so nothing team-specific lives in the repo.
+    entitlements:
+      path: WuselAgent/WuselAgent.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - $(WUSEL_APP_GROUP)
+    dependencies:
+      # Embed the extension inside the app bundle (.appex under Contents/PlugIns).
+      - target: WuselFileProvider
+
+  # --- The File Provider extension ----------------------------------------
+  WuselFileProvider:
+    type: app-extension
+    platform: macOS
+    sources:
+      - path: WuselFileProvider
+      - path: WuselKit
+    settings:
+      base:
+        # An app extension's bundle id must be prefixed by the host app's.
+        PRODUCT_BUNDLE_IDENTIFIER: at.itbh.wusel.agent.FileProvider
+        PRODUCT_NAME: WuselFileProvider
+    info:
+      path: WuselFileProvider/Info.plist
+      properties:
+        CFBundleDisplayName: Wusel File Provider
+        # Same App Group id as the agent, for SharedPaths at runtime.
+        WUSELAppGroup: $(WUSEL_APP_GROUP)
+        # The mount's Finder sidebar icon (under "Locations"). A File Provider
+        # domain takes its sidebar icon from the EXTENSION's CFBundleSymbolName —
+        # an SF Symbol, or a custom symbol shipped in the extension — NOT from the
+        # app icon. `wusel` is our custom symbol (Assets.xcassets/wusel.symbolset),
+        # authored from the Wusel vector logo.
+        CFBundleIcons:
+          CFBundlePrimaryIcon:
+            CFBundleSymbolName: wusel
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.fileprovider-nonui
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).FileProviderExtension
+          # A File Provider must declare its document group (an App Group) and
+          # that it enumerates; without these the system rejects it as not a
+          # launchable provider (applicationExtensionNotFound). Matched against a
+          # working reference (the Nextcloud client).
+          NSExtensionFileProviderDocumentGroup: $(WUSEL_APP_GROUP)
+          NSExtensionFileProviderSupportsEnumeration: true
+          # Finder right-click actions. The extension implements
+          # NSFileProviderCustomAction. Both actions are always offered
+          # (TRUEPREDICATE): a File Provider activation rule cannot read our pinned
+          # state (its predicate does not see the item's userInfo), so we cannot
+          # hide the irrelevant one — and pin/unpin are idempotent, so offering
+          # both is harmless. The Name is the localization key resolved from
+          # Localizable.strings (en/de) — a File Provider action name localizes
+          # through Localizable.strings, not InfoPlist.strings.
+          NSExtensionFileProviderActions:
+            - NSExtensionFileProviderActionIdentifier: at.itbh.wusel.action.makeAvailableOffline
+              NSExtensionFileProviderActionName: Make Available Offline
+              NSExtensionFileProviderActionActivationRule: TRUEPREDICATE
+            - NSExtensionFileProviderActionIdentifier: at.itbh.wusel.action.removeOfflineAvailability
+              NSExtensionFileProviderActionName: Remove Offline Availability
+              NSExtensionFileProviderActionActivationRule: TRUEPREDICATE
+          # A Finder emblem for offline-available (pinned) items, so the user can
+          # tell them apart from on-demand ones. The item lists this decoration's
+          # identifier when pinned (see WuselItem / NSFileProviderItemDecorating);
+          # the badge is a built-in system checkmark, so no custom asset is needed.
+          NSFileProviderDecorations:
+            - Identifier: at.itbh.wusel.decoration.offline
+              Category: Badge
+              BadgeImageType: com.apple.icon-decoration.badge.checkmark
+              Label: Available Offline
+            - Identifier: at.itbh.wusel.decoration.stale
+              Category: Badge
+              BadgeImageType: com.apple.icon-decoration.badge.warning
+              Label: Offline Copy Outdated
+            # No Team/Group-folder badge: `BadgeImageType` must be a UTI
+            # conforming to `com.apple.icon-decoration.badge`, Apple ships no team
+            # glyph, and a custom-UTI badge does not render cleanly and degrades
+            # items to "!". Left out until a viable recipe exists.
+    entitlements:
+      path: WuselFileProvider/WuselFileProvider.entitlements
+      properties:
+        com.apple.security.app-sandbox: true
+        com.apple.security.application-groups:
+          - $(WUSEL_APP_GROUP)
+
+# Explicit, shared schemes so `mise run project` always produces the same set —
+# without this Xcode auto-creates per-user schemes that a regeneration wipes,
+# leaving only one selectable. WuselAgent is the one to run (it registers the
+# domain); the extension is built as its embedded dependency.
+schemes:
+  WuselAgent:
+    build:
+      targets:
+        WuselAgent: all
+    run:
+      config: Debug
+  WuselFileProvider:
+    build:
+      targets:
+        WuselFileProvider: all
+    run:
+      config: Debug

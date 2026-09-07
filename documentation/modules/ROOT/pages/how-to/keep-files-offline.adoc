@@ -14,7 +14,7 @@ exempt from eviction, and still readable when the server cannot be reached.
 ----
 wusel pin Documents        # a directory, recursively
 wusel pin Notes.txt        # a single file
-wusel pin                  # no path: the whole account
+wusel pin --all            # the whole account — everything it holds, downloaded
 wusel pins                 # list what is pinned
 wusel unpin Documents      # release it — the files become evictable cache again
 ----
@@ -28,6 +28,15 @@ None of these need a running mount — they write straight into the cache. Add
 A directory pin covers its whole subtree, including entries that have never been
 listed. A pin also overrides the cache size budget, so a file larger than the
 budget is still kept.
+
+`--all` is spelled out on purpose: pinning the whole account downloads
+everything in it, and it used to be what `wusel pin` did when the path was left
+out. A path that resolves to the mount root is refused for the same reason.
+
+Files a directory pin covers but has not fetched yet — the ones the server grew
+after the pin was made — are shown as promised, not as present: a cloud with a
+green arrow, and `wusel ipc stat` reports `pinned-pending`. `wusel update` (or
+*Update Now* in Files) fetches them.
 
 == When the server copy changes
 

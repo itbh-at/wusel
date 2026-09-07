@@ -108,51 +108,6 @@ see xref:reference/file-states.adoc[File states]. Previews are not covered
 by it. Turning thumbnails off in the file manager works, but it is a global
 setting; there is no per-folder scope for it.
 
-[#emblem-survives-the-copy]
-== A copy made outside the mount keeps its emblem
-
-Copy a file from `~/Wusel` to `~/Documents` in the file manager, and the copy
-still carries a Wusel emblem — and its context menu still offers *Make Available
-Offline* — on a plain ext4 file that has nothing to do with Nextcloud any more.
-
-*Why it happens.* Per-file state travels as the extended attribute
-xref:reference/file-states.adoc[`user.wusel.state`], a deliberate contract that any
-file manager's plugin can read with one local, network-free call. The copy is
-faithful to it: GIO declares the *entire* extended-attribute namespace as "copy
-the value when the file is copied", and `cp -a`, `rsync -X` and `tar --xattrs`
-do the same on request. So the attribute arrives at the destination, where it is
-dead — nothing updates it, and no daemon owns that path.
-
-*Why no attribute can fix this.* There is no channel on Linux that can express
-"do not copy me". The one namespace flagged copy-on-move-only is `xattr-sys`,
-which is not ours to write, and freedesktop's own emblem channel
-`metadata::emblems` carries the same copy-with-the-file flag. This is also why
-nobody solves it that way: every comparable client — Nextcloud's own desktop
-client, Dropbox, Seafile, MEGA, pCloud — pushes per-file state to its
-file-manager extension over a socket and *registers its sync roots with the
-extension first*, so the extension only judges paths beneath a root it knows.
-Where extended attributes genuinely do drive emblems (tags, ratings, download
-origin) they describe a property *of the file*, and travelling with a copy is
-the point. `user.wusel.state` describes where the file *is*, not what it is.
-
-*Where the fix belongs.* On the reading side. Every reader of the attribute — the
-Nautilus extension today, the planned Dolphin/Nemo/Thunar plugins tomorrow — has
-to establish that the path is on a Wusel mount before it trusts what it finds
-there, instead of taking the attribute's presence as proof. Dropping the
-attribute from the mount's `listxattr` would stop the copy at the source, but it
-would also break `getfattr -d` as the diagnostic affordance it is built to be,
-and it is a trick nobody else plays: once no reader trusts the value off the
-mount, the leftover is inert.
-
-A stale emblem is cosmetic — the menu actions address a path the daemon does not
-manage and simply fail. Leftovers can be found and removed by hand:
-
-[source,sh]
-----
-getfattr -R -n user.wusel.state ~ 2>/dev/null   # find copies carrying it
-setfattr -x user.wusel.state <file>             # drop it from one file
-----
-
 [#df-without-a-quota]
 == `df` reports a stand-in size when the account has no quota
 
@@ -199,3 +154,36 @@ $ journalctl --user -u wusel@default | grep quota
 The official Nextcloud desktop client hits the same wall and sidesteps it: for
 an unlimited account it shows "X in use" with no total and no bar. A filesystem
 has no such option — `df` has fields that must be filled.
+
+[#e2ee-folders]
+== An end-to-end encrypted folder is unreadable
+
+A folder marked *end-to-end encrypted* in Nextcloud's desktop or mobile client
+appears in the mount with meaningless names and unreadable content: random
+identifiers instead of file names, ciphertext instead of documents. Nothing is
+broken and nothing is lost — the folder is simply not ours to read.
+
+*Why it happens.* End-to-end encryption happens entirely in the client. Every
+file gets a symmetric key, the file names and the folder's structure live in an
+encrypted metadata blob, and those keys are wrapped with a keypair whose private
+half never leaves the user's own devices, protected by the twelve-word mnemonic
+their client showed them once. The server therefore stores precisely what WebDAV
+hands us: random identifiers and ciphertext. That is the feature working as
+designed — the operator cannot read the folder either.
+
+*What Wusel does today.* Neither decrypt such a folder nor mark it. The mount
+shows what the server returns, which is why the result reads as corruption
+rather than as a locked door.
+
+*Which half is small and which is not.* Recognising an encrypted folder is
+cheap: the server flags it in PROPFIND (`nc:is-encrypted`, the same property the
+official client reads), and our directory listing already asks for
+`nc:`-namespaced properties — so it is one property, one state, and a folder the
+file manager can show as locked with a notice that says why. Decrypting is a
+project of its own: two metadata formats, the keypair, the mnemonic-protected
+private key and a keystore to hold it — security code, where approximately right
+is worse than absent.
+
+*Meanwhile.* Use a client that implements it for those folders and keep them out
+of the paths you rely on in the mount. Everything outside an encrypted folder is
+unaffected.

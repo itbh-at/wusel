@@ -81,7 +81,18 @@ fn a_notice_reaches_the_hook_with_localized_text_and_raw_json() {
     });
 
     let contents = wait_for_marker(&marker);
-    assert!(contents.contains("TITLE=Upload failed"), "{contents}");
+    // A non-empty title, not a specific wording: this notice is localized from
+    // the caller's environment, so asserting the English sentence would only
+    // pass on an English-speaking machine. Which language it picks is
+    // `desktop::localizes_to_german_and_falls_back_to_english`'s subject; what
+    // belongs here is that the hook received all three variables, filled.
+    let title = contents
+        .lines()
+        .find_map(|l| l.strip_prefix("TITLE="))
+        .unwrap_or_else(|| panic!("no TITLE line reached the hook: {contents}"));
+    assert!(!title.is_empty(), "the hook got an empty title: {contents}");
+    // The path and the reason are interpolated verbatim in every language, so
+    // these two hold whatever the locale is.
     assert!(contents.contains("big.iso"), "{contents}");
     assert!(contents.contains("quota exceeded"), "{contents}");
     // The JSON line carries the stable, unlocalized `kind` — what a script

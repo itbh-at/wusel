@@ -27,15 +27,17 @@ items, Windows Cloud Filter placeholders + hydration callbacks):
 | State (`provider::FileState`) | Meaning
 | `online-only` | No local copy; metadata only (from PROPFIND). The default.
 | `cached`      | A whole, ETag-fresh copy sits in the blob cache — evictable.
-| `pinned`      | Kept offline on purpose (the file, an ancestor directory, or the root is pinned); exempt from eviction. The pin list lives in `<config>/pins.json`, not in the cache database — it is intent, and survives `cache clear`.
+| `pinned`      | Kept offline on purpose (the file, an ancestor directory, or the root is pinned), *and* the copy is here; exempt from eviction. The pin list lives in `<config>/pins.json`, not in the cache database — it is intent, and survives `cache clear`.
+| `pinned-pending`| Pinned, with nothing here yet. A directory pin covers files the server grows afterwards, so the promise routinely runs ahead of the bytes; reporting those as `pinned` claims an offline copy the user does not have.
 | `pinned-stale`| Pinned, but the copy we keep no longer matches the server's. Still served when the server is unreachable — an outdated copy beats an error.
 | `modified`    | A local edit not yet uploaded (an open write buffer, or a deferred create).
 |===
 
 This is the *only* per-file state model, and it is **derived, not stored**:
 `Provider::file_state` answers from the write buffers, the `pins` table and the
-blob cache's ETag sidecars — SQLite holds no state column. The same four values
-are what the OS integrations see, as the `user.wusel.state` xattr
+blob cache's ETag sidecars — SQLite holds no state column. The same values
+are what the OS integrations see, asked of the engine over the
+xref:explanation/status-protocol.adoc[status socket]
 (xref:reference/file-states.adoc[File states] documents the contract).
 
 Flow: we answer `getattr`/`readdir` from the SQLite state (without content).
@@ -142,3 +144,9 @@ avoids exactly that:
 
 The bottleneck isn't the bytes of a single GET (which saturates the link); it is
 round-trip latency on metadata. The cache-first VFS removes it.
+
+Nextcloud's own client is approaching the same problem from the other end — an
+external FUSE process that dehydrates an already-mirrored folder. That
+comparison has its own page:
+xref:explanation/compared-to-the-official-client.adoc[Compared to the official
+Nextcloud client].

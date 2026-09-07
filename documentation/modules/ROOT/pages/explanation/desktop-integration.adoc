@@ -26,9 +26,9 @@ Sidebar entry + sync status:: `libcloudproviders` (D-Bus). Built into the
 daemon — no extra component to compile. Needs the session bus and a one-time
 *system* registration per machine (xref:reference/cli.adoc[`wusel desktop install-provider`]). Consumed by GNOME Files; KDE/others do not consume it.
 Per-file emblems + context-menu actions:: a *native file-manager extension*
-(one per file manager, see below). It reads each file's state from the FUSE
-xattr `user.wusel.state` and draws emblems / offers "make offline / free
-space". No scripting runtime.
+(one per file manager, see below). It asks the daemon for each file's state
+over the xref:explanation/status-protocol.adoc[status socket] and draws emblems
+/ offers "make offline / free space". No scripting runtime.
 
 == User-facing notifications
 
@@ -71,6 +71,11 @@ eviction, or revalidation. The cases that clear the bar, most important first:
 * *Connection or auth is lost* (must act): the app password was revoked, a TLS
   error, the server is unreachable — the "Nextcloud folder" is then silently
   stale.
+* *The server answers but cannot serve* (wait): 5xx for longer than a blip —
+  maintenance, a backup window, a proxy with nothing behind it. Its own message
+  rather than "connection lost", because the difference is what the user does
+  next: check the network, or wait. It resolves through the same
+  `ConnectionRestored`.
 * *(minor)* the keyring is locked at service start, so the mount cannot begin.
 
 These are largely the structured events the engine **already emits as warnings**
@@ -80,7 +85,7 @@ notification per incident.
 
 *Good news, only as resolution.* Routine success is never announced, but the
 *recovery* of a problem the user was told about is — e.g. `ConnectionRestored`
-after a `ConnectionLost`. (A successful `login` is not notified: it happens in
+after a `ConnectionLost` or a `ServerUnavailable`. (A successful `login` is not notified: it happens in
 the terminal, where the user already sees the confirmation.) Every notice carries
 a `Severity` (`Success` / `Warning` / `Error`) so the backend renders good vs bad
 distinctly — on Linux, a freedesktop `urgency` hint (critical stays on screen)
@@ -107,8 +112,9 @@ frontend injects a backend once via `Provider::set_desktop(Arc<dyn Desktop>)`:
 
 * Linux daemon → a D-Bus backend: `org.freedesktop.Notifications` for notices,
   `libcloudproviders` for status. (Implemented behind the trait, not in `wusel-core`.)
-* macOS / Windows (later) → their native frameworks (File Provider status +
-  `UNUserNotificationCenter`; Cloud Filter `CfReportSyncStatus` + toasts).
+* macOS → a File Provider backend (status) plus `UNUserNotificationCenter` for
+  notices — implemented today, experimental.
+* Windows (later) → Cloud Filter `CfReportSyncStatus` and toast notifications.
 
 Because the whole surface is one injected trait, swapping the Linux module for a
 macOS/Windows one is a drop-in — the engine is untouched. And because the default
@@ -283,6 +289,18 @@ into the same re-read. The daemon reaches the session bus even when started over
 SSH (it falls back to `$XDG_RUNTIME_DIR/bus`).
 
 [NOTE]
+.Why `at.itbh.Wusel`, not `at.itbh.wusel`
+====
+The names this integration exposes — the `at.itbh.Wusel.desktop` launcher, the
+private `at.itbh.Wusel` D-Bus interface, the `at.itbh.Wusel-symbolic` icon — are
+one reverse-DNS *application ID*. The freedesktop convention capitalises its final
+component, the application name, exactly as GNOME's own apps do
+(`org.gnome.Nautilus`, `org.gnome.TextEditor`). So the lower-case vendor part
+(`at.itbh`) and the upper-case app part (`Wusel`) are both deliberate; this is the
+normal spelling, not a stray capital, and every file that names the ID keeps it.
+====
+
+[NOTE]
 .Known limitation — live refresh is best-effort
 ====
 The push refreshes reliably *once the signal fires*, i.e. when hydration
@@ -327,15 +345,21 @@ later addition.
 
 == Other file managers (planned)
 
-All read the same xref:reference/file-states.adoc[`user.wusel.state`] xattr; only the presentation
-plugin differs — there is no single mechanism across desktops. Each of them owes
-the same scope check: decide that the path is on a Wusel mount *before* reading
-the attribute's meaning off it, because a copy carries the value out of the
-mount (xref:reference/limitations.adoc#emblem-survives-the-copy[Known limitations]).
+All ask the same xref:explanation/status-protocol.adoc[status socket] for
+xref:reference/file-states.adoc[the same states]; only the presentation plugin
+differs — there is no single mechanism across desktops. The scope check comes
+free: the socket answers for paths under a mount it serves, so a plugin cannot
+decorate a file that merely looks like ours.
 
 * *KDE Dolphin*: a C++ `KOverlayIconPlugin` (emblems) built against KIO/KF6, plus
   *declarative* KDE ServiceMenus (`.desktop` files, no code) for the actions.
   Dolphin does not consume `libcloudproviders`, so account-level sync status is
   not surfaced in the file manager there — per-file emblems and freedesktop
   notifications carry it instead.
-* *Nemo / Thunar*: their own extension interfaces, reading the same xattr.
+* *Nemo / Thunar*: their own extension interfaces, speaking the same socket.
+
+How the official Nextcloud client delivers the same two channels — notifications
+off a tray object, emblems from a Python extension talking to the GUI process —
+is set out in
+xref:explanation/compared-to-the-official-client.adoc[Compared to the official
+Nextcloud client].

@@ -112,8 +112,9 @@ Service output goes to the journal, not to a log file:
   collided; your version is in the copy, the server's is at the original name.
 |===
 
-Every file in the mount also carries the `user.wusel.state` extended attribute;
-see xref:reference/file-states.adoc[File states].
+Every file in the mount also has a sync state, which the daemon answers over
+its status socket rather than storing on the file; see
+xref:reference/file-states.adoc[File states].
 
 == Removing everything
 

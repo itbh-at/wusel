@@ -68,6 +68,25 @@ fresh app password is in place.
   make the arrival immediate rather than merely prompt.
 * ⬜ Proper gettext i18n (`.po`/`.mo`) for the file-manager labels — currently a
   small built-in de/en table.
+* ⬜ **Notification texts beyond two languages.** `Notice::localize` has one arm
+  per language and knows German plus the English fallback. That is enough to
+  prove the seam and thin for the audience it exists for — notifications are the
+  one place we speak the user's language precisely because non-technical users
+  read them. The official client runs everything through Qt's `tr()` and a
+  translation platform and ships dozens. The structure is already right (a
+  `Notice` is data until a backend renders it), so this is either more arms or,
+  once the count justifies the dependency, a real catalogue
+  (xref:explanation/compared-to-the-official-client.adoc[Compared to the official Nextcloud client]).
+
+* ⬜ **Server-side notifications as an opt-in channel.** A share invitation or a
+  Talk mention never reaches a Wusel user: we notify about what the engine did,
+  and the server's own Notifications app is not read. The signal already
+  arrives — `notify_push` sends `notify_notification` on the websocket we
+  already hold, and `push.rs` deliberately ignores it — so the missing piece is
+  fetching the payload from OCS and routing it through `Notice`. Opt-in, and
+  subject to the same bar as every other notice: it must be something the user
+  has to act on.
+
 * ✅ **Versioned documentation with a version selector.** The published site now
   builds every version: `main` as "latest" plus each release tag as its number,
   with the bottom-left menu to switch. The version is supplied by the *site*
@@ -202,14 +221,50 @@ exists to avoid.
 == Later
 
 * ⬜ *KDE — the same feature set*: the cloud folder via KIO, per-file overlays via
-  a C++ `KOverlayIconPlugin` reading the same `user.wusel.state` xattr, pin/unpin
+  a C++ `KOverlayIconPlugin` speaking the same status socket, pin/unpin
   via KDE ServiceMenus, a Baloo config exclude, and a KRunner/Milou search
-  provider (Nemo/Thunar read the same xattr where cheap).
-* ⬜ *A small configuration UI on top of the CLI*: an optional graphical helper to
-  log in, add accounts and change options without the terminal — deliberately
-  *not* a permanent system-tray applet. Status and notifications already live in
-  the desktop's own mechanisms (the file-manager sidebar and emblems, freedesktop
-  notifications), so there is nothing to re-model in a tray.
+  provider (Nemo/Thunar speak the same socket where cheap).
+* ⬜ [[configuration-ui]]*A configuration UI on top of the CLI*: an optional
+  graphical helper to log in, add accounts and change options without the
+  terminal — deliberately *not* a permanent system-tray applet. It is a normal
+  application, launched for a task and closed, never a resident window that
+  watches the sync: status and notifications already live in the desktop's own
+  mechanisms (the file-manager sidebar and emblems, freedesktop notifications), so
+  there is nothing to re-model in a tray, and the daemon stays fully autonomous
+  without it. This is the near-term, Linux increment of the
+  <<flutter-ui,Flutter management UI>> below — one codebase, minimal here — and
+  the same guardrails govern both.
++
+*Modular, not small — that is the lightweight claim.* The engine runs without
+any of this: the GUI ships as its own optional package the daemon never links and
+never requires, so whoever wants the light install takes the core and FUSE alone
+and nothing here follows onto a headless box. "Lightweight against the official
+client" therefore means *fewer parts you can leave out*, not a smaller binary — a
+Flutter engine plus GTK is not that, and the claim must never be made on size.
++
+Two integration constraints are decided now, because getting them wrong is
+user-visible:
++
+** *One application identity.* There is a single `at.itbh.Wusel.desktop` and one
+   grid icon. The GUI inherits the identity the search provider and
+   `libcloudproviders` already reference rather than adding a second "Wusel"
+   launcher; launching it opens the GUI, and opening the mount folder becomes a
+   `[Desktop Action]`. On Wayland the window `app_id` must equal that basename, or
+   the shell lists the running window as a separate entry however correct the
+   `.desktop` is.
+** *On Linux it talks to the daemon.* The daemon owns the live state (SQLite,
+   config, `pins.json`) and is its single writer, so the Linux GUI is an
+   xref:explanation/status-protocol.adoc[IPC] client to it, not a second process
+   linking the core behind its back. The in-process FFI path
+   (`flutter_rust_bridge`) is for platforms where the app itself is the
+   core-linker (mobile); see the Flutter item.
++
+Share options (create shares, public links with password/expiry via the OCS
+`files_sharing` API) wait for this GUI: a share dialog needs a window a context
+menu cannot host, and it is an engine capability first, a form second. The
+lighter file-manager actions do *not* wait on it — *Copy internal link*
+(`<server>/f/<file_id>`, from the `file_id` the socket already carries) and *Open
+in Nextcloud* are CLI verbs the Nautilus extension spawns, no GUI involved.
 * ⬜ *Smart open* (`wusel open <file>`, surfaced as a file-manager *context-menu*
   action — not a double-click override): route a file to the right handler.
   Double-click stays the desktop's own default (a file in `~/Wusel` behaves like
@@ -234,25 +289,73 @@ unclear). A chrome-less editor emulates a "local office" that can still co-edit
 with colleagues — enough for Office files, for now. For plain text, the opt-in
 xref:explanation/keeping-in-sync.adoc[3-way merge] already gives a familiar, git-style middle
 ground.
-* ⬜ *A second platform (far-future experiment)*. The order is deliberate: the
-  Linux frontend is finished first and completely — a half-built frontend proves
-  nothing about portability — and only then does a second one start. What has to
-  be true *now* so that second frontend costs a port rather than a rewrite is
-  recorded in xref:explanation/portability.adoc[Portability], together with the
-  reasoning that makes **Windows the structurally easier candidate**.
+* ◐ *A second frontend — macOS, experimental*. The plan was to finish the Linux
+  frontend first, then start a second one, with
+  xref:explanation/portability.adoc[Portability] reasoning **Windows the
+  structurally easier candidate**. Demand reordered it: the internal need and
+  user feedback for macOS outweighed both KDE and Windows, and the File Provider
+  port proved straightforward — the portability groundwork held, so it was a
+  port, not a rewrite. macOS is pulled *ahead of*, not instead of, the rest.
 +
+** ◐ *macOS* — a native File Provider extension (not FUSE). What works today:
+   files show up in Finder; the sync status (downloaded vs online-only) is drawn
+   by macOS's own File Provider indicators; an additional emblem marks items made
+   available offline; and offline pin/unpin runs from the Finder context menu. It
+   rides a signed app bundle with a sandboxed extension and a Swift bridge to the
+   engine over the xref:explanation/status-protocol.adoc[wusel-ipc socket].
+   **Experimental** — the frontend is young; the engine underneath is the same
+   one Linux uses.
 ** ⬜ *Windows*: the Cloud Filter API via `windows-rs` — native placeholders +
-   Explorer status, on the official API (no FUSE-style shim). Range-based
-   hydration, which is the shape our content path already has.
-** ⬜ *macOS*: a native File Provider extension — not FUSE. Additionally demands
-   a signed, notarized app bundle with a sandboxed extension and a bridge into
-   Swift, which is packaging work Windows does not ask for.
+   Explorer status on the official API (no FUSE-style shim), range-based
+   hydration as our content path already has. Still the structurally easiest
+   port; it comes later.
 
-* ⬜ *A Flutter management UI over the same core (far-future)*. This is the
-  xref:#_refinements_near_term[configuration UI] point extended past the Linux
+* ⬜ *Frictionless install and uninstall (store-shipped frontends)*: a design
+  rule for every packaged frontend — one step onto the machine, one step off it,
+  with no manual system-extension dance and no leftover-file hunt. On macOS this
+  is a deliberate contrast with the Nextcloud client, whose removal is a
+  four-stage manual chore: disable the Finder extension, force-quit the
+  background processes, trash the app, then hand-delete `Application Support`,
+  `Caches`, `Preferences`, `Logs` and `CloudStorage` — and that last step ships
+  with a data-loss warning.
++
+Wusel can do better, and say so honestly, because of two structural facts:
++
+** *VFS-first means nothing local is precious.* Everything Wusel writes on the
+   client is a **cache** of server state (the SQLite metadata and hydrated blobs
+   in the App Group container), so wiping it can never lose a file — the
+   incumbent's "delete `CloudStorage`, but not your real files" caveat simply
+   does not apply.
+** *We own the domain lifecycle.* `NSFileProviderManager.remove(domain)` turns
+   the extension off **and** tears down the mount in one call — the very step the
+   Nextcloud client leaves to the user. The primitive already exists; the
+   `reset-domain` recovery path uses it.
++
+So the deliverable is a first-class *uninstall* — a menu entry ("Remove Wusel…")
+and a `wusel uninstall` command — that in one action removes the File Provider
+domain (extension off, mount gone), unregisters the login item
+(`SMAppService.unregister`), stops `serve`, deletes the App Group container and
+logs, and offers to trash the app. Install is the mirror: open a signed,
+notarized `.app` and sign in — the app self-registers its domain and login item,
+no installer and no admin password.
++
+The claim this earns, and its honest limit, is worth stating plainly: advertise
+"easy on, easy off — and removing Wusel cannot touch your files," *not* "no
+system extension." Wusel runs a File Provider extension like any such client; the
+difference is that Wusel cleans up after itself where the Nextcloud client makes
+the user do it. The same rule governs the Windows and mobile builds, where the
+store sets the install bar and judges uninstall just as harshly.
+
+* ⬜ [[flutter-ui]]*A Flutter management UI over the same core (far-future)*. This
+  is the <<configuration-ui,configuration UI>> point extended past the Linux
   desktop, and it is where the "maybe a UI one day" question meets our house
   toolkit. `flutter_rust_bridge` lets a single Flutter codebase call `wusel-core`
-  the way the CLI does — no re-implementation.
+  the way the CLI does — no re-implementation. One toolkit reaches Linux, macOS
+  and Windows, and — only once a native VFS host exists for it — iOS and Android,
+  which is the "lightweight alternative to the official app" a mobile user might
+  want: a control surface over one shared core, not a second full sync client. The
+  modularity rule carries across every platform: the UI is an optional package the
+  VFS host never requires, so the light install is always the core alone.
 +
 The line that must not blur: Flutter is the *control surface*, never the
 filesystem. It carries login, accounts, options, status and pin/conflict

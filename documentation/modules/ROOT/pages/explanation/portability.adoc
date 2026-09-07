@@ -7,9 +7,9 @@
 :description: What a port to another platform actually is here, which knowledge is allowed to live in a frontend, and the two gates that keep the answer checkable.
 :page-aliases: frontends.adoc
 
-NOTE: This page records an **intention**, not shipped behaviour. Only the Linux
-FUSE frontend exists — but the groundwork it argues for is now built, and the
-sections below say which parts. It belongs next to xref:explanation/architecture.adoc[Architecture],
+NOTE: This page records an **intention**, not shipped behaviour. The Linux FUSE
+frontend is complete and the macOS File Provider one is experimental — and the
+groundwork this page argues for is now built, which the sections below bear out. It belongs next to xref:explanation/architecture.adoc[Architecture],
 which names the three frontends, and xref:explanation/concurrency.adoc[Concurrency],
 which designs the state machine they would share.
 
@@ -49,8 +49,8 @@ Two consequences follow, and they are the whole reason this page is not just a
 list of API names:
 
 **About a third of our callbacks do not port — they disappear.** `getattr`,
-`open`, `getxattr`, `listxattr`, `statfs`, `opendir`, `releasedir` have no
-counterpart where the OS answers them itself.
+`open`, `statfs`, `opendir`, `releasedir` have no counterpart where the OS
+answers them itself.
 
 **The write direction inverts.** Today the frontend calls `flush` and we upload.
 There, the platform tells us afterwards that a file changed. The *upload script*
@@ -145,7 +145,7 @@ what one kernel interface happens to call it.
 |Move |`rename` |`NOTIFY_RENAME` |`modifyItem` (parent/name)
 |Refresh |syncer invalidation |same |same
 |Abandon |`flush` with reads outstanding |`CANCEL_FETCH_DATA` |progress cancellation
-|Attributes |`getattr`, `getxattr`, … |— the OS answers |partly `item(for:)`
+|Attributes |`getattr`, … |— the OS answers |partly `item(for:)`
 |===
 
 Two things this table settles. **Cancellation is easier everywhere else** — both
@@ -201,112 +201,135 @@ for authorization once and posts directly — and the notices come from the
 **daemon**, never from the File Provider extension, which macOS suspends and
 kills at will and which therefore must own no state.
 
-=== The Rust sketch
+=== How it is wired: the notice travels the socket
 
-A new `#[cfg(target_os = "macos")]` arm of `wusel_desktop::backend`, the twin of
-the Linux one behind the same trait: fail-soft, off the caller's thread, and
-touching nothing in the engine. In keeping with this project's
-minimal-dependency habit, the native call is a small Objective-C shim compiled
-by a build script and reached over a C ABI, rather than a framework-binding
-crate (the `objc2` route is the alternative).
+On Linux the backend is a Rust `Desktop` impl that links the engine directly. On
+macOS it cannot: the agent is a Swift app that drives the engine over the
+`wusel serve` Unix socket and never links it (see _The socket frontend_ above).
+So the notice takes the same road as a change signal — a **second push channel
+on the socket**, alongside `watch`:
 
-[source,rust]
-----
-// crates/wusel-desktop/src/lib.rs — one more arm, mirroring the Linux one.
-#[cfg(target_os = "macos")]
-pub fn backend(account: &str, _mount_path: &Path) -> Arc<dyn Desktop> {
-    macos::backend(account)
-}
+....
+engine  --notify(&Notice)-->  IpcDesktop  --localize once-->  Notices fan-out
+                                                                    |
+                          socket `notices` stream  <----- stream_notices
+                                                                    |
+   NoticeWatcher (agent)  --UNUserNotificationCenter-->  a banner in the user's language
+....
 
-#[cfg(target_os = "macos")]
-mod macos {
-    use std::os::raw::c_char;
-    use std::sync::{mpsc, Arc};
-    use wusel_core::desktop::{Desktop, Notice, Status};
+The pieces, and why each sits where it does:
 
-    // The only genuinely new native code — a ~30-line ObjC shim (below),
-    // compiled by build.rs (`cc`, `-framework UserNotifications`). No new crate.
-    extern "C" {
-        fn wusel_request_notification_authorization();
-        fn wusel_post_notification(title: *const c_char, body: *const c_char);
-    }
+* **`wusel_ipc::IpcDesktop`** is the `Desktop` the engine is handed in
+  `cmd_serve` (via `Provider::set_desktop`). Its `notify` calls
+  `Notice::localize` **once** — still the single place we speak the user's
+  language — and pushes the rendered `{severity, title, body}` to a fan-out. This
+  is deliberately *platform-independent* Rust: it compiles on Linux too, adds no
+  `cfg(target_os)` to `wusel-core`, and keeps the whole notice path testable
+  natively (`crates/wusel-ipc/tests/serve_notices.rs`). Localization stays in
+  Rust because the string table must not be duplicated in Swift.
+* The **locale** comes from the engine's environment (`desktop::ui_locale()`).
+  A launchd-spawned agent usually has no `LANG`, so the agent hands the logged-in
+  user's UI language down when it spawns `serve` (`ServeSupervisor` sets `LANG`
+  from `Locale.preferredLanguages`). Without it, notices default to English —
+  safe, not wrong.
+* The **`notices` op** is the twin of `watch`: the connection goes one-way and
+  carries pushed `notice` frames until the client hangs up. Two channels, not
+  one, so the extension can subscribe to just the changes and the agent to just
+  the notices.
+* **`NoticeWatcher`** (in the agent, never the extension — only an app may post,
+  and the extension is ephemeral) reads the stream and posts each notice through
+  `UNUserNotificationCenter`, mapping `severity` to the banner's interruption
+  level and sound. It reconnects with a short backoff if `serve` restarts, the
+  mirror of `ChangeWatcher`.
 
-    pub(super) fn backend(_account: &str) -> Arc<dyn Desktop> {
-        let (tx, rx) = mpsc::channel::<Notice>();
-        let locale = std::env::var("LANG").unwrap_or_default(); // read once
-        // One worker: the engine calls `notify` on its hot path, so the trait
-        // only enqueues — exactly as the Linux backend hands work to a zbus
-        // worker. It also confines the app-runloop calls to a single thread.
-        std::thread::Builder::new()
-            .name("wusel-usernotifications".into())
-            .spawn(move || {
-                unsafe { wusel_request_notification_authorization() }; // once, first run
-                for notice in rx {                                     // ends when the sender drops
-                    let m = notice.localize(&locale); // the one place we speak the user's language
-                    if let (Ok(t), Ok(b)) = (cstr(&m.title), cstr(&m.body)) {
-                        unsafe { wusel_post_notification(t.as_ptr(), b.as_ptr()) };
-                    }
-                }
-            })
-            .ok();
-        Arc::new(MacDesktop { tx })
-    }
+**The self-test rides the same path too.** `wusel desktop notify [severity]`
+verifies the channel without waiting for a real sync event — the Linux command,
+unchanged. On Linux the CLI posts straight to the bus; on macOS the CLI cannot
+post (only the agent app may), so it connects to the running agent's socket
+(auto-discovered, mirroring `SharedPaths.socketPath`), sends a `test-notice`, and
+the server injects the sample through `IpcDesktop` exactly as a real notice — the
+agent then shows the banner. The reply reports how many listeners received it, so
+"sent but no banner" (agent down, or notifications denied) is diagnosed rather
+than silent.
 
-    struct MacDesktop {
-        tx: mpsc::Sender<Notice>,
-    }
-
-    impl Desktop for MacDesktop {
-        fn notify(&self, notice: &Notice) {
-            let _ = self.tx.send(notice.clone()); // fail-soft: notifier gone ⇒ drop it
-        }
-        // Aggregate status is shown natively by the File Provider domain, and
-        // per-file state is a File Provider item property the extension reports,
-        // so neither travels this backend on macOS.
-        fn set_status(&self, _status: Status) {}
-        fn file_changed(&self, _abs_path: &str) {}
-        // `is_metered` would read NWPathMonitor later; None ("not cheap") until then.
-    }
-
-    fn cstr(s: &str) -> Result<std::ffi::CString, std::ffi::NulError> {
-        std::ffi::CString::new(s)
-    }
-}
-----
-
-[source,objc]
-----
-// crates/wusel-desktop/macos/wusel_notify.m — compiled by build.rs on macOS.
-#import <UserNotifications/UserNotifications.h>
-
-void wusel_request_notification_authorization(void) {
-    [UNUserNotificationCenter.currentNotificationCenter
-        requestAuthorizationWithOptions:UNAuthorizationOptionAlert
-                      completionHandler:^(BOOL granted, NSError *err) {}];
-}
-
-void wusel_post_notification(const char *title, const char *body) {
-    UNMutableNotificationContent *c = [UNMutableNotificationContent new];
-    c.title = [NSString stringWithUTF8String:title];
-    c.body  = [NSString stringWithUTF8String:body];
-    UNNotificationRequest *r =
-        [UNNotificationRequest requestWithIdentifier:NSUUID.UUID.UUIDString
-                                             content:c trigger:nil];
-    [UNUserNotificationCenter.currentNotificationCenter
-        addNotificationRequest:r withCompletionHandler:nil];
-}
-----
+**Connection health rides the same path.** `ConnectionLost`/`ConnectionRestored`
+are the notices a user testing the app is most likely to see, and they only fire
+if something watches reachability. `cmd_serve` wires a
+`wusel_core::health::Reachability` tracker — fed by every DAV request and by the
+notify_push retry loop — to the same `IpcDesktop`, exactly as `cmd_mount` does on
+Linux. So an otherwise idle daemon still learns the connection went away, and
+came back, and says so.
 
 Two properties carry over from the Linux backend, and they are the ones that
-matter: it **never blocks or fails the caller** (`notify` only enqueues), and it
-adds **no `cfg(target_os)` to `wusel-core`** — the gate the second checkpoint
-below watches. Everything macOS-specific stays in this crate, behind the cfg.
+matter: it **never blocks or fails the caller** (`notify` only enqueues onto an
+unbounded fan-out), and it adds **no `cfg(target_os)` to `wusel-core`** — the
+gate the second checkpoint below watches. Everything macOS-specific — the banner
+call, the authorization prompt, the locale hand-down — stays in the Swift agent;
+the Rust half is platform-independent.
 
-This is a sketch, deliberately: like the completion and error-mapping traits, the
-exact shape is only worth fixing once the macOS frontend is a real second caller
-(see _What we do now, and what we deliberately defer_). What is settled now is
-*where* it goes — behind the existing `Desktop` trait, in a macOS arm of
-`wusel-desktop` — and that the daemon must be an agent app for it to work at all.
+== Offline availability (pinning), and its two emblems
+
+"Make available offline" is the same engine **pin** the Linux frontend and
+`wusel pin` use — a path recorded in `pins.json`, its content hydrated and kept.
+The macOS frontend exposes it as a Finder right-click action and reflects its
+state with an emblem. The whole feature is the pin store surfaced over the
+socket; the engine core is untouched.
+
+The mechanism, end to end:
+
+* **The action.** The extension declares two `NSExtensionFileProviderActions`
+  ("Make Available Offline" / "Remove Offline Availability", localized via
+  `Localizable.strings`) and implements `NSFileProviderCustomAction`;
+  `performAction` sends the socket `pin`/`unpin` op per item. A File Provider
+  activation predicate cannot read our pinned state, so both actions always show
+  — pin/unpin are idempotent, so that is harmless. A truly state-dependent menu
+  would need a separate FinderSync extension.
+* **The state on the wire.** `stat`/`enumerate` carry a `pinned` flag
+  (`Pins::is_pinned`) and a `stale` flag (`content.is_stale` — the cached copy's
+  etag no longer matches the server's, i.e. `PinnedStale`). The item folds both
+  into its `metadataVersion`, so a pin, unpin, or a file going stale is a real
+  metadata change the system re-renders — without it, an unpin (especially of a
+  folder) looked like a no-op.
+* **The emblems.** A pinned item returns an `NSFileProviderDecorations` badge:
+  the system checkmark when current, the system warning when stale ("Offline
+  Copy Outdated"). One badge, not both. The native download indicator only tells
+  downloaded from online-only, not *kept* from merely-downloaded, which is why a
+  custom decoration is needed at all. A pin whose bytes are not down yet —
+  `pinned-pending`, the ordinary state of a file a directory pin has just started
+  covering — gets *no* check: the promise is made and the copy is not here, which
+  is precisely what the system's own not-downloaded indicator already says. The
+  item still declares `downloadEagerlyAndKeepDownloaded`, so the check appears
+  when the copy lands, and the state is folded into the metadata version so that
+  moment re-renders. A Team/Group folder root carries its own badge beside the
+  offline one — the two say unrelated things, so they are not exclusive. Apple's
+  built-in decoration images have nothing that reads as "shared with a team", so
+  that badge names an SF Symbol instead; both are system images, neither ships an
+  asset.
+* **Immediate feedback.** A local pin/unpin emits no server change, so the
+  working-set change channel would never see the acted item. `performAction`
+  records the acted paths (and, for a folder, its descendants — a folder pin
+  covers its whole subtree) in a shared list the working-set enumerator drains
+  and reports, so every affected emblem updates at once.
+* **The covered-file notice.** Unpinning a file that a pinned folder still covers
+  does nothing — the folder pin wins. `Provider::unpin` detects this and emits a
+  localized `Notice::PinnedByFolder` ("kept offline by its folder"), so the
+  no-op is explained rather than silent. It rides the notice pipeline, so every
+  platform gets it.
+
+**One documented behavioural quirk, deliberately left as-is.** macOS drives its
+*own* replica from the item's content policy: a pinned item declares
+`downloadEagerlyAndKeepDownloaded`, which macOS honours by keeping the current
+version downloaded — so when the server moves on, the system tends to *re-fetch
+by itself*. That differs from the engine's Linux-side `refresh_pinned = ask`
+default (notify, let the user run "Update now"; never spend bandwidth unasked).
+On macOS the practical result is that a pinned file trends toward staying current
+on its own, and the "outdated" warning emblem may therefore be short-lived. This
+is an accepted divergence, not a bug: the offline promise (the file is there,
+kept, not evictable — verified via `fileproviderctl evaluate`: `isDownloaded=1`,
+effective content policy `downloadEagerlyAndKeepDownloaded`) holds either way.
+The `isKeepDownloaded=0` field and a transient cloud badge that clears on access
+are a known Finder display quirk decoupled from the real keep state — there is no
+settable item property for it, so it is left alone.
 
 == Who owns the local copy
 

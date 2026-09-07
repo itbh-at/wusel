@@ -3,7 +3,7 @@
 
 A native `libnautilus-extension` module (a `.so`, no scripting runtime) that
 integrates the virtual Nextcloud mount into GNOME Files (Nautilus). It reads each
-file's state from the FUSE xattr `user.wusel.state` and adds:
+file's state from the daemon's status socket and adds:
 
 - **Emblems** (`InfoProvider`), one per state (the OneDrive model), shipped as our
   own icons under `emblems/` since current Adwaita has no suitable stock ones:
@@ -44,8 +44,9 @@ nautilus -q         # restart Nautilus so it loads the extension
   daemon's kernel invalidation; if a given desktop does not pick that up live,
   the emblem updates on the next view reload. A daemon→extension push (for fully
   live updates everywhere) is a later refinement.
-- The xattr read is a local `getxattr(2)` — the engine guarantees it never
-  triggers a network round-trip, so browsing stays cheap.
+- The status read is a local socket round-trip, cached per path and invalidated
+  by the daemon's `FileChanged` signal — the engine guarantees it never triggers
+  a network round-trip, so browsing stays cheap.
 
 Full documentation: the **File-manager integration** page in the Antora docs
 (`documentation/`).

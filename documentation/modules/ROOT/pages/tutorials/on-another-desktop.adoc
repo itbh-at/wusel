@@ -155,13 +155,13 @@ from you. Ask for it directly:
 
 [source,sh]
 ----
-getfattr -n user.wusel.state ~/Wusel/Some.txt
+wusel ipc stat /Some.txt
 ----
 
-It answers `cached`. Before you read the file it would have said `online-only`.
-xref:reference/file-states.adoc[File states] lists all five values — this
-attribute is the same thing GNOME's emblems are drawn from, and it is what a
-Dolphin or Thunar plugin would read.
+The `state` field reads `cached`. Before you read the file it would have said
+`online-only`. xref:reference/file-states.adoc[File states] lists all five
+values — this is the same answer GNOME's emblems are drawn from, over the same
+socket a Dolphin or Thunar plugin would use.
 
 == Step 5 — Write something
 
@@ -251,8 +251,9 @@ that are GNOME-only today.
   Dolphin uses KIO instead and does not.
 * *The emblems* need a per-file-manager extension. Dolphin would take a C++
   `KOverlayIconPlugin`; Nemo and Thunar have their own interfaces. All three
-  would read the same `user.wusel.state` attribute you queried in step 4 — the
-  contract is already there, the plugins are not.
+  would read the same state you queried in step 4, over the
+  xref:explanation/status-protocol.adoc[wusel-ipc socket] — the contract is
+  already there, the plugins are not.
 * *The desktop search* is a GNOME Shell search provider. KDE's equivalent would
   be a KRunner plugin.
 

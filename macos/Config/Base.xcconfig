@@ -1,0 +1,28 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 IT Beratung Hermann GmbH
+//
+// Shared build settings for every target and configuration.
+//
+// Signing carries no developer identity in the repo. The Team ID lives only in
+// Config/Local.xcconfig, which is git-ignored. Signing style is Automatic (set
+// in project.yml). A File Provider extension will not load ad-hoc, so running it
+// in Finder needs a real team — but `mise run build` passes
+// CODE_SIGNING_ALLOWED=NO, so a checkout with no Local.xcconfig still compiles.
+
+// Empty by default; Config/Local.xcconfig overrides with a real Team ID (it is
+// included last, so its value wins). CODE_SIGN_IDENTITY is deliberately NOT
+// pinned: with several "Apple Development" certs across teams, pinning the
+// generic name lets the wrong (other-team) cert win and embeds no profile.
+// Leaving it to automatic signing picks the cert matching DEVELOPMENT_TEAM.
+DEVELOPMENT_TEAM =
+
+// Per-contributor Team ID. The `?` makes it optional, so a fresh checkout
+// without the file still compiles (unsigned, via CODE_SIGNING_ALLOWED=NO).
+#include? "Local.xcconfig"
+
+// The App Group the agent and extension share (socket + File Provider document
+// group). On macOS an App Group is <TeamID>.<name>, so it is composed from the
+// local Team ID here — keeping the team-specific value out of the repo while
+// giving both targets and the Info.plist one definition (referenced as
+// $(WUSEL_APP_GROUP)).
+WUSEL_APP_GROUP = $(DEVELOPMENT_TEAM).at.itbh.wusel

@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Name=Wusel (Nextcloud)
+Name=Wusel
 Comment=Nextcloud files via Wusel
 Icon=at.itbh.Wusel
 # Launching (grid icon or the search header) opens the DEFAULT mount point

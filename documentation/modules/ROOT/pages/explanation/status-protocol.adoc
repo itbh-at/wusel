@@ -10,9 +10,10 @@ Every desktop tells the user two things about a file in a virtual mount: its
 *sync state* (online-only, cached, uploading, …) and, for a Team/Group folder,
 that the folder *is* one. Wusel first surfaced both on Linux as extended
 attributes — `user.wusel.state` and `user.wusel.kind`, read straight off the
-FUSE mount with `getxattr`. This page records why that channel is being
-replaced by a query over the `wusel-ipc` socket, and what the shared protocol
-has to guarantee to be worth it.
+FUSE mount with `getxattr`. This page records why that channel was replaced by
+a query over the `wusel-ipc` socket, and what the shared protocol has to
+guarantee to be worth it. The attributes are gone; the socket is the only
+status channel.
 
 == Why not an attribute on the file
 
@@ -38,6 +39,36 @@ KDE's Dolphin and the Windows shell later — is a *thin projector*: it asks the
 socket for an object's status and maps the answer onto its own decoration
 vocabulary. None of them link the engine, embed sync logic, or invent their own
 status; none of them write anything onto the file.
+
+=== Why a socket, and not a named pipe
+
+The name is a trap: a *named pipe* means one thing on Windows and quite another
+on Unix. Windows' is connection-oriented, bidirectional and instanced per
+client — the functional equivalent of a Unix-domain socket. Unix's is a FIFO
+(`mkfifo`), and a FIFO cannot carry this protocol:
+
+* *No connections.* A FIFO is one shared byte stream with no `accept()`, so
+  there is no way to tell which client sent a frame and no way to answer that
+  client. `watch` and `notices` each hold a stream open per subscriber; on FIFOs
+  that means one FIFO per subscriber, plus a hand-rolled rendezvous to set it
+  up — reimplementing what `accept()` gives away.
+* *Atomicity stops at `PIPE_BUF`* — 4096 bytes on Linux, against frames of up to
+  `MAX_FRAME` (8 MiB), which a `fetch` response reaches. Two concurrent writers
+  interleave mid-frame and corrupt the stream. A `SOCK_STREAM` connection has
+  exactly one writer by construction.
+* *No peer credentials.* `SO_PEERCRED` does not exist on a FIFO, so the one
+  guarantee that holds wherever the socket is put — the peer is this user —
+  could not be made at all.
+* *No descriptor passing.* `SCM_RIGHTS` over AF_UNIX is what would let a
+  frontend later be handed an open file descriptor instead of copied bytes.
+
+So the portable statement is not "socket versus named pipe" but
+**connection-oriented local IPC**: spelled AF_UNIX here, and a named pipe on
+Windows, where the security descriptor set at `CreateNamedPipe` and
+`ImpersonateNamedPipeClient` are what stand in for the mode bits and
+`SO_PEERCRED`. The wire itself ports unchanged — it is length-prefixed frames
+over anything that reads and writes bytes, which is why `read_frame` and
+`write_frame` take `impl Read` / `impl Write` rather than a socket.
 
 This is the encapsulation the xattr channel quietly gave up. The interesting
 work — deciding whether a file is online-only, cached, uploading, a group-folder
@@ -116,14 +147,14 @@ the client's cost to bear, once, in shared plumbing.
 
 == State of play
 
-The `wusel-ipc` crate and its socket live on the macOS integration branch; the
-group-folder engine (`is_group_folder_root`) lives on `main`. Until those meet,
-`folder_kind` is always `plain` on the branch that has the socket — the field is
-on the wire regardless, because the *contract* is what must be stable, and a
-group-folder-aware daemon fills it without any client changing. That is the
-single seam where the two lines of work join.
+The two lines of work have met: the socket carries a real `folder_kind`, filled
+from the same `is_group_folder_root` read that answers the sync state. The
+contract was on the wire before the engine could fill it, and filling it changed
+one function in `wusel-ipc` and nothing in any client — which is the case for
+fixing a protocol before its implementations, made concrete.
 
-On Linux the xattr channel stays until a Nautilus plugin speaks the socket with
-a working cache; the two can run side by side during the switch. The
-xref:reference/file-states.adoc[File states] reference then describes *what a
-client renders*, not the interface it reads — the interface is this protocol.
+The Nautilus extension speaks the socket, with the cache the prototype
+measured, and the extended attributes have been removed — there is no second
+channel left to keep in step. The xref:reference/file-states.adoc[File states]
+reference accordingly describes *what a client renders*, not the interface it
+reads: the interface is this protocol.

@@ -1,0 +1,90 @@
+////
+  // SPDX-License-Identifier: Apache-2.0
+  // Copyright 2026 IT Beratung Hermann GmbH
+////
+
+= Wusel — macOS File Provider frontend
+
+The macOS frontend to the Wusel engine: a background **agent app** that runs the
+engine and a **File Provider extension** that maps Finder's callbacks onto the
+engine's socket protocol. It is a *frontend* only — it contains none of
+Nextcloud's semantics, which stay in the Rust engine
+(see `documentation/.../frontends.adoc`). This directory is self-contained so it
+can later move to its own repository.
+
+== Architecture
+
+[cols="1,3"]
+|===
+|`WuselAgent` |A background agent `.app` (`LSUIElement`, no Dock icon), started
+by launchd. It runs the engine, binds `wusel serve` on the shared-container
+socket, registers the File Provider domain, and posts Notification Center
+notices. Only an app may notify, which is why the daemon is an app.
+
+|`WuselFileProvider` |An `NSFileProviderReplicatedExtension`, embedded in the
+agent app. It owns no state (macOS suspends and kills it at will) and drives the
+engine over the socket for every callback.
+
+|`WuselKit` |The Unix-domain-socket client, the Swift twin of
+`crates/wusel-ipc` — same framing, same op and field names. Compiled into both
+targets.
+|===
+
+The callback→socket mapping mirrors the intent table in the frontends doc:
+`item`/`enumerator` → `stat`/`enumerate`, `fetchContents` → `fetch`,
+`createItem` → `create` (+`write`+`publish`), `modifyItem` → `move` and/or
+`write`+`publish`, `deleteItem` → `remove`.
+
+== Building
+
+The Xcode project is generated from `project.yml` by XcodeGen (pinned in
+`macos/mise.toml`); the `.xcodeproj` is git-ignored, so `project.yml` is what is
+reviewed, not a `project.pbxproj`.
+
+[source,console]
+----
+cd macos
+mise run project   # generate Wusel.xcodeproj from project.yml
+mise run build     # build both targets, unsigned
+----
+
+`mise run build` compiles ad-hoc with **no Apple Developer account**, so anyone
+can check the skeleton compiles.
+
+== Signing — your identity never enters the repo
+
+Signing and Finder registration are each contributor's own responsibility, and
+no developer identity is ever committed. To sign locally:
+
+[source,console]
+----
+cp Config/Local.xcconfig.example Config/Local.xcconfig
+# edit Config/Local.xcconfig: set DEVELOPMENT_TEAM to your Apple Team ID
+mise run project && mise run build
+----
+
+`Config/Local.xcconfig` is git-ignored. The base config (`Config/Base.xcconfig`)
+pulls it in with an optional `#include?`, so a fresh checkout without it still
+builds. A signed build is what can register a File Provider domain and appear in
+Finder for end-to-end testing.
+
+== Scope of this skeleton
+
+Wired and building:
+
+* the socket client (framing + all read/write ops), shared by both targets;
+* the replicated extension: `item`, `enumerator`, `fetchContents`, `createItem`,
+  `modifyItem`, `deleteItem` mapped to socket ops;
+* the agent app shell that registers the File Provider domain.
+
+Deliberately deferred to later slices:
+
+* the agent actually launching the engine + `wusel serve` on the shared socket,
+  and the Notification Center bridge (the `Desktop` trait's macOS arm);
+* incremental change enumeration — turning the socket's `watch` stream into
+  bumped sync anchors so Finder re-enumerates on server-side changes (the
+  enumerator is pull-only for now);
+* Nextcloud's stable `file_id` as the item identity (paths are the identity for
+  now, which a rename changes);
+* whole-file fetch beyond ~4 GiB (a single `fetch` frame's limit) — needs
+  chunking.

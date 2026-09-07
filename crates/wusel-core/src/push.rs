@@ -222,12 +222,13 @@ async fn discover(
                 return Some(info);
             }
             Err(e) if retriable_for_discovery(&e) => {
-                // A transport failure is also a reachability event; a bad status
-                // is the server answering, so it is not.
-                if e.is_transport() {
-                    if let Some(health) = health {
-                        health.failed(&e);
-                    }
+                // Every retriable failure is a reachability event, and which
+                // *kind* is `health`'s to decide — no answer at all, or a server
+                // answering that it cannot serve. Deciding it here (transport
+                // only) is what made a discovery loop hammering a `502` the
+                // quietest part of an outage.
+                if let Some(health) = health {
+                    health.failed(&e);
                 }
                 tracing::warn!(%e, "notify_push: capability lookup failed — retrying in {backoff}s");
                 tokio::time::sleep(Duration::from_secs(backoff)).await;
@@ -341,9 +342,28 @@ fn is_file_event(msg: &str) -> bool {
 /// can tell "the server refused us" from "the server is not there at all" —
 /// which is exactly what decides whether the user is told about it (see
 /// [`crate::health`]). Folding everything into a string would throw that away.
+///
+/// Two layers can answer, so both are unfolded:
+///
+/// * `Reqwest` — the upgrade request itself failed. Its own conversion already
+///   keeps a status where there is one, and reports none where nobody answered.
+/// * `Handshake(UnexpectedStatusCode)` — the request arrived and the answer was
+///   not `101`. That status is the whole point: a `502` from a proxy in front of
+///   a server under maintenance is a user-facing event, and it is *not* an
+///   unreachable server.
+///
+/// What is left — a protocol error mid-stream, a missing header — is one lost
+/// connection and nothing the user can act on. It stays opaque deliberately: the
+/// reconnect that follows is what judges the server, and it judges it on an
+/// answer rather than on a dropped socket.
 fn ws_err(e: reqwest_websocket::Error) -> Error {
+    use reqwest_websocket::{Error as Ws, HandshakeError};
     match e {
-        reqwest_websocket::Error::Reqwest(e) => Error::from(e),
+        Ws::Reqwest(e) => Error::from(e),
+        Ws::Handshake(HandshakeError::UnexpectedStatusCode(status)) => Error::HttpStatus {
+            status: status.as_u16(),
+            message: format!("websocket upgrade refused with {status}"),
+        },
         other => Error::Other(format!("websocket: {other}")),
     }
 }
@@ -364,6 +384,29 @@ mod tests {
             status,
             message: "test".into(),
         }
+    }
+
+    /// The upgrade's status is what tells "the server is down for maintenance"
+    /// from "nothing answered", and the health tracker draws a different
+    /// notification from each. Flattening it into a string — which is what
+    /// happened to every non-reqwest websocket error — made a `502` during a
+    /// backup window indistinguishable from noise, so nobody was ever told.
+    #[test]
+    fn a_refused_upgrade_keeps_its_status() {
+        let e = ws_err(reqwest_websocket::Error::Handshake(
+            reqwest_websocket::HandshakeError::UnexpectedStatusCode(
+                reqwest::StatusCode::BAD_GATEWAY,
+            ),
+        ));
+        assert!(
+            matches!(e, Error::HttpStatus { status: 502, .. }),
+            "a refused upgrade is the server answering, with its status: {e}"
+        );
+        assert!(!e.is_transport(), "the server answered, so it is reachable");
+        assert!(
+            e.is_server_fault(),
+            "…but it cannot serve, which is its own event"
+        );
     }
 
     #[test]

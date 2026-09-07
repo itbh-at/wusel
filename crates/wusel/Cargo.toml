@@ -34,6 +34,13 @@ fuse = ["dep:wusel-fuse"]
 wusel-core = { path = "../wusel-core" }
 wusel-fuse = { path = "../wusel-fuse", optional = true }
 wusel-desktop = { path = "../wusel-desktop" }
+# The socket frontend (macOS File Provider IPC spike). Not behind `fuse`:
+# running the engine without a FUSE mount is the whole point of `serve`.
+wusel-ipc = { path = "../wusel-ipc" }
+# getppid for the parent-death watchdog in `serve`: it must exit when the
+# spawning agent dies, or an abrupt kill (Xcode stop, logout) leaves an orphaned
+# engine still bound to notify_push and fighting the next serve for the socket.
+libc = "0.2"
 clap = { version = "4", features = ["derive"] }
 serde.workspace = true
 serde_json.workspace = true

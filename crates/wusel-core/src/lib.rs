@@ -44,6 +44,27 @@ pub mod webdav;
 
 pub use error::{Error, Result};
 
+/// The build stamp — the commit this binary was built from (`-dirty` if the
+/// tree had uncommitted changes) and when — set by `build.rs`. Distinct rebuilds
+/// of the same source are otherwise indistinguishable, which made a stale
+/// macOS-bundled engine impossible to spot.
+pub const BUILD_ID: &str = concat!(
+    env!("WUSEL_BUILD_COMMIT"),
+    " built ",
+    env!("WUSEL_BUILD_TIME")
+);
+
+/// The full version line for `--version` and startup logs: the package version
+/// plus the build stamp, e.g. `0.3.2 (a1b2c3d built 2026-09-07T12:53:00Z)`.
+pub const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("WUSEL_BUILD_COMMIT"),
+    " built ",
+    env!("WUSEL_BUILD_TIME"),
+    ")"
+);
+
 /// The tokio runtime handle [`provider::Provider::runtime`] hands out, re-exported
 /// so a frontend can name and store it (to run reads off its dispatch thread)
 /// without taking its own tokio dependency — the crate's dependency-minimalism

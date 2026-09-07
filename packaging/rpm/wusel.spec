@@ -106,6 +106,8 @@ install -m644 integration/nautilus/emblems/wusel-emblem-*.svg %{buildroot}%{_dat
 
 install -d %{buildroot}%{_datadir}/icons/hicolor/scalable/apps
 install -m644 integration/icons/at.itbh.Wusel.svg %{buildroot}%{_datadir}/icons/hicolor/scalable/apps/
+install -d %{buildroot}%{_datadir}/icons/hicolor/symbolic/apps
+install -m644 integration/icons/at.itbh.Wusel-symbolic.svg %{buildroot}%{_datadir}/icons/hicolor/symbolic/apps/
 
 install -d %{buildroot}%{_datadir}/applications
 install -d %{buildroot}%{_datadir}/dbus-1/services
@@ -151,8 +153,11 @@ fi
 # Native Nautilus extension + its emblem icons.
 %{_libdir}/nautilus/extensions-4/libwusel-nautilus.so
 %{_datadir}/icons/hicolor/scalable/emblems/wusel-emblem-*.svg
-# App icon — resolved by the .desktop file and the cloud-provider sidebar entry.
+# App icons. The full-colour logo is the app-grid/launcher icon (`.desktop`
+# Icon=); the symbolic (monochrome) one is the file-manager sidebar entry, which
+# GTK re-tints to the theme foreground so it stays legible in Dark Mode.
 %{_datadir}/icons/hicolor/scalable/apps/at.itbh.Wusel.svg
+%{_datadir}/icons/hicolor/symbolic/apps/at.itbh.Wusel-symbolic.svg
 # GNOME Shell search provider registration + its launcher app. gnome-shell
 # is only Suggested (see above), so this package must own the directory
 # itself rather than assume gnome-shell's own package created it — openSUSE's
@@ -171,6 +176,12 @@ fi
 # with no system-wide preset to apply; each user enables their own instance.
 
 %changelog
+* Mon Sep 07 2026 Christoph D. Hermann <christoph.hermann@itbh.at> - 0.4.0-1
+- Experimental macOS support (native File Provider frontend, built from source)
+- Per-file status served over the wusel-ipc socket instead of an extended attribute
+- Real storage quota via statfs; Team/Group folder roots marked; opt-in notify
+  hook; searchable documentation; a page comparing Wusel to the official client
+
 * Thu Aug 27 2026 Christoph D. Hermann <christoph.hermann@itbh.at> - 0.3.2-1
 - A permanently failed upload is now surfaced once instead of retried forever
   in silence, phantom "waiting" uploads left by a delete or rename are cleared,

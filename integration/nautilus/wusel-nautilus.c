@@ -6,11 +6,10 @@
 // wusel Nautilus extension — per-file emblems for the virtual Nextcloud mount.
 //
 // A native `libnautilus-extension` module (no scripting runtime): Nautilus loads
-// this `.so` and, for every file it draws, asks us to annotate it. We read the
-// engine's per-file state from the FUSE xattr `user.wusel.state` (see
-// wusel_core::provider::FileState) and add an emblem accordingly. The read is a
-// plain getxattr(2) against the mount — cheap and local; the engine guarantees
-// it never triggers a network round-trip.
+// this `.so` and, for every file it draws, asks us to annotate it. We ask the
+// daemon for that file's status over its socket (see wusel-status.h for why the
+// status is not stored on the file) and add an emblem accordingly. The answers
+// are cached, so a folder full of files is not a round-trip each.
 //
 // Every state gets a distinct, always-visible emblem (the OneDrive model:
 // cloud = online-only, check = available, filled check = kept offline, arrow =
@@ -24,14 +23,12 @@
 #include <glib-object.h>
 #include <string.h>
 #include <sys/types.h>
-#include <sys/xattr.h>
 
-#define STATE_XATTR "user.wusel.state"
+#include "wusel-status.h"
+
 // The object's kind, independent of its sync state. Present only on the root
 // of a Team/Group folder, so its mere presence is the answer; the value is
 // read anyway, so a later kind can be told apart without changing this side.
-#define KIND_XATTR "user.wusel.kind"
-#define KIND_GROUP_FOLDER "group-folder"
 
 // --- GObject type: one object implementing the provider interfaces ----------
 
@@ -69,6 +66,13 @@ static const char *emblem_for_state(const char *state)
     {
         return "wusel-emblem-pinned"; // kept offline on purpose, always available
     }
+    if (strcmp(state, "pinned-pending") == 0)
+    {
+        // Kept offline on purpose, but nothing is here yet — so it still costs
+        // the network to open. The cloud says that; the green badge says the
+        // promise stands.
+        return "wusel-emblem-pinned-pending";
+    }
     if (strcmp(state, "pinned-stale") == 0)
     {
         // Kept offline, but the copy is older than the server's. Still
@@ -92,6 +96,29 @@ static const char *emblem_for_state(const char *state)
         return "wusel-emblem-sync-error";
     }
     return NULL;
+}
+
+// The file's local path, or NULL when it has none of ours to give: everything
+// here works on absolute paths — the status socket is asked by path, the
+// refresh map is keyed by path, and `wusel pin` is handed one — while Nautilus
+// also draws trash:, recent: and network locations that have no local path at
+// all. One place to ask, so every caller skips those the same way.
+static char *local_path(NautilusFileInfo *file)
+{
+    char *scheme = nautilus_file_info_get_uri_scheme(file);
+    gboolean is_file = scheme && strcmp(scheme, "file") == 0;
+    g_free(scheme);
+    if (!is_file)
+    {
+        return NULL;
+    }
+    GFile *location = nautilus_file_info_get_location(file);
+    char *path = location ? g_file_get_path(location) : NULL;
+    if (location)
+    {
+        g_object_unref(location);
+    }
+    return path;
 }
 
 // --- Live emblem refresh -----------------------------------------------------
@@ -237,6 +264,10 @@ static gboolean flush_pending(gpointer user_data)
     while (g_hash_table_iter_next(&it, &key, NULL))
     {
         const char *path = key;
+        // The signal used to mean "re-read this file"; with the status cached
+        // it must first mean "that entry is stale", or the re-read would be
+        // served the very answer the daemon just told us to forget.
+        wusel_status_invalidate(path);
         GWeakRef *wr = tracked ? g_hash_table_lookup(tracked, path) : NULL;
         if (!wr)
         {
@@ -289,53 +320,35 @@ wusel_ext_update_file_info(NautilusInfoProvider *provider,
     (void)handle;
 
     // Only real local files live on the FUSE mount; skip trash:, recent:, etc.
-    char *scheme = nautilus_file_info_get_uri_scheme(file);
-    gboolean is_file = scheme && strcmp(scheme, "file") == 0;
-    g_free(scheme);
-    if (!is_file)
-    {
-        return NAUTILUS_OPERATION_COMPLETE;
-    }
-
-    GFile *location = nautilus_file_info_get_location(file);
-    char *path = location ? g_file_get_path(location) : NULL;
-    if (location)
-    {
-        g_object_unref(location);
-    }
+    char *path = local_path(file);
     if (!path)
     {
         return NAUTILUS_OPERATION_COMPLETE;
     }
 
-    char value[32];
-    ssize_t n = getxattr(path, STATE_XATTR, value, sizeof(value) - 1);
-    if (n > 0)
+    // Ask the engine over its socket, which answers both axes in one
+    // round-trip: the sync state and whether this is a Team/Group folder root.
+    // They are separate emblems on purpose — a group folder still has a sync
+    // state, and both belong on it.
+    WuselStatus status;
+    if (wusel_status_get(path, &status))
     {
-        value[n] = '\0';
         track_file(path, file); // remember it, so a FileChanged can refresh it
-        const char *emblem = emblem_for_state(value);
+        const char *emblem = emblem_for_state(status.state);
         if (emblem)
         {
             nautilus_file_info_add_emblem(file, emblem);
         }
-    }
-    // else: no xattr → not one of our files (or an unpinned directory).
-
-    // The kind is a separate attribute and a separate emblem: a Team/Group
-    // folder still has a sync state, and both belong on it. Absent on
-    // everything else, which is why nothing is drawn by default.
-    char kind[32];
-    ssize_t k = getxattr(path, KIND_XATTR, kind, sizeof(kind) - 1);
-    if (k > 0)
-    {
-        kind[k] = '\0';
-        if (strcmp(kind, KIND_GROUP_FOLDER) == 0)
+        if (strcmp(status.kind, "group_folder") == 0)
         {
-            track_file(path, file);
             nautilus_file_info_add_emblem(file, "wusel-emblem-group-folder");
         }
+        g_free(path);
+        return NAUTILUS_OPERATION_COMPLETE;
     }
+
+    // No answer: not a wusel path, or no daemon serving it. Draw nothing — the
+    // socket is the only status channel, so there is nothing else to ask.
     g_free(path);
     return NAUTILUS_OPERATION_COMPLETE;
 }
@@ -357,35 +370,20 @@ wusel_ext_info_provider_iface_init(NautilusInfoProviderInterface *iface)
 // phrase from another product and describes a side effect, while what the entry
 // actually does is withdraw the promise. The space follows.
 
-// Read one file's state xattr into `out` (NUL-terminated). FALSE if the file is
-// not a local file, or not on our mount (no xattr).
+// Read one file's sync state into `out` (NUL-terminated). FALSE if the file is
+// not a local file, not on one of our mounts, or has no state of its own — a
+// plain directory has none, and must not get the file actions.
 static gboolean file_state(NautilusFileInfo *file, char *out, size_t out_len)
 {
-    char *scheme = nautilus_file_info_get_uri_scheme(file);
-    gboolean is_file = scheme && strcmp(scheme, "file") == 0;
-    g_free(scheme);
-    if (!is_file)
-    {
-        return FALSE;
-    }
-    GFile *location = nautilus_file_info_get_location(file);
-    char *path = location ? g_file_get_path(location) : NULL;
-    if (location)
-    {
-        g_object_unref(location);
-    }
+    char *path = local_path(file);
     if (!path)
     {
         return FALSE;
     }
-    ssize_t n = getxattr(path, STATE_XATTR, out, out_len - 1);
+    WuselStatus status;
+    gboolean ok = wusel_status_get(path, &status) && status.state[0] != '\0';
     g_free(path);
-    if (n <= 0)
-    {
-        return FALSE;
-    }
-    out[n] = '\0';
-    return TRUE;
+    return ok && g_strlcpy(out, status.state, out_len) < out_len;
 }
 
 // Locate the wusel binary: PATH first, then the usual install locations. The
@@ -437,6 +435,18 @@ static void on_action_done(GPid pid, gint status, gpointer data)
             g_slist_remove(child_watches, GUINT_TO_POINTER(g_source_get_id(self)));
     }
     NautilusFileInfo *file = NAUTILUS_FILE_INFO(data);
+    // Drop the cached status *before* asking for the re-read: the re-read goes
+    // through the same cache, which still holds the answer from before the pin.
+    // Without this the emblem and the menu keep showing the old state until
+    // Nautilus is restarted — the cache has no expiry of its own, and the
+    // daemon's FileChanged cannot help here, since the pin happened in this
+    // other process, not in the daemon.
+    char *path = local_path(file);
+    if (path)
+    {
+        wusel_status_invalidate(path);
+        g_free(path);
+    }
     nautilus_file_info_invalidate_extension_info(file);
     g_spawn_close_pid(pid);
     // No unref here: the source's GDestroyNotify owns the reference, so it is
@@ -458,12 +468,7 @@ static void run_action(NautilusMenuItem *item, const char *verb)
     for (GList *l = files; l != NULL; l = l->next)
     {
         NautilusFileInfo *file = NAUTILUS_FILE_INFO(l->data);
-        GFile *location = nautilus_file_info_get_location(file);
-        char *path = location ? g_file_get_path(location) : NULL;
-        if (location)
-        {
-            g_object_unref(location);
-        }
+        char *path = local_path(file);
         if (!path)
         {
             continue;
@@ -552,7 +557,7 @@ wusel_ext_get_file_items(NautilusMenuProvider *provider, GList *files)
     // Offer "make offline" if anything selected can be pinned, and "free space"
     // if anything selected is pinned; ignore a selection that is not ours.
     gboolean any_ours = FALSE, any_pinnable = FALSE, any_unpinnable = FALSE;
-    gboolean any_stale = FALSE;
+    gboolean any_stale = FALSE, any_missing = FALSE;
     for (GList *l = files; l != NULL; l = l->next)
     {
         char state[32];
@@ -572,6 +577,14 @@ wusel_ext_get_file_items(NautilusMenuProvider *provider, GList *files)
             any_unpinnable = TRUE;
             any_stale = TRUE;
         }
+        else if (strcmp(state, "pinned-pending") == 0)
+        {
+            // Pinned with nothing here yet. Unpinning applies (the pin is
+            // real), and so does fetching — the same action that mends a stale
+            // copy mends a missing one.
+            any_unpinnable = TRUE;
+            any_missing = TRUE;
+        }
         else if (strcmp(state, "online-only") == 0 || strcmp(state, "cached") == 0)
         {
             any_pinnable = TRUE;
@@ -583,17 +596,19 @@ wusel_ext_get_file_items(NautilusMenuProvider *provider, GList *files)
     }
 
     GList *items = NULL;
-    if (any_stale)
+    if (any_stale || any_missing)
     {
         // First in the list: it is the only entry that answers a problem the
-        // emblem is already showing.
+        // emblem is already showing. One entry for both defects, because it is
+        // one action — `wusel update` fetches whatever the pin promised and did
+        // not deliver, whether the copy here is old or absent.
         items = g_list_append(
-            items, make_item("Wusel::update",
-                             tr("Wusel - Update Now", "Wusel - Jetzt aktualisieren"),
-                             tr("Fetch the current version; the offline copy is out of date",
-                                "Aktuelle Fassung holen; die Offline-Kopie ist veraltet"),
-                             "wusel-emblem-pinned-stale", G_CALLBACK(on_update_activate),
-                             files));
+            items,
+            make_item("Wusel::update", tr("Wusel - Update Now", "Wusel - Jetzt aktualisieren"),
+                      tr("Fetch the current version; the offline copy is missing or out of date",
+                         "Aktuelle Fassung holen; die Offline-Kopie fehlt oder ist veraltet"),
+                      any_stale ? "wusel-emblem-pinned-stale" : "wusel-emblem-pinned-pending",
+                      G_CALLBACK(on_update_activate), files));
     }
     if (any_pinnable)
     {
@@ -674,6 +689,9 @@ void nautilus_module_shutdown(void)
     }
     g_clear_pointer(&pending, g_hash_table_destroy);
     g_clear_pointer(&tracked, g_hash_table_destroy);
+    // The status connection and its cache: an unloaded module must not leave
+    // an open socket behind in the file manager's process.
+    wusel_status_shutdown();
     tracked_since_prune = 0;
     g_clear_object(&bus);
 }

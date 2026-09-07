@@ -1,0 +1,141 @@
+////
+  // SPDX-License-Identifier: Apache-2.0
+  // Copyright 2026 IT Beratung Hermann GmbH
+////
+
+= Compared to the official Nextcloud client
+:description: How Wusel differs from Nextcloud's own desktop client on Linux — a filesystem versus a sync client — the concrete consequences, and where the official client is ahead.
+
+Nextcloud ships its own desktop client, so the fair question is how Wusel
+differs. It is less a matter of features than of what each program *is*:
+
+*The official client is a sync application.* It keeps your folders in step with
+the server. A new beta adds on-demand files on Linux — but through a separate
+FUSE helper that the sync client starts and drives, an on-demand layer on a sync
+app.
+
+*Wusel is a filesystem.* Your Nextcloud simply _is_ a folder, and the system
+fetches each file as you open it. There is no sync client and no helper — the
+engine is the mount.
+
+That difference is not wording. It changes what you can actually do:
+
+* *It runs without a desktop.* Wusel is a filesystem served by a systemd user
+  service, so a server, a container, or an SSH session with nobody logged in
+  behaves like a desktop. The official on-demand files are part of the desktop
+  client and driven by it: `nextcloudcmd`, its headless sync tool, has no
+  virtual-files mode, and the emblems, menus and the downloads themselves need
+  that client running.
+* *"Available offline" stays true.* Wusel works out each file's state instead of
+  writing it onto the file, so a pin cannot quietly become a lie — the file you
+  kept for the train is really there.
+* *It installs small.* One binary and FUSE, against the client's Qt and QML
+  stack plus a Python file-manager extension.
+* *Fewer parts to break.* One process runs from a `read` to the network, rather
+  than a sync client driving a separate, experimental FUSE daemon over a socket
+  — a seam the proposal's own author still lists as unfinished: "missing is
+  proper communication between the openvfs fuse daemon and the desktop files
+  client".
+* *It stays out of your way.* No tray icon and no window of its own. Wusel runs
+  in the background and interrupts you only when it must — a conflicted copy, or
+  an upload that cannot complete — never with the "sync finished" noise a
+  tray application tends to produce. Per-file status lives on the files
+  themselves, as emblems, not in a panel you have to watch.
+
+None of that changes when the beta label comes off. It follows from how each
+program is built, not from how finished it is: waiting for the proposal gives you
+the sync client with an on-demand layer, not a filesystem.
+
+Every claim below points at something you can read in their source or in ours,
+and it describes the state in early September 2026.
+
+== On-demand files
+
+The released official client has no on-demand mode on Linux — it syncs each
+selected folder in full. On-demand files are a proposal:
+https://github.com/nextcloud/desktop/pull/10635[nextcloud/desktop#10635], open,
+and offered in the setup dialog as *Virtual files (beta)* — an early preview its
+authors recommend against for production and do not make the default.
+
+In that proposal the virtual filesystem is not part of the client. It is
+https://github.com/opencloud-eu/openvfs[openvfs] — a separate FUSE daemon from
+the OpenCloud project, derived from LoggedFS and called experimental in its own
+README. Like Wusel, it shows files as placeholders and fetches their content only
+when something opens them. Unlike Wusel, it is a second program: the sync client
+starts and mounts it, drives it over a local socket, and — because the client
+holds the credentials — every download is delegated back to the client, which
+its README says must be running for the mount to work. Each file's pin state is
+stored in an extended attribute on the file itself.
+
+Wusel has no second program between the kernel and the credentials. The engine
+*is* the filesystem: one process takes each `read` straight to a WebDAV request,
+and a file's state is worked out when asked, not written onto the file.
+
+That last point is not a detail. An extended attribute travels with the file when
+it is copied — with `cp -a`, `mv` across a disk, `rsync -X`, an archive, or a
+file manager that keeps metadata. Copy a file out of a mount and back into one
+and it arrives carrying a pin state from before, which the engine has no reason
+to distrust: it can be told the bytes are present, or absent, when the truth is
+the opposite. Wusel kept its state in an xattr in an early version and hit
+exactly this; the status socket is the answer to it. Asked per path, the engine
+reads its own records — there is nothing on the file to carry, and so nothing to
+be wrong.
+
+Both are on-demand over FUSE. What differs is what provides it: a sync client
+plus a separate, experimental helper, or a single engine that is the filesystem.
+
+== Desktop integration
+
+On a desktop, Wusel behaves like part of the system: a *Wusel (Nextcloud)* entry
+in the Files sidebar, an emblem on every file showing whether it is online-only,
+cached or pinned, a right-click *Make Available Offline*, your Nextcloud in the
+Activities search, and a notification when something needs you.
+
+Two things make this more than a feature list. The integration talks to a systemd
+service that needs no login session, so a server or a headless box behaves
+exactly like a desktop. And the emblems answer the on-demand question — are the
+bytes here yet? — which is the one thing you need to know before the network goes
+away.
+
+Several accounts fit this model naturally, because each is its own filesystem.
+Every account gets its own mount (`~/Wusel`, `~/Wusel-work`, …), its own sidebar
+entry and its own systemd service, running independently of the others —
+including with nobody logged in. Two Nextclouds are two ordinary folders side by
+side. The official client also handles several accounts, but as folders inside
+the one running application, not as separate mounts you can start, stop and serve
+on their own.
+
+The official client's file-manager extension is older and reaches more managers
+today: Nautilus, Nemo, Caja and Dolphin, against our Nautilus, with the rest
+xref:project/roadmap.adoc[on the roadmap]. But it talks to the running client
+over a socket — close the client and the emblems and menus go with it. And the
+new on-demand proposal adds none of this, only a choice of sync type in the setup
+dialog.
+
+== Footprint
+
+The official client is a Qt application: it links the Qt libraries — base,
+widgets, QML, Quick — and a KDE framework or two, and its file-manager extension
+is written in Python, so the distribution pulls a Python binding in with it.
+
+Wusel is a single binary. It links four system libraries; TLS, SQLite and D-Bus
+are built in, and the only thing it asks the distribution for is FUSE. Nothing
+needs an interpreter or a widget toolkit — which is what lets it run on a server
+or in a container. (This is about what gets installed, not memory use, which is
+not measured here.)
+
+== Where the official client is ahead
+
+Today it leads in a few places — but only one of them is lasting.
+
+The rest is a matter of time, already on the xref:project/roadmap.adoc[roadmap].
+It reaches more file managers today, where Wusel has Nautilus, and Nemo, Caja and
+KDE's Dolphin are planned. Its interface is translated into dozens of languages,
+where Wusel's notifications speak two. And it relays the server's own
+notifications — a share invitation, a Talk mention — which Wusel will offer as an
+opt-in channel.
+
+The gap that is not merely time is *end-to-end encryption*. The official client
+supports it; Wusel does not, and has not yet taken a position on it. For now an
+E2EE folder is xref:reference/limitations.adoc#e2ee-folders[unreadable in the
+mount].

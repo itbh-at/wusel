@@ -70,7 +70,7 @@ machine at all, which is not an omission: they have no work to do.
 
 |`getattr` |`Stat` |<<metadata>>
 |`lookup` |`Lookup` |<<directories>>
-|`getxattr`, `listxattr` |`State` |<<metadata>>
+|status socket `stat` |`State` |<<metadata>>
 |`readdir` |`Enumerate` |<<directories>>
 |`read` |`Fetch` |<<reading>>
 |`write` |`Write` |<<writing>>
@@ -88,12 +88,12 @@ interval schedules its own refresh — and the `412` sub-script (<<conflict>>) i
 reached only from inside a publish.
 
 [#metadata]
-== Metadata: getattr, open, getxattr, listxattr
+== Metadata: getattr, open, and the status query
 
 // Rendered from documentation/diagrams/fsm-op-metadata.d2.
 image::fsm-op-metadata.svg[Metadata scripts,900]
 
-These are the callbacks a file manager fires in storms — one `getxattr` per
+These are the requests a file manager fires in storms — one status query per
 visible entry while drawing a folder. None of them may touch the network, and
 none does.
 

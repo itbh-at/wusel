@@ -2706,6 +2706,7 @@ version = "0.3.2"
 dependencies = [
  "anyhow",
  "clap",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",
@@ -2715,6 +2716,7 @@ dependencies = [
  "wusel-core",
  "wusel-desktop",
  "wusel-fuse",
+ "wusel-ipc",
 ]
 
 [[package]]
@@ -2763,6 +2765,22 @@ dependencies = [
  "fuser",
  "libc",
  "reqwest",
+ "tokio",
+ "tracing",
+ "wusel-core",
+ "wusel-fsm",
+ "wusel-ipc",
+ "wusel-mock",
+]
+
+[[package]]
+name = "wusel-ipc"
+version = "0.3.2"
+dependencies = [
+ "libc",
+ "reqwest",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "wusel-core",

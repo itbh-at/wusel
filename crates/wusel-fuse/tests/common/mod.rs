@@ -31,7 +31,16 @@ pub struct MountFixture {
 impl MountFixture {
     /// Build the fixture, start the mock server, mount, and wait until the
     /// mount serves. `tag` keeps concurrent test binaries in separate dirs.
+    #[allow(dead_code)] // used by every e2e binary but the socket one
     pub fn start(tag: &str) -> Self {
+        Self::start_with(tag, |_| wusel_fuse::Extras::default())
+    }
+
+    /// As [`start`](Self::start), but the caller supplies the mount's
+    /// [`wusel_fuse::Extras`] — the hook a second frontend attaches through.
+    /// The closure is handed the base directory, so it can put a socket beside
+    /// the mount rather than in a shared location.
+    pub fn start_with(tag: &str, extras: impl FnOnce(&Path) -> wusel_fuse::Extras) -> Self {
         let base = std::env::temp_dir().join(format!("wusel-fuse-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let fixture = base.join("fixture");
@@ -98,8 +107,9 @@ impl MountFixture {
         let mnt = base.join("mnt");
         std::fs::create_dir_all(&mnt).unwrap();
         let mnt_for_thread = mnt.clone();
+        let extras = extras(&base);
         let mount_thread = std::thread::spawn(move || {
-            let _ = wusel_fuse::mount(&mnt_for_thread, provider);
+            let _ = wusel_fuse::mount_with(&mnt_for_thread, provider, extras);
         });
 
         assert!(wait_until_mounted(&mnt), "mount did not become ready");
