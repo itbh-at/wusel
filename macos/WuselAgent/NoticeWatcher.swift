@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 IT Beratung Hermann GmbH
 
+import FileProvider
 import Foundation
 import UserNotifications
 
@@ -25,13 +26,15 @@ import UserNotifications
 /// only landing in the list.
 final class NoticeWatcher: NSObject, UNUserNotificationCenterDelegate {
     private let socketPath: String
+    private let domain: NSFileProviderDomain
     private let center = UNUserNotificationCenter.current()
     private let queue = DispatchQueue(label: "at.itbh.wusel.notice-watcher")
     private var stopped = false
     private let reconnectDelay: TimeInterval = 5
 
-    init(socketPath: String) {
+    init(socketPath: String, domain: NSFileProviderDomain) {
         self.socketPath = socketPath
+        self.domain = domain
         super.init()
     }
 
@@ -89,8 +92,9 @@ final class NoticeWatcher: NSObject, UNUserNotificationCenterDelegate {
             try client.notices()
             AgentLog.log("notices: subscribed to the notice stream")
             while !stopped, let response = try client.nextPush() {
-                if case .notice(let severity, let title, let body) = response {
+                if case .notice(let kind, let severity, let title, let body) = response {
                     post(severity: severity, title: title, body: body)
+                    react(toNoticeKind: kind)
                 }
             }
         } catch {
@@ -100,6 +104,21 @@ final class NoticeWatcher: NSObject, UNUserNotificationCenterDelegate {
         if !stopped {
             queue.asyncAfter(deadline: .now() + reconnectDelay) { [self] in loop() }
         }
+    }
+
+    /// Act on a notice beyond showing it. When the connection is restored, run
+    /// the reconcile that a change-log reset had to skip while the server was
+    /// unreachable (the extension defers it precisely so a reimport never wedges a
+    /// folder with a stuck upload error): nudge the working set and re-import the
+    /// opened folders, now safely against a reachable server. Keyed on the stable
+    /// notice id, never the translated text.
+    private func react(toNoticeKind kind: String) {
+        guard kind == "connection-restored" else { return }
+        AgentLog.log("notices: connection restored — reconciling opened folders")
+        if let manager = NSFileProviderManager(for: domain) {
+            manager.signalEnumerator(for: .workingSet) { _ in }
+        }
+        KnownContainers.reconcileOpenedFolders(domain: domain, log: AgentLog.log)
     }
 
     /// Post one notice as a banner. A fresh identifier each time so notices stack

@@ -20,6 +20,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use wusel_core::diag::DiagReport;
+use wusel_core::push::PushStatus;
 use wusel_core::runtime::DiagHandle;
 
 use crate::dispatch::Replies;
@@ -34,7 +35,12 @@ impl DiagSocket {
     /// `None` — never an error — when it cannot bind, because a mount must go
     /// ahead without its diagnostics socket.
     #[must_use]
-    pub fn bind(path: PathBuf, handle: DiagHandle, replies: Arc<Replies>) -> Option<Self> {
+    pub fn bind(
+        path: PathBuf,
+        handle: DiagHandle,
+        replies: Arc<Replies>,
+        push: Option<Arc<PushStatus>>,
+    ) -> Option<Self> {
         if let Some(dir) = path.parent() {
             if let Err(e) = std::fs::create_dir_all(dir) {
                 tracing::warn!(
@@ -60,7 +66,7 @@ impl DiagSocket {
 
         std::thread::Builder::new()
             .name("wusel-diag".into())
-            .spawn(move || serve(&listener, &handle, &replies))
+            .spawn(move || serve(&listener, &handle, &replies, push.as_deref()))
             .expect("spawn the diagnostics socket thread");
 
         Some(Self { path })
@@ -77,10 +83,15 @@ impl Drop for DiagSocket {
 
 /// Answer each connection with one JSON report. Runs until the listener is
 /// dropped (at process exit); an error on one connection never ends the loop.
-fn serve(listener: &UnixListener, handle: &DiagHandle, replies: &Arc<Replies>) {
+fn serve(
+    listener: &UnixListener,
+    handle: &DiagHandle,
+    replies: &Arc<Replies>,
+    push: Option<&PushStatus>,
+) {
     for conn in listener.incoming() {
         let Ok(mut stream) = conn else { continue };
-        let payload = match build_report(handle, replies) {
+        let payload = match build_report(handle, replies, push) {
             Ok(json) => json,
             // The decider did not answer in time — itself a diagnosis. Hand it
             // over as something `doctor` can show rather than nothing.
@@ -93,10 +104,16 @@ fn serve(listener: &UnixListener, handle: &DiagHandle, replies: &Arc<Replies>) {
 }
 
 /// The report a connection is answered with: the substrate's snapshot plus the
-/// count of parked replies, which only the frontend knows.
-fn build_report(handle: &DiagHandle, replies: &Arc<Replies>) -> wusel_core::Result<String> {
+/// count of parked replies, which only the frontend knows, plus the notify_push
+/// listener's state, which only the daemon that runs one can hand over.
+fn build_report(
+    handle: &DiagHandle,
+    replies: &Arc<Replies>,
+    push: Option<&PushStatus>,
+) -> wusel_core::Result<String> {
     let snapshot = handle.snapshot()?;
     let mut report = DiagReport::from_substrate(&snapshot);
     report.replies_pending = Some(replies.pending_count());
+    report.push = push.map(PushStatus::snapshot);
     report.to_json()
 }

@@ -179,8 +179,9 @@ and made to be shared.
 === `wusel doctor`
 
 Collect diagnostics for a support case: system, daemon, mount, the FUSE
-connection's waiting count, the daemon's internal state, and a redacted journal
-tail. Redacted by default, so the output is safe to attach to a ticket.
+connection's waiting count, the daemon's internal state, the state of the
+notify_push connection, and a redacted journal tail. Redacted by default, so the
+output is safe to attach to a ticket.
 
 [cols="1,3",options="header"]
 |===

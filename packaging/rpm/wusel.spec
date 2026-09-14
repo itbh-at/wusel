@@ -176,6 +176,17 @@ fi
 # with no system-wide preset to apply; each user enables their own instance.
 
 %changelog
+* Sun Sep 14 2026 Christoph D. Hermann <christoph.hermann@itbh.at> - 0.4.1-1
+- Judge server reachability by HTTP, not the notify_push WebSocket: a broken
+  push endpoint no longer reports the server offline; an unreachable one still is
+- Make re-creating an existing folder (MKCOL) idempotent so it succeeds
+- Reconcile pending uploads at start-up in synchronous mode too, and resolve
+  uploads whose buffer is gone instead of retrying them forever
+- `wusel doctor` reports the notify_push connection and names its failure
+- Experimental macOS: reconcile on reconnect, skip reimport while unreachable,
+  re-signal the working set on watch reconnect, bound the engine-connect retry,
+  bind the socket before engine start-up
+
 * Mon Sep 07 2026 Christoph D. Hermann <christoph.hermann@itbh.at> - 0.4.0-1
 - Experimental macOS support (native File Provider frontend, built from source)
 - Per-file status served over the wusel-ipc socket instead of an extended attribute

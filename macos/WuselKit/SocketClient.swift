@@ -132,6 +132,18 @@ final class SocketClient {
         return (seq, items)
     }
 
+    /// Whether the daemon currently has positive evidence the server is reachable.
+    /// The working-set enumerator asks this before a reimport, which deletes and
+    /// re-creates a folder subtree and would wedge it with a stuck upload error if
+    /// it ran against a server that cannot be reached.
+    func reachable() throws -> Bool {
+        let (response, _) = try call(Request(op: "reachable", path: ""))
+        guard case .reachable(let reachable) = response else {
+            throw SocketError.unexpectedResponse
+        }
+        return reachable
+    }
+
     /// Block for the next pushed frame on a `watch` or `notices` connection; `nil`
     /// at a clean end of stream (the peer closed, e.g. `wusel serve` restarted).
     func nextPush() throws -> Response? {

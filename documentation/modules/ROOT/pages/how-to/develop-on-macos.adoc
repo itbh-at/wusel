@@ -20,6 +20,45 @@ On Linux none of this applies; follow
 xref:tutorials/set-up-a-development-environment.adoc[Set up a development
 environment] instead.
 
+== First aid: rebuild the File Provider replica
+
+If the native File Provider starts behaving oddly — folders stuck, a
+cloud-with-`!` emblem that will not clear, changes that do not appear, or a
+*Preparing…* that never finishes — the reliable recovery is to rebuild macOS's
+local replica from the server. Wusel is xref:explanation/vfs-first.adoc[VFS-first]:
+every file is online-only, so a rebuild loses nothing.
+
+Drop a one-shot marker from a terminal, then restart the agent so it acts on it:
+
+[source,sh]
+----
+touch ~/.config/wusel/reset-domain
+----
+
+On its next start the Wusel agent removes and re-adds the File Provider domain — a
+clean replica — and deletes the marker, so it fires once. Creating the file alone
+changes nothing until the agent restarts. To restart it, **log out and back in**:
+the agent runs as a login item, so logging back in relaunches it (and restarts
+macOS's `fileproviderd` along with the session). That is enough; a full reboot
+does the same and is only the bigger hammer for the rare case where logging out
+did not clear it.
+
+[NOTE]
+====
+The marker lives in `~/.config/wusel/`, *outside* the App Group container, on
+purpose: macOS shields the container from Terminal and scripts (TCC), so a marker
+placed there could not be dropped from a shell — the non-sandboxed agent reads the
+real home directory instead.
+====
+
+The one thing a rebuild discards is a file created on the Mac that has **not yet
+reached the server** — only possible while an upload is failing. If in doubt, run
+`wusel status` first: a *PARKED* upload is bytes that are still only local.
+
+TIP: Running the build straight from Xcode (`⌘R`) rather than an installed
+login-item app? Logging out will not relaunch it — press `⌘R` (or relaunch Wusel)
+to consume the marker.
+
 == What works natively
 
 The engine and the CLI build and test on macOS with no container:

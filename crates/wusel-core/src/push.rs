@@ -29,22 +29,123 @@
 //! shared state is one atomic.
 
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::{SinkExt, StreamExt};
 use reqwest_websocket::{Message, RequestBuilderExt};
 
 use crate::config::TlsSettings;
+use crate::diag::{PushPhase, PushReport};
 use crate::{capabilities, tls, Error, Result};
 
 /// Handle to the background listener. Dropping it asks the loop to stop between
 /// reconnects; the daemon normally keeps it for the mount's lifetime.
 pub struct PushListener {
     stop: Arc<AtomicBool>,
+    status: Arc<PushStatus>,
     // Kept so the thread is owned by the handle; joined on a clean stop only.
     _handle: Option<JoinHandle<()>>,
+}
+
+impl PushListener {
+    /// The listener's live state, for the diagnostics socket. Shared, so the
+    /// daemon can hand it to the mount while keeping the listener itself.
+    #[must_use]
+    pub fn status(&self) -> Arc<PushStatus> {
+        Arc::clone(&self.status)
+    }
+}
+
+/// What the listener is doing right now, as `wusel doctor` will see it.
+///
+/// Written by the listener thread at every phase change and failure, read by
+/// the diagnostics socket when somebody asks. A plain mutex: both sides touch
+/// it a few times a minute at most, and nothing on the FUSE path ever does.
+///
+/// It exists because a listener that cannot hold its connection is silent by
+/// design — it logs one `WARN` per attempt and retries forever — and from the
+/// outside that looks exactly like a server that offers no notify_push. The
+/// two need opposite advice (fix the reverse proxy, against nothing to do), so
+/// the daemon has to say which it is.
+#[derive(Default)]
+pub struct PushStatus {
+    inner: Mutex<Inner>,
+}
+
+struct Inner {
+    phase: PushPhase,
+    since: Instant,
+    endpoint: Option<String>,
+    failures: u32,
+    connects: u32,
+    last_error: Option<String>,
+}
+
+impl Default for Inner {
+    fn default() -> Self {
+        Self {
+            phase: PushPhase::Discovering,
+            since: Instant::now(),
+            endpoint: None,
+            failures: 0,
+            connects: 0,
+            last_error: None,
+        }
+    }
+}
+
+impl PushStatus {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Enter `phase`; the clock restarts only if it actually changes.
+    fn set_phase(&self, phase: PushPhase) {
+        let mut s = self.lock();
+        if s.phase != phase {
+            s.phase = phase;
+            s.since = Instant::now();
+        }
+    }
+
+    fn set_endpoint(&self, endpoint: &str) {
+        self.lock().endpoint = Some(endpoint.to_string());
+    }
+
+    /// One more failed attempt, and its reason.
+    fn failed(&self, error: &Error) {
+        let mut s = self.lock();
+        s.failures = s.failures.saturating_add(1);
+        s.last_error = Some(error.to_string());
+    }
+
+    /// Authenticated: the run of failures is over and its last error is no
+    /// longer news.
+    fn connected(&self) {
+        {
+            let mut s = self.lock();
+            s.connects = s.connects.saturating_add(1);
+            s.failures = 0;
+            s.last_error = None;
+        }
+        self.set_phase(PushPhase::Connected);
+    }
+
+    /// The state as plain data for the wire.
+    #[must_use]
+    pub fn snapshot(&self) -> PushReport {
+        let s = self.lock();
+        PushReport {
+            phase: s.phase,
+            since_secs: s.since.elapsed().as_secs(),
+            endpoint: s.endpoint.clone(),
+            failures: s.failures,
+            connects: s.connects,
+            last_error: s.last_error.clone(),
+        }
+    }
 }
 
 impl Drop for PushListener {
@@ -67,12 +168,14 @@ pub fn spawn(
     health: Option<Arc<crate::health::Reachability>>,
 ) -> PushListener {
     let stop = Arc::new(AtomicBool::new(false));
+    let status = Arc::new(PushStatus::default());
     let (server, login, password) = (
         server_url.to_string(),
         login.to_string(),
         password.to_string(),
     );
     let stop_thread = stop.clone();
+    let status_thread = Arc::clone(&status);
 
     let handle = std::thread::Builder::new()
         .name("nc-notify-push".into())
@@ -84,6 +187,8 @@ pub fn spawn(
                 Ok(rt) => rt,
                 Err(e) => {
                     tracing::warn!(%e, "notify_push: could not build runtime");
+                    status_thread.failed(&Error::Other(format!("no runtime: {e}")));
+                    status_thread.set_phase(PushPhase::Stopped);
                     return;
                 }
             };
@@ -96,12 +201,15 @@ pub fn spawn(
                 &sync_trigger,
                 &stop_thread,
                 health.as_deref(),
+                &status_thread,
             ));
+            status_thread.set_phase(PushPhase::Stopped);
         })
         .expect("spawn notify-push thread");
 
     PushListener {
         stop,
+        status,
         _handle: Some(handle),
     }
 }
@@ -117,16 +225,19 @@ async fn run(
     sync_trigger: &std::sync::mpsc::Sender<()>,
     stop: &AtomicBool,
     health: Option<&crate::health::Reachability>,
+    status: &PushStatus,
 ) {
     let client = match tls::client(tls_settings) {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(%e, "notify_push: no HTTP client");
+            status.failed(&e);
+            status.set_phase(PushPhase::Unavailable);
             return;
         }
     };
 
-    let Some(info) = discover(&client, server, login, password, stop, health).await else {
+    let Some(info) = discover(&client, server, login, password, stop, health, status).await else {
         return;
     };
     if let Some(version) = &info.version {
@@ -136,12 +247,19 @@ async fn run(
         Some(url) => url,
         None => {
             tracing::info!("notify_push not available — relying on TTL revalidation");
+            status.set_phase(PushPhase::Unavailable);
             return;
         }
     };
     tracing::info!(%endpoint, "notify_push: connecting");
+    status.set_endpoint(&endpoint);
+    status.set_phase(PushPhase::Connecting);
 
     let mut backoff = 1u64;
+    // Failures of the socket while the server itself answers. They say the
+    // *endpoint* is broken, not the server, and after a few of them this loop
+    // stops pretending otherwise: see [`WS_GIVE_UP_AFTER`].
+    let mut endpoint_failures = 0u32;
     while !stop.load(Ordering::SeqCst) {
         match listen_once(
             &client,
@@ -152,17 +270,48 @@ async fn run(
             sync_trigger,
             stop,
             health,
+            status,
         )
         .await
         {
-            Ok(()) => backoff = 1, // clean close → reconnect promptly
+            Ok(()) => {
+                // A clean close: the endpoint worked, reconnect promptly.
+                backoff = 1;
+                endpoint_failures = 0;
+            }
             Err(e) => {
-                // The other half of the heartbeat: once the socket is up, this
-                // reconnect loop is the only thing still talking to the server on
-                // an idle mount, so its failures are what notice an outage that
-                // starts while nobody is using the folder.
-                if let Some(health) = health {
-                    health.failed(&e);
+                status.failed(&e);
+                // A failed socket is no verdict on the server. The endpoint is a
+                // URL the server *advertises*, and it is wrong more often than
+                // the server is down — a loopback address, a proxy that does not
+                // upgrade — while every plain request sails through. Reported as
+                // a failure, that made a mount with a broken endpoint announce
+                // "connection lost" after every successful listing, forever.
+                //
+                // So the server is judged the one way that cannot lie about it:
+                // an HTTP request. That keeps this loop the idle mount's
+                // heartbeat (an outage is still noticed, and its end) without
+                // letting the endpoint's problems speak for the server's.
+                let server_answers = match health {
+                    Some(health) => probe_server(&client, server, login, password, health).await,
+                    None => true,
+                };
+                if server_answers {
+                    endpoint_failures = endpoint_failures.saturating_add(1);
+                    if endpoint_failures == WS_GIVE_UP_AFTER {
+                        tracing::warn!(
+                            %endpoint, error = %e,
+                            "notify_push: the server answers but its WebSocket endpoint does not \
+                             ({WS_GIVE_UP_AFTER} failures in a row) — falling back to TTL \
+                             polling and retrying every {DEGRADED_BACKOFF_SECS}s. `wusel doctor` \
+                             names the likely cause (notify_push's base_endpoint, or a reverse \
+                             proxy without WebSocket upgrades)"
+                        );
+                    }
+                } else {
+                    // The server is gone; the endpoint may be fine. Judge it afresh
+                    // once the server is back.
+                    endpoint_failures = 0;
                 }
                 tracing::warn!(%e, "notify_push: connection ended, retrying in {backoff}s");
             }
@@ -170,15 +319,62 @@ async fn run(
         if stop.load(Ordering::SeqCst) {
             break;
         }
+        status.set_phase(PushPhase::Reconnecting);
         tokio::time::sleep(Duration::from_secs(backoff)).await;
-        backoff = (backoff * 2).min(MAX_BACKOFF_SECS);
+        // While the server is down this loop is what notices its return, so it
+        // keeps the short cap. A broken endpoint behind a working server is worth
+        // a look now and then, not two requests a minute.
+        let cap = if endpoint_failures >= WS_GIVE_UP_AFTER {
+            DEGRADED_BACKOFF_SECS
+        } else {
+            MAX_BACKOFF_SECS
+        };
+        backoff = (backoff * 2).min(cap);
     }
+}
+
+/// Judge the server by a plain HTTP request, on behalf of a loop whose own
+/// failures cannot. Reports the outcome to `health` exactly as the WebDAV
+/// client does for every request — an answer of any status is a reachable
+/// server, only no answer or a 5xx is an incident — and returns whether the
+/// server answered.
+async fn probe_server(
+    client: &reqwest::Client,
+    server: &str,
+    login: &str,
+    password: &str,
+    health: &crate::health::Reachability,
+) -> bool {
+    let answered = match capabilities::fetch(client, server, login, password).await {
+        Ok(_) => true,
+        Err(e) => {
+            let incident = e.is_transport() || e.is_server_fault();
+            if incident {
+                health.failed(&e);
+            }
+            !incident
+        }
+    };
+    if answered {
+        health.ok();
+    }
+    answered
 }
 
 /// The longest wait between endpoint-discovery attempts. Matches the reconnect
 /// cap: often enough that a returning network is noticed while the user is still
 /// waiting for it, rare enough to be free.
 const MAX_BACKOFF_SECS: u64 = 30;
+
+/// How many socket failures in a row, each with the server demonstrably
+/// answering, before the endpoint is written off as broken. Three, not one: a
+/// proxy restart or a notify_push binary coming up after Nextcloud produces a
+/// couple of refused connections that are nobody's misconfiguration.
+const WS_GIVE_UP_AFTER: u32 = 3;
+
+/// The reconnect cap once the endpoint is written off. Still retried — the
+/// admin may fix it — but at a rate that costs nothing and logs nothing new.
+const DEGRADED_BACKOFF_SECS: u64 = 300;
 
 /// Ask the server what it can do — waiting out a network outage instead of
 /// giving up on the mount's live updates.
@@ -208,6 +404,7 @@ async fn discover(
     password: &str,
     stop: &AtomicBool,
     health: Option<&crate::health::Reachability>,
+    status: &PushStatus,
 ) -> Option<capabilities::ServerInfo> {
     let mut backoff = 1u64;
     loop {
@@ -230,12 +427,15 @@ async fn discover(
                 if let Some(health) = health {
                     health.failed(&e);
                 }
+                status.failed(&e);
                 tracing::warn!(%e, "notify_push: capability lookup failed — retrying in {backoff}s");
                 tokio::time::sleep(Duration::from_secs(backoff)).await;
                 backoff = (backoff * 2).min(MAX_BACKOFF_SECS);
             }
             Err(e) => {
                 tracing::warn!(%e, "notify_push: capability lookup refused — relying on TTL");
+                status.failed(&e);
+                status.set_phase(PushPhase::Unavailable);
                 return None;
             }
         }
@@ -269,6 +469,7 @@ async fn listen_once(
     sync_trigger: &std::sync::mpsc::Sender<()>,
     stop: &AtomicBool,
     health: Option<&crate::health::Reachability>,
+    status: &PushStatus,
 ) -> Result<()> {
     // reqwest speaks http(s); map the ws(s) scheme the server advertises.
     let http_url = endpoint
@@ -306,6 +507,7 @@ async fn listen_once(
                     if let Some(health) = health {
                         health.ok();
                     }
+                    status.connected();
                     tracing::info!("notify_push: authenticated");
                 } else if is_file_event(text) {
                     invalidate_after.store(now_secs(), Ordering::SeqCst);
@@ -378,6 +580,43 @@ fn now_secs() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The state `doctor` reads must tell a run of failures from a healthy
+    /// connection, and forget the run once the connection is back.
+    #[test]
+    fn the_status_counts_a_run_of_failures_and_clears_it_on_connect() {
+        let status = PushStatus::default();
+        assert_eq!(status.snapshot().phase, PushPhase::Discovering);
+
+        status.set_endpoint("wss://cloud.example.org/push/ws");
+        status.set_phase(PushPhase::Connecting);
+        status.failed(&Error::Http("[connect] connection refused".into()));
+        status.set_phase(PushPhase::Reconnecting);
+        status.failed(&Error::HttpStatus {
+            status: 502,
+            message: "websocket upgrade refused with 502 Bad Gateway".into(),
+        });
+        let s = status.snapshot();
+        assert_eq!(s.phase, PushPhase::Reconnecting);
+        assert_eq!(s.failures, 2);
+        assert_eq!(s.connects, 0);
+        assert_eq!(
+            s.endpoint.as_deref(),
+            Some("wss://cloud.example.org/push/ws")
+        );
+        assert!(
+            s.last_error.as_deref().unwrap_or("").contains("502"),
+            "the latest failure is the one reported: {:?}",
+            s.last_error
+        );
+
+        status.connected();
+        let s = status.snapshot();
+        assert_eq!(s.phase, PushPhase::Connected);
+        assert_eq!((s.failures, s.connects), (0, 1));
+        assert_eq!(s.last_error, None, "old news once the socket is up");
+        assert!(s.endpoint.is_some(), "the endpoint outlives the incident");
+    }
 
     fn http(status: u16) -> Error {
         Error::HttpStatus {

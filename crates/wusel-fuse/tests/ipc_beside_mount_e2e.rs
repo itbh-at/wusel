@@ -59,12 +59,16 @@ fn the_mount_serves_the_status_socket_off_its_own_engine() {
         let events = wusel_ipc::Events::start(inval_rx);
         let notices = wusel_ipc::IpcDesktop::new();
         wusel_fuse::Extras {
+            // No notify_push listener in this test — the socket is what is under
+            // test, not the daemon's push state.
+            push: None,
             invalidations: Some(inval_tx),
             on_ready: Some(Box::new(move |ids, provider| {
                 let driver = std::sync::Arc::new(wusel_ipc::Driver::attach(ids, provider));
                 let route = driver.route();
+                let listener = wusel_ipc::bind(&path).expect("bind the status socket");
                 std::thread::spawn(move || {
-                    let _ = wusel_ipc::serve(driver, events, notices, &path);
+                    let _ = wusel_ipc::serve(driver, events, notices, listener);
                 });
                 Some(route)
             })),

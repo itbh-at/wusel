@@ -38,10 +38,26 @@ fn main() {
     println!("cargo:rustc-env=WUSEL_BUILD_TIME={time}");
 
     // Re-stamp when the commit moves or the injected time changes; otherwise the
-    // cached build.rs output (and a stale commit) would stick. `--git-path`
-    // resolves HEAD correctly inside a worktree, where `.git` is a file.
+    // cached build.rs output (and a stale commit) would stick. This has to catch
+    // a `git pull` as well, which moves the *branch ref* and leaves `.git/HEAD`
+    // untouched (HEAD keeps pointing at `refs/heads/<branch>`) — watching HEAD
+    // alone let a pulled-then-rebuilt binary keep the pre-pull commit, the exact
+    // stale-stamp confusion this whole file exists to end. `--git-path` resolves
+    // each file correctly inside a worktree, where `.git` is a file.
     println!("cargo:rerun-if-env-changed=WUSEL_BUILD_TIME");
-    if let Some(head) = git(&["rev-parse", "--git-path", "HEAD"]) {
-        println!("cargo:rerun-if-changed={head}");
+    let watch = |path: &str| {
+        if let Some(p) = git(&["rev-parse", "--git-path", path]) {
+            println!("cargo:rerun-if-changed={p}");
+        }
+    };
+    watch("HEAD"); // a branch switch, or a detached HEAD moving
+    watch("packed-refs"); // the branch ref while refs are packed
+    watch("logs/HEAD"); // the reflog: appended on every move of HEAD's target
+
+    // The current branch's own ref file, rewritten on commit / pull / merge /
+    // reset even from a packed state. Skipped on a detached HEAD, which `HEAD`
+    // above already covers.
+    if let Some(git_ref) = git(&["symbolic-ref", "-q", "HEAD"]) {
+        watch(&git_ref); // e.g. refs/heads/main
     }
 }

@@ -50,6 +50,75 @@ pub struct DiagReport {
     /// FUSE frontend; `None` when the report is produced without one.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub replies_pending: Option<usize>,
+    /// What the notify_push listener is doing. Filled by the daemon that runs
+    /// one; `None` from a report produced without it, and from a mount older
+    /// than this field — defaulted for that reason, like `hydrating`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub push: Option<PushReport>,
+}
+
+/// Where the notify_push listener stands — the mount's live-update channel.
+///
+/// The point of reporting it: whether live updates work is invisible from
+/// outside. The mount works either way (TTL polling is the fallback), so a
+/// WebSocket path that a reverse proxy does not pass through shows up only as
+/// listings going stale — and, until then, as a daemon that keeps failing to
+/// connect while every plain HTTP request succeeds. Only the listener itself
+/// can say which of the two it is.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PushPhase {
+    /// Asking the server whether it offers notify_push at all.
+    Discovering,
+    /// It does not (or the lookup was refused for good): the mount polls.
+    Unavailable,
+    /// The endpoint is known and the first connection is being made.
+    Connecting,
+    /// Authenticated; file-change events arrive.
+    Connected,
+    /// The connection ended and the listener is waiting out its backoff.
+    Reconnecting,
+    /// The listener was asked to stop, or gave up for good.
+    Stopped,
+    /// A phase this build does not know — the daemon is newer than `doctor`.
+    /// Catches the variant instead of failing the whole report over it.
+    #[serde(other)]
+    Unknown,
+}
+
+impl PushPhase {
+    /// The phase as it is spelled on the wire — for a report that quotes it.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Discovering => "discovering",
+            Self::Unavailable => "unavailable",
+            Self::Connecting => "connecting",
+            Self::Connected => "connected",
+            Self::Reconnecting => "reconnecting",
+            Self::Stopped => "stopped",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// The notify_push listener's state, as it crosses the socket.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PushReport {
+    pub phase: PushPhase,
+    /// Seconds the current phase has lasted.
+    pub since_secs: u64,
+    /// The advertised WebSocket endpoint, once discovered. A URL the server
+    /// publishes, not a user path — nothing private in it.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub endpoint: Option<String>,
+    /// Failed attempts since the last successful authentication.
+    pub failures: u32,
+    /// Successful authentications since the mount started.
+    pub connects: u32,
+    /// The most recent failure, verbatim — the line `doctor` exists to surface.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub last_error: Option<String>,
 }
 
 /// The machine's occupancy, mirroring [`wusel_fsm::MachineSnapshot`].
@@ -113,6 +182,7 @@ impl DiagReport {
                 file: s.pools.file,
             },
             replies_pending: None,
+            push: None,
         }
     }
 
@@ -170,8 +240,33 @@ mod tests {
     fn a_report_round_trips_through_json() {
         let mut report = DiagReport::from_substrate(&a_snapshot());
         report.replies_pending = Some(3);
+        report.push = Some(PushReport {
+            phase: PushPhase::Reconnecting,
+            since_secs: 17,
+            endpoint: Some("wss://cloud.example.org/push/ws".into()),
+            failures: 4,
+            connects: 1,
+            last_error: Some("websocket upgrade refused with 502 Bad Gateway".into()),
+        });
         let back = DiagReport::from_json(&report.to_json().unwrap()).unwrap();
         assert_eq!(report, back);
+    }
+
+    /// A `doctor` older than the daemon must still read the report: an unknown
+    /// phase becomes `Unknown`, and a report without the field parses at all.
+    #[test]
+    fn a_newer_or_older_daemon_still_parses() {
+        let mut json = DiagReport::from_substrate(&a_snapshot()).to_json().unwrap();
+        assert!(!json.contains("\"push\""), "absent, not null, when unset");
+        let back = DiagReport::from_json(&json).unwrap();
+        assert_eq!(back.push, None);
+
+        json.insert_str(
+            json.len() - 1,
+            r#","push":{"phase":"teleporting","since_secs":1,"failures":0,"connects":0}"#,
+        );
+        let back = DiagReport::from_json(&json).unwrap();
+        assert_eq!(back.push.unwrap().phase, PushPhase::Unknown);
     }
 
     #[test]

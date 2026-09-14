@@ -60,6 +60,33 @@ async fn propfind_dir_lists_children_over_http() {
 }
 
 #[tokio::test]
+async fn mkcol_is_idempotent_over_http() {
+    let base = std::env::temp_dir().join(format!("wusel-mock-dav-mkcol-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let fixture = base.join("fixture");
+    std::fs::create_dir_all(&fixture).unwrap();
+
+    let mock = common::Mock::serve(&fixture);
+    let dav = client_for(&mock.addr);
+
+    // First create: the collection did not exist → succeeds and appears on disk.
+    dav.mkcol("Reports")
+        .await
+        .expect("first MKCOL creates the directory");
+    assert!(fixture.join("Reports").is_dir(), "the directory is created");
+
+    // Second create: the server answers 405 (already exists). It must still
+    // succeed — re-creating a folder that is already there (the File Provider
+    // reimport re-runs create-item on server-backed folders) is a no-op, not the
+    // failure that once left the item wedged with a stuck upload error.
+    dav.mkcol("Reports")
+        .await
+        .expect("MKCOL on an existing collection is an idempotent success");
+
+    std::fs::remove_dir_all(&base).ok();
+}
+
+#[tokio::test]
 async fn quota_reaches_the_server_over_http() {
     let base = std::env::temp_dir().join(format!("wusel-mock-dav-quota-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);

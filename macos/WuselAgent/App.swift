@@ -48,8 +48,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Relays the engine's change stream to Finder.
     private lazy var changes = ChangeWatcher(domain: domain)
 
-    /// Relays the engine's user notices to Notification Center.
-    private let notices = NoticeWatcher(socketPath: SharedPaths.socketPath)
+    /// Relays the engine's user notices to Notification Center, and re-drives the
+    /// opened-folder reconcile when the connection is restored.
+    private lazy var notices = NoticeWatcher(socketPath: SharedPaths.socketPath, domain: domain)
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         AgentLog.log("starting; bundle=\(Bundle.main.bundlePath)")

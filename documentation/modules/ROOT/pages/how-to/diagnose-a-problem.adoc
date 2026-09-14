@@ -191,7 +191,10 @@ stays unreachable for about ten seconds, a **"Connection lost"** notification
 names the server, and the file manager's account status switches to *error*. A
 second notification announces the connection coming back. Both are localized;
 neither repeats while the outage lasts (one per incident, not one per failed
-request).
+request), and for five minutes after a recovery a new outage only changes the
+file manager's status — it is announced only if it is still going on after
+that. A flapping link therefore produces two notifications per five minutes at
+most, not two per wobble.
 
 Two things follow from that, when a mount seems stuck:
 
@@ -215,6 +218,46 @@ journalctl --user -u wusel@default -g 'unreachable|connect|timeout' -n 50
 
 `wusel doctor` also reports connectivity, and is the better first step if the
 mount answers to nothing at all.
+
+[#notify-push]
+== Live updates do not arrive, or the connection keeps "dropping"
+
+Listings that stay stale until their TTL expires, or a stream of _Connection
+lost_ / _Server available again_ notices while everything else works, point at
+the notify_push WebSocket rather than the network. `wusel doctor` reads the
+listener's state from the daemon and prints it in the `PUSH` section, with a
+finding on top:
+
+* `connected` — live updates work; look elsewhere.
+* `unavailable` — the server does not offer notify_push. The mount polls
+  instead, which is slower but correct; nothing to fix on this side.
+* `reconnecting` with failures, and an `endpoint` on `127.0.0.1` or
+  `localhost` — the server hands out an address only it can reach. Its own
+  self-test passes, every client fails. Set notify_push's `base_endpoint` to
+  the public URL on the server:
++
+[source,sh]
+----
+occ notify_push:setup
+# or by hand:
+occ config:app:set notify_push base_endpoint --value https://cloud.example.org/push
+----
+* `reconnecting` with failures on a public endpoint, while `CONNECTIVITY` is
+  fine — the server advertises an endpoint that cannot be held. The finding
+  quotes the daemon's last error. A `502`, `404` or `400` on the upgrade, or a
+  connection that is refused on a port the server never opened, almost always
+  means the reverse proxy in front of Nextcloud does not pass WebSocket
+  upgrades through to notify_push. On the server:
++
+[source,sh]
+----
+occ notify_push:self-test
+----
++
+and then fix the proxy block as the
+https://github.com/nextcloud/notify_push#reverse-proxy[notify_push documentation]
+shows for your proxy. The mount picks the repaired endpoint up on its next
+reconnect; no restart needed.
 
 == Cache vs. server problems
 

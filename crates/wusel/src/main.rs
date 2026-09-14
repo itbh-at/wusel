@@ -708,7 +708,7 @@ fn cmd_mount(account: &Account, mountpoint: Option<&str>) -> anyhow::Result<()> 
     // retry loops keep talking to the server when nothing else does, which makes
     // them the mount's heartbeat: an otherwise idle daemon still learns that the
     // connection went away — and came back — and tells the user.
-    let _push = wusel_core::push::spawn(
+    let push = wusel_core::push::spawn(
         &creds.server,
         &creds.login_name,
         &creds.app_password,
@@ -743,7 +743,11 @@ fn cmd_mount(account: &Account, mountpoint: Option<&str>) -> anyhow::Result<()> 
     // `cache clear` reads this to notice a live daemon (see
     // `live_mount_for_account`); the marker goes away again on clean exit.
     write_mount_marker(account, &target);
-    let result = wusel_fuse::mount_with(&target, provider, ipc_extras(account));
+    // The listener stays ours (it stops when `push` drops, after the mount);
+    // the mount only gets its state to serve to `wusel doctor`.
+    let mut extras = ipc_extras(account);
+    extras.push = Some(push.status());
+    let result = wusel_fuse::mount_with(&target, provider, extras);
     remove_mount_marker(account);
     result
 }
@@ -775,16 +779,36 @@ fn ipc_extras(account: &Account) -> wusel_fuse::Extras {
     let socket_path = default_ipc_socket(account);
 
     wusel_fuse::Extras {
+        // The caller adds the push listener's state; this function only knows
+        // the IPC side.
+        push: None,
         invalidations: Some(inval_tx),
         on_ready: Some(Box::new(move |ids, provider| {
             let driver = std::sync::Arc::new(wusel_ipc::Driver::attach(ids, provider));
             // Take the route before the driver moves into the serve thread: it
             // is what the mount's reply pump calls for ids it does not hold.
             let route = driver.route();
+            // Bind on this (the on-ready) thread, before spawning the accept
+            // loop, so the socket is already listening the moment the mount is
+            // usable — the same bind-before-serve ordering `wusel serve` uses.
+            let listener = match wusel_ipc::bind(&socket_path) {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::warn!(
+                        path = %socket_path.display(), error = %e,
+                        "could not bind the status socket; \
+                         the file manager will show no sync emblems"
+                    );
+                    // Nobody will serve the route, so hand back none — an
+                    // installed route whose waiters nobody answers leaks every
+                    // id it sees, exactly as the spawn-failure arm below.
+                    return None;
+                }
+            };
             match std::thread::Builder::new()
                 .name("wusel-ipc-serve".into())
                 .spawn(move || {
-                    if let Err(e) = wusel_ipc::serve(driver, events, notices, &socket_path) {
+                    if let Err(e) = wusel_ipc::serve(driver, events, notices, listener) {
                         tracing::warn!(
                             path = %socket_path.display(), error = %e,
                             "the status socket is not being served; \
@@ -910,6 +934,22 @@ fn cmd_serve(account: &Account, socket: Option<&str>) -> anyhow::Result<()> {
     // even a failure during setup cannot leave us orphaned on notify_push.
     spawn_parent_death_watchdog();
 
+    // Bind the IPC socket *now*, before the slow start-up below. A bound Unix
+    // socket already listens, so the File Provider extension — which the system
+    // may launch and point at us at any instant — connects into the kernel
+    // backlog instead of meeting a refused connect while we load credentials and
+    // build the DAV client, the push connection and the engine. Its request then
+    // waits, harmlessly, until we start accepting at the end. Binding here (not
+    // after the setup) is what closes the start-up/restart race that otherwise
+    // left Finder wedged at "Preparing".
+    let socket_path = match socket {
+        Some(s) => std::path::PathBuf::from(s),
+        None => default_ipc_socket(account),
+    };
+    let listener = wusel_ipc::bind(&socket_path)
+        .with_context(|| format!("could not bind the IPC socket at {}", socket_path.display()))?;
+    println!("wusel serve: listening on {}", socket_path.display());
+
     // Credentials up front: the notice pipeline's connection-health tracker needs
     // the server URL, and the push connection needs the whole set.
     let creds = wusel_core::credentials::load(&account.credentials_path(), account.name())
@@ -930,6 +970,11 @@ fn cmd_serve(account: &Account, socket: Option<&str>) -> anyhow::Result<()> {
         &creds.server,
         std::sync::Arc::clone(&desktop) as std::sync::Arc<dyn wusel_core::desktop::Desktop>,
     ));
+    // Let the socket answer the `reachable` op from the same tracker (the wiring
+    // is circular — the tracker took `desktop` as its notifier just above — so it
+    // is attached now rather than at construction). The File Provider consults it
+    // before a reimport.
+    desktop.set_reachability(std::sync::Arc::clone(&health));
 
     // The same creds → http → dav → state → provider steps `cmd_mount` runs,
     // already factored out for pin/unpin — reuse it rather than replicate, now
@@ -967,21 +1012,13 @@ fn cmd_serve(account: &Account, socket: Option<&str>) -> anyhow::Result<()> {
         .context("could not start the engine substrate")?;
     let driver = std::sync::Arc::new(driver);
 
-    let socket_path = match socket {
-        Some(s) => std::path::PathBuf::from(s),
-        None => default_ipc_socket(account),
-    };
-    if let Some(dir) = socket_path.parent() {
-        std::fs::create_dir_all(dir)
-            .with_context(|| format!("could not create the socket directory {}", dir.display()))?;
-    }
-
-    println!("wusel serve: listening on {}", socket_path.display());
+    // The engine is up; start accepting and drain whatever has queued on the
+    // socket we bound at the top.
     println!(
         "(read: stat, enumerate, fetch; write: create, write, publish, remove, move, setattr; \
          plus watch for change signals and notices for user notifications)"
     );
-    wusel_ipc::serve(driver, events, desktop, &socket_path)
+    wusel_ipc::serve(driver, events, desktop, listener)
         .with_context(|| format!("could not serve on {}", socket_path.display()))?;
     Ok(())
 }
@@ -1001,7 +1038,11 @@ fn spawn_parent_death_watchdog() {
     let _ = std::thread::Builder::new()
         .name("wusel-serve-parent-watch".into())
         .spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_secs(2));
+            // Poll briskly: the socket this serve holds is the one the next agent
+            // must bind, so a slow reap keeps the successor from starting. Half a
+            // second is imperceptible energy-wise and closes the orphan window
+            // that a two-second poll left wide enough to notice by hand.
+            std::thread::sleep(std::time::Duration::from_millis(500));
             // SAFETY: as above.
             if unsafe { libc::getppid() } != orig {
                 tracing::info!("the agent that spawned serve exited; shutting down");

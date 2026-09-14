@@ -173,14 +173,9 @@ fn browses_and_reads_over_the_socket() {
     // Serve on a temp Unix socket in the background. A short path keeps well
     // inside the 108-byte sun_path limit.
     let socket = std::env::temp_dir().join(format!("wusel-ipc-{}.sock", std::process::id()));
-    let socket_for_thread = socket.clone();
+    let listener = wusel_ipc::bind(&socket).expect("bind the test socket");
     std::thread::spawn(move || {
-        let _ = wusel_ipc::serve(
-            driver,
-            events,
-            wusel_ipc::IpcDesktop::new(),
-            &socket_for_thread,
-        );
+        let _ = wusel_ipc::serve(driver, events, wusel_ipc::IpcDesktop::new(), listener);
     });
 
     // Connect, retrying until the background thread has bound the socket.

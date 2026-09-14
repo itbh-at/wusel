@@ -215,11 +215,17 @@ enum Response: Decodable {
     /// A pulled batch of changes at or after the requested anchor, with the head
     /// sequence to anchor from next.
     case changes(seq: UInt64, changes: [ChangeItem])
-    /// A pushed, already-localized user notice on a `notices` connection.
-    case notice(severity: Severity, title: String, body: String)
+    /// A pushed, already-localized user notice on a `notices` connection. `kind`
+    /// is the notice's stable id (e.g. `"connection-restored"`), which the agent
+    /// acts on beyond just showing the banner.
+    case notice(kind: String, severity: Severity, title: String, body: String)
+    /// The reply to `reachable`: whether the daemon currently has positive
+    /// evidence the server is reachable.
+    case reachable(Bool)
 
     private enum CodingKeys: String, CodingKey {
-        case kind, len, error, change, path, seq, changes, severity, title, body
+        case kind, len, error, change, path, seq, changes, severity, title, body, reachable
+        case noticeKind = "notice_kind"
     }
 
     init(from decoder: Decoder) throws {
@@ -248,9 +254,12 @@ enum Response: Decodable {
                 changes: try c.decode([ChangeItem].self, forKey: .changes))
         case "notice":
             self = .notice(
+                kind: try c.decode(String.self, forKey: .noticeKind),
                 severity: try c.decode(Severity.self, forKey: .severity),
                 title: try c.decode(String.self, forKey: .title),
                 body: try c.decode(String.self, forKey: .body))
+        case "reachable":
+            self = .reachable(try c.decode(Bool.self, forKey: .reachable))
         default:
             throw WireError.badRequest
         }

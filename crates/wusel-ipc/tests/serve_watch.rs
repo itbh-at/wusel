@@ -79,14 +79,14 @@ fn a_server_change_reaches_a_watch_client() {
     driver.call(ObjectId(ROOT_INODE), Intent::Enumerate);
 
     let socket = std::env::temp_dir().join(format!("wusel-ipc-watch-{}.sock", std::process::id()));
-    let socket_for_thread = socket.clone();
+    let listener = wusel_ipc::bind(&socket).expect("bind the test socket");
     let driver_for_thread = Arc::clone(&driver);
     std::thread::spawn(move || {
         let _ = wusel_ipc::serve(
             driver_for_thread,
             events,
             wusel_ipc::IpcDesktop::new(),
-            &socket_for_thread,
+            listener,
         );
     });
     // Wait for the socket to appear before connecting.

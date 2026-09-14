@@ -14,6 +14,33 @@ the RPM is terse because a package changelog is, this page has room to say why.
 The format follows https://keepachangelog.com/en/1.1.0/[Keep a Changelog]; the
 project uses https://semver.org/[Semantic Versioning].
 
+== 0.4.1 — 2026-09-14
+
+=== Added
+
+* **`wusel doctor` reports the notify_push connection** and names its failure, so
+  a push endpoint that never connects is visible instead of silent.
+
+=== Fixed
+
+* **A broken push endpoint no longer says the server is offline.** Reachability is
+  judged by the HTTP server answering, not by the notify_push WebSocket: a server
+  that answers every request but advertises an unreachable push endpoint stays
+  "connected", while a genuinely unreachable server is still announced as lost.
+
+* **Re-creating a folder that already exists succeeds** — MKCOL is idempotent,
+  instead of failing on the second attempt.
+
+* **Pending uploads recover cleanly at start-up.** They are reconciled in
+  synchronous mode too, and an upload whose buffer is gone is resolved rather than
+  retried forever.
+
+* **Experimental macOS:** opened folders are reconciled when the connection comes
+  back; the File Provider reimport is skipped while the server is unreachable; the
+  working set is re-signalled when the change watch reconnects; the engine-connect
+  retry is bounded; and the socket is bound before the engine starts, so the
+  extension never meets a refused connection.
+
 == 0.4.0 — 2026-09-07
 
 === Added

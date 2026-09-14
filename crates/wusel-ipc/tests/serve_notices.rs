@@ -59,10 +59,10 @@ fn a_notice_reaches_a_notices_client() {
 
     let socket =
         std::env::temp_dir().join(format!("wusel-ipc-notices-{}.sock", std::process::id()));
-    let socket_for_thread = socket.clone();
+    let listener = wusel_ipc::bind(&socket).expect("bind the test socket");
     let desktop_for_serve = Arc::clone(&desktop);
     std::thread::spawn(move || {
-        let _ = wusel_ipc::serve(driver, events, desktop_for_serve, &socket_for_thread);
+        let _ = wusel_ipc::serve(driver, events, desktop_for_serve, listener);
     });
     let up = Instant::now();
     while !socket.exists() {

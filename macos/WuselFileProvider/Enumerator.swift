@@ -129,8 +129,22 @@ final class Enumerator: NSObject, NSFileProviderEnumerator {
                 // root-wide reimport once flooded items with "!"); the low new head
                 // is still adopted below, so this fires once per reset, not a loop.
                 if head < since {
-                    Engine.log("change log reset (head=\(head) < since=\(since)) — reconciling opened folders")
-                    Self.reconcileOpenedFolders(domain: self.domain)
+                    // The reimport below deletes and re-creates the folder subtree
+                    // in the system's replica; the re-create has to reach the
+                    // server. Run against an unreachable one it fails with
+                    // `.serverUnreachable`, and the folder is left wedged with a
+                    // stuck upload error — a "!" that only a domain reset clears
+                    // (confirmed by reproduction). So gate on reachability: skip
+                    // when the server is not known reachable, and let the agent
+                    // re-run the reconcile once the connection is restored. A
+                    // failed query reads as "not reachable" — do not risk it.
+                    if (try? client.reachable()) == true {
+                        Engine.log("change log reset (head=\(head) < since=\(since)) — reconciling opened folders")
+                        KnownContainers.reconcileOpenedFolders(domain: self.domain, log: Engine.log)
+                    } else {
+                        Engine.log(
+                            "change log reset (head=\(head) < since=\(since)) — server unreachable, deferring reconcile")
+                    }
                 }
                 // Report a change only for a folder the user has opened, and only
                 // for files. An unopened folder must not be seeded (that shows it
@@ -262,67 +276,6 @@ final class Enumerator: NSObject, NSFileProviderEnumerator {
         return order.compactMap { kept[$0] }
     }
 
-    /// Force the system to re-import — and so reconcile — the folders the user has
-    /// opened, after a change-log reset lost the deltas that would have updated
-    /// them (see the caller in `enumerateChanges`).
-    ///
-    /// Scoped deliberately: the account root is skipped (a reimport below root
-    /// re-scans the whole tree and once flooded items with "!"), and a folder
-    /// nested under another opened folder is dropped because reimporting the
-    /// ancestor already covers it — so each opened subtree is re-scanned once.
-    private static func reconcileOpenedFolders(domain: NSFileProviderDomain) {
-        guard let manager = NSFileProviderManager(for: domain) else { return }
-        let opened = KnownContainers.snapshot().filter { $0 != "/" }
-        let topmost = opened.filter { path in
-            !opened.contains { other in other != path && path.hasPrefix(other + "/") }
-        }
-        for path in topmost {
-            // `reimportItems(below:)` is Void-returning and non-throwing; it
-            // reports outcomes through the completion handler.
-            manager.reimportItems(below: ItemMapping.identifier(forPath: path)) { error in
-                if let error = error {
-                    Engine.log("reconcile: reimport(\(path)) failed: \(error.localizedDescription)")
-                }
-            }
-        }
-    }
-}
-
-/// The set of container paths the user has actually opened (Finder called
-/// `enumerateItems` on them). Live change updates are limited to these, so an
-/// unopened folder is never seeded with a partial replica. Backed by a file in
-/// the App Group container (the extension is short-lived); the agent clears it on
-/// a domain reset, matching Finder's freshly-emptied replica.
-enum KnownContainers {
-    static let filename = "known-containers"
-    private static let lock = NSLock()
-
-    private static var url: URL? {
-        SharedPaths.containerURL?.appendingPathComponent(filename)
-    }
-
-    static func remember(_ path: String) {
-        guard path.hasPrefix("/"), let url = url else { return }
-        lock.lock()
-        defer { lock.unlock() }
-        var set = read(url)
-        guard set.insert(path).inserted else { return }
-        try? Data((set.joined(separator: "\n") + "\n").utf8).write(to: url)
-    }
-
-    static func snapshot() -> Set<String> {
-        guard let url = url else { return [] }
-        lock.lock()
-        defer { lock.unlock() }
-        return read(url)
-    }
-
-    private static func read(_ url: URL) -> Set<String> {
-        guard let data = try? Data(contentsOf: url),
-            let text = String(data: data, encoding: .utf8)
-        else { return [] }
-        return Set(text.split(separator: "\n").map(String.init))
-    }
 }
 
 /// Paths the user just pinned or unpinned via the context menu, awaiting a Finder
