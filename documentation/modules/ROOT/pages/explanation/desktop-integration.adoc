@@ -171,7 +171,7 @@ listing, a content read, an upload and the notify_push discovery each learn it
 separately, and each would notify separately. So the answer lives in **one**
 place, `health::Reachability` in `wusel-core`, and every request reports its
 outcome to it — `WebDavClient` has a single private `send` for exactly this
-reason, so a new call site cannot forget. Three rules keep thousands of events
+reason, so a new call site cannot forget. Four rules keep thousands of events
 down to one notification:
 
 * *Only transport failures count* (`Error::is_transport`): no answer at all —
@@ -186,6 +186,12 @@ down to one notification:
   reaching this layer is rare to begin with.)
 * *One notice per incident*, and the first success both clears the state and —
   only if the user was told — announces the recovery.
+* *A flapping link is not narrated wobble by wobble.* For five minutes after a
+  recovery notice, a new outage changes the file manager's status but earns no
+  toast; it is announced only if it is still going on when those five minutes
+  are up. A long outage is never lost, a short one right after a recovery is
+  never news. This is what keeps a train ride, or a bad wireless cell, from
+  producing the one stream of notifications a user reliably turns off for good.
 
 *The heartbeat.* An idle mount issues no requests, and the interesting moment
 during an outage is precisely the one nobody is asking about: the recovery. The
@@ -196,6 +202,18 @@ nobody is touching therefore still learns within about half a minute that the
 server went away, and that it is back. Making discovery retry at all also fixes
 a defect of its own: it used to happen exactly once, so a daemon that started
 before the network had DNS ran without push until the next restart.
+
+The reconnect loop does not report its *own* failures, though. The WebSocket
+endpoint is a URL the server advertises, and it is wrong more often than the
+server is down — a loopback address in notify_push's `base_endpoint`, a reverse
+proxy that does not pass WebSocket upgrades — while every plain request sails
+through. Counted as failures, that made a mount with a broken endpoint announce
+"connection lost" after every successful listing, forever. So on a socket
+failure the loop judges the server the one way that cannot lie about it, a
+plain HTTP request, and reports only that outcome. After three socket failures
+in a row with the server answering, it writes the endpoint off: one warning in
+the log, TTL polling from then on, and a retry every five minutes in case the
+admin fixes it. `wusel doctor` names the cause.
 
 == File-manager integration (`libcloudproviders`)
 

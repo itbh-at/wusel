@@ -220,6 +220,18 @@ exists to avoid.
 
 == Later
 
+* ⬜ *OIDC bearer tokens instead of an app password*
+  (https://github.com/itbh-at/wusel/issues/40[wusel#40]). Where Nextcloud
+  delegates login to an external identity provider (`user_oidc`), wusel could
+  obtain access and refresh tokens from that provider itself — the Device
+  Authorization Grant (RFC 8628) suits a daemon — and send the access token as
+  `Authorization: Bearer` to WebDAV and OCS. Nextcloud accepts that once
+  _Check Bearer token on API and WebDav requests_ is enabled for the provider;
+  the user must already exist, and the token's audience must match the
+  provider's client ID. The gain is central token lifetime and revocation at the
+  identity provider; today an app password outlives a user disabled there. Not
+  scheduled: it needs the 401 state above and an auth layer behind the WebDAV
+  client, which still hard-codes Basic auth at every call.
 * ⬜ *KDE — the same feature set*: the cloud folder via KIO, per-file overlays via
   a C++ `KOverlayIconPlugin` speaking the same status socket, pin/unpin
   via KDE ServiceMenus, a Baloo config exclude, and a KRunner/Milou search

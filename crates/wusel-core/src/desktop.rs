@@ -143,8 +143,10 @@ impl Notice {
     /// Stable, unlocalized identifier for this notice's kind — the `"kind"` field
     /// in [`Notice::to_json`]. **A public contract** — keep these strings stable,
     /// like the status protocol's own `state` values: a notify-hook script may
-    /// already be matching on them.
-    fn kind(&self) -> &'static str {
+    /// already be matching on them, and the socket frontend forwards this id so
+    /// the agent can act on a notice (a restored connection re-drives the
+    /// reconcile) without parsing the translated text.
+    pub fn kind(&self) -> &'static str {
         match self {
             Notice::ConflictCopy { .. } => "conflict-copy",
             Notice::UploadFailed { .. } => "upload-failed",

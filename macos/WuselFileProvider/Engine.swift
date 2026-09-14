@@ -10,22 +10,30 @@ import Foundation
 enum Engine {
     static func connect() throws -> SocketClient {
         let path = SharedPaths.socketPath
-        // The engine may be momentarily absent — serve is still binding at
-        // launch, or it was just restarted (a `wusel serve` the watchdog reaped
-        // with its agent, an Xcode ⌘R). Giving up on the first refused connect
-        // fails the enumeration, and the system then marks every item with a
-        // "!". Retry briefly so a transient gap is invisible; a genuinely-down
-        // backend still errors after the window.
+        // The engine may be momentarily absent — serve was just restarted (the
+        // supervisor respawns it with backoff; an Xcode ⌘R), or the socket is
+        // mid-rebind. Serve now *binds before* its slow start-up, so a merely
+        // starting engine no longer refuses us — the connect waits in the
+        // backlog — but a restart still opens a gap. Retry with exponential
+        // backoff up to a deadline so a transient gap is invisible; a genuinely
+        // down backend then errors as `.serverUnreachable` (which Finder retries)
+        // instead of either giving up on the first refusal or blocking the
+        // callback forever.
+        let deadline = Date().addingTimeInterval(10)
+        var delay: TimeInterval = 0.1
         var lastError: Error?
-        for attempt in 0..<6 {
+        while true {
             do {
                 return try SocketClient(socketPath: path)
             } catch {
                 lastError = error
-                if attempt < 5 { Thread.sleep(forTimeInterval: 0.5) }
+                let remaining = deadline.timeIntervalSinceNow
+                if remaining <= 0 { break }
+                Thread.sleep(forTimeInterval: min(delay, remaining))
+                delay = min(delay * 2, 1.0)
             }
         }
-        log("connect failed after retries (\(path)): \(lastError.map { "\($0)" } ?? "unknown")")
+        log("connect failed, retried to deadline (\(path)): \(lastError.map { "\($0)" } ?? "unknown")")
         throw lastError ?? SocketClient.SocketError.connect(0)
     }
 

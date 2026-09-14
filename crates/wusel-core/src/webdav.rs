@@ -425,18 +425,29 @@ impl WebDavClient {
     }
 
     /// Creates a collection (directory) with `MKCOL`.
+    ///
+    /// Idempotent: a `MKCOL` on a collection that already exists answers `405`
+    /// (RFC 4918 — the resource is already there), which is success for us, not a
+    /// failure. Creating a directory that exists is a no-op, and treating it as an
+    /// error is what wedged a folder the macOS File Provider re-created during a
+    /// reimport (it re-runs `create-item` on folders already on the server) — the
+    /// failed create left a stuck upload error that only a domain reset cleared.
     pub async fn mkcol(&self, path: &str) -> Result<()> {
         tracing::debug!(%path, "MKCOL");
-        self.send(
-            self.http
-                .request(
-                    reqwest::Method::from_bytes(b"MKCOL").unwrap(),
-                    self.url_for(path, true)?,
-                )
-                .basic_auth(&self.login_name, Some(&self.app_password)),
-        )
-        .await?
-        .error_for_status()?;
+        let resp = self
+            .send(
+                self.http
+                    .request(
+                        reqwest::Method::from_bytes(b"MKCOL").unwrap(),
+                        self.url_for(path, true)?,
+                    )
+                    .basic_auth(&self.login_name, Some(&self.app_password)),
+            )
+            .await?;
+        if resp.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED {
+            return Ok(());
+        }
+        resp.error_for_status()?;
         Ok(())
     }
 

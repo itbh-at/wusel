@@ -17,8 +17,9 @@
 //!   [`Driver::resolve`].
 //! * [`wire`] — the framed request/response protocol (**provisional**; see the
 //!   module docs).
-//! * [`serve`] — a blocking accept loop that binds a `UnixListener` and drives
-//!   each connection through the driver.
+//! * [`bind`] then [`serve`] — bind the `UnixListener` up front (so a client's
+//!   connect is never refused while the engine is still starting), then run a
+//!   blocking accept loop that drives each connection through the driver.
 //!
 //! The protocol covers the **read path** — `stat`, `enumerate`, `fetch` — the
 //! **write path** — `create`, `write`, `publish`, `remove`, `move`, `setattr` —
@@ -162,31 +163,26 @@ fn peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
     Ok(uid)
 }
 
-/// Bind `socket_path` and serve intent requests over it until the listener
-/// fails. Blocks the calling thread; each accepted connection is handled on its
-/// own thread, so several clients (or a client with several connections) are
-/// served concurrently through the shared [`Driver`].
+/// Bind `socket_path` and return a listening socket, ready to hand to [`serve`].
 ///
-/// The socket is **private to the user running the daemon**, on three counts:
-/// its directory is proved to be ours and 0700 (see [`prepare_socket_dir`]), the
-/// socket itself is 0600, and every accepted connection's peer credentials must
-/// name our own uid. The last is the one that actually holds — file permissions
-/// depend on where the caller put the socket, `SO_PEERCRED` does not, so a
-/// `--socket` pointed somewhere unfortunate is still not a way in.
+/// Split from [`serve`] so the daemon can bind **before** its slow start-up —
+/// credentials, DAV, the push connection, the engine — has run. A bound Unix
+/// socket is already *listening*: a client's `connect` lands in the kernel
+/// backlog and succeeds at once, even while nothing is calling `accept` yet. The
+/// File Provider extension, which the system may launch and point at us at any
+/// instant, therefore never meets a refused connect during that window — it used
+/// to, then give up after a few retries and leave every item wedged at
+/// "Preparing". [`serve`] drains the backlog once the engine is ready.
 ///
-/// A stale socket file from a previous run is removed first, so a rebind after
-/// an unclean exit does not fail with `EADDRINUSE`.
+/// The socket is **private to the user running the daemon**: its directory is
+/// proved to be ours and 0700 (see [`prepare_socket_dir`]) and the socket itself
+/// is narrowed to 0600. A stale socket file from an unclean exit is removed
+/// first, so the rebind does not fail with `EADDRINUSE`.
 ///
 /// # Errors
 /// If the socket's directory is not private to this user, or the socket cannot
-/// be bound. A failure on an individual connection is logged and does not stop
-/// the loop.
-pub fn serve(
-    driver: Arc<Driver>,
-    events: Arc<Events>,
-    desktop: Arc<IpcDesktop>,
-    socket_path: &Path,
-) -> std::io::Result<()> {
+/// be bound.
+pub fn bind(socket_path: &Path) -> std::io::Result<UnixListener> {
     if let Some(dir) = socket_path.parent() {
         prepare_socket_dir(dir)?;
     }
@@ -202,7 +198,27 @@ pub fn serve(
     // worse here — it is process-global, and this runs inside a daemon whose
     // other threads are creating files of their own.
     std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(listener)
+}
 
+/// Serve intent requests over an already-bound `listener` (from [`bind`]) until
+/// it fails. Blocks the calling thread; each accepted connection is handled on
+/// its own thread, so several clients (or a client with several connections) are
+/// served concurrently through the shared [`Driver`].
+///
+/// Every accepted connection's peer credentials must name our own uid — file
+/// permissions depend on where the caller put the socket, `SO_PEERCRED` does
+/// not, so a `--socket` pointed somewhere unfortunate is still not a way in.
+///
+/// # Errors
+/// A failure on an individual connection is logged and does not stop the loop;
+/// the `Err` return is reserved for the listener itself failing.
+pub fn serve(
+    driver: Arc<Driver>,
+    events: Arc<Events>,
+    desktop: Arc<IpcDesktop>,
+    listener: UnixListener,
+) -> std::io::Result<()> {
     // SAFETY: `geteuid` has no preconditions and cannot fail.
     let me = unsafe { libc::geteuid() };
     let live = Arc::new(AtomicUsize::new(0));
@@ -316,6 +332,21 @@ fn handle_connection(
             writer.flush()?;
             continue;
         }
+        // `reachable` answers "is the server reachable right now?" from the
+        // daemon's health tracker. The macOS File Provider asks before a
+        // destructive reimport: a reimport that races an unreachable server
+        // wedges the folder with a stuck upload error, so it must skip when this
+        // says no. Answered here (not in `dispatch`) because the tracker lives on
+        // the desktop backend.
+        if request.op == "reachable" {
+            let resp = Response::reachable(desktop.reachable_now());
+            wire::write_frame(
+                &mut writer,
+                &resp.to_frame().map_err(std::io::Error::other)?,
+            )?;
+            writer.flush()?;
+            continue;
+        }
         // `changes` is the pull twin of `watch`: a replicated frontend replays the
         // log from its sync anchor instead of holding a live stream open. Answered
         // here rather than in `dispatch` because the log lives in `events`.
@@ -386,7 +417,7 @@ fn stream_notices(desktop: &IpcDesktop, writer: &mut BufWriter<UnixStream>) -> s
     use std::io::Write;
     let feed = desktop.subscribe();
     for notice in feed {
-        let resp = Response::notice(notice.severity, notice.title, notice.body);
+        let resp = Response::notice(notice.kind, notice.severity, notice.title, notice.body);
         wire::write_frame(writer, &resp.to_frame().map_err(std::io::Error::other)?)?;
         writer.flush()?;
     }

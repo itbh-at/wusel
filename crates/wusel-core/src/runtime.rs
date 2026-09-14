@@ -684,28 +684,35 @@ impl Substrate {
             done_tx.clone(),
         ));
 
-        // The asynchronous uploader: resume anything owed at start-up, and retry
-        // transient failures until they land. It only nudges the decider (the
-        // durable record is the source of truth), so it needs the sender and the
-        // database path, nothing more. Synchronous write-back has no owed uploads
-        // to chase — `flush` waited for each — so it runs no uploader.
-        let uploader_shutdown = if ctx.async_upload {
+        // The uploader: resume anything owed at start-up, and (asynchronously)
+        // retry transient failures until they land. It only nudges the decider
+        // (the durable record is the source of truth), so it needs the sender and
+        // the database path; the scratch dir lets it spot a pending upload whose
+        // buffer is gone and resolve it rather than resume it forever.
+        //
+        // It runs in *both* modes, but differently. Synchronous write-back has no
+        // owed uploads of its own to chase — `flush` waited for each — yet a
+        // *previous* run (or an old database) can still leave stuck rows behind,
+        // and nothing else would ever revisit them. So sync mode makes one
+        // start-up reconciliation pass and stops; async mode then stays, retrying
+        // on a growing interval.
+        let run_once = !ctx.async_upload;
+        let uploader_shutdown = {
             let (uploader_shutdown, up_rx) = channel::<()>();
             let up_to_fsm = to_fsm.clone();
             let up_db = ctx.db_path.clone();
+            let up_scratch = ctx.scratch_dir.clone();
             let up_done = done_tx.clone();
             threads.push(
                 std::thread::Builder::new()
                     .name("wusel-uploader".into())
                     .spawn(move || {
                         let _done = up_done;
-                        uploader_loop(&up_to_fsm, &up_db, &up_rx);
+                        uploader_loop(&up_to_fsm, &up_db, &up_scratch, run_once, &up_rx);
                     })
                     .expect("spawn the uploader thread"),
             );
             Some(uploader_shutdown)
-        } else {
-            None
         };
 
         Ok((
@@ -874,7 +881,7 @@ impl Drop for Substrate {
     }
 }
 
-/// The asynchronous uploader.
+/// The uploader.
 ///
 /// It never uploads anything itself — the durable `pending_uploads` records are
 /// the source of truth, and the decider owns the buffers — so all it does is
@@ -882,10 +889,19 @@ impl Drop for Substrate {
 /// resume what a crash or a shutdown left behind, and then on a growing interval
 /// to retry transient failures until they land.
 ///
-/// The interval doubles (to a cap) while work remains and resets once nothing is
-/// owed, so a server that keeps refusing is not hammered while a passing blip is
-/// retried soon.
-fn uploader_loop(to_fsm: &Sender<Event>, db_path: &std::path::Path, shutdown: &Receiver<()>) {
+/// With `run_once` it makes exactly that start-up pass and returns — synchronous
+/// write-back wants no background retry loop, but a previous run's stuck rows
+/// still have to be revisited once. Otherwise it stays and retries: the interval
+/// doubles (to a cap) while work remains and resets once nothing is owed, so a
+/// server that keeps refusing is not hammered while a passing blip is retried
+/// soon.
+fn uploader_loop(
+    to_fsm: &Sender<Event>,
+    db_path: &std::path::Path,
+    scratch_dir: &std::path::Path,
+    run_once: bool,
+    shutdown: &Receiver<()>,
+) {
     use std::sync::mpsc::RecvTimeoutError;
 
     let base = std::env::var("WUSEL_UPLOAD_RETRY_SECS")
@@ -922,18 +938,29 @@ fn uploader_loop(to_fsm: &Sender<Event>, db_path: &std::path::Path, shutdown: &R
                 for p in pending {
                     // `error` records are parked for the user; only `pending`
                     // (and in-flight, which the decider dedups) are retried.
-                    if matches!(p.state, crate::state::UploadState::Pending) {
-                        owed += 1;
-                        if to_fsm
-                            .send(Event::ResumeUpload {
-                                object: p.object,
-                                base_etag: p.base_etag,
-                                mtime: p.mtime,
-                            })
-                            .is_err()
-                        {
-                            return; // the decider is gone
-                        }
+                    if !matches!(p.state, crate::state::UploadState::Pending) {
+                        continue;
+                    }
+                    // A resumable upload needs its buffer — the durable bytes the
+                    // publish sends. If that file is gone (a database from before
+                    // the delete-cascade fix, or a scratch dir cleared under us),
+                    // the upload can never complete; resuming it every pass would
+                    // leave the row `pending` forever with nothing to send. Resolve
+                    // it instead of nudging the decider into a doomed publish.
+                    if !scratch_dir.join(p.object.0.to_string()).exists() {
+                        resolve_lost_buffer(&db, &p);
+                        continue;
+                    }
+                    owed += 1;
+                    if to_fsm
+                        .send(Event::ResumeUpload {
+                            object: p.object,
+                            base_etag: p.base_etag,
+                            mtime: p.mtime,
+                        })
+                        .is_err()
+                    {
+                        return; // the decider is gone
                     }
                 }
                 owed
@@ -944,6 +971,12 @@ fn uploader_loop(to_fsm: &Sender<Event>, db_path: &std::path::Path, shutdown: &R
             }
         };
 
+        // Synchronous mode wanted just this one reconciliation pass, not a
+        // standing retry loop.
+        if run_once {
+            return;
+        }
+
         interval = if owed == 0 {
             base
         } else {
@@ -953,6 +986,38 @@ fn uploader_loop(to_fsm: &Sender<Event>, db_path: &std::path::Path, shutdown: &R
             Err(RecvTimeoutError::Timeout) => {}
             // Signalled, or the substrate dropped its end: stop.
             Ok(()) | Err(RecvTimeoutError::Disconnected) => return,
+        }
+    }
+}
+
+/// Resolve a pending upload whose buffer bytes are gone, so it is not resumed on
+/// every pass forever.
+///
+/// A create (`base_etag` empty) whose node already carries a server etag has
+/// demonstrably landed — the row is a stale leftover, so clear it (this is the
+/// case that leaves the old two-row phantom). Anything else cannot be confirmed
+/// and its local bytes are lost, so park it as `error` rather than hide it: a
+/// dropped edit is a real failure the user should see, `wusel status` surfaces
+/// it, and a re-save starts a fresh, complete upload. Best-effort — a database
+/// error here just leaves the row for the next pass.
+fn resolve_lost_buffer(db: &StateDb, p: &crate::state::PendingUpload) {
+    let landed = p.base_etag.is_empty()
+        && matches!(db.node_by_inode(p.object.0), Ok(Some(n)) if !n.etag.is_empty());
+    let done = if landed {
+        db.clear_pending_upload(p.object)
+            .map(|()| "cleared a stale pending upload (already on the server)")
+    } else {
+        db.set_upload_state(
+            p.object,
+            crate::state::UploadState::Error,
+            Some("the local copy to upload is gone"),
+        )
+        .map(|()| "parked a pending upload whose local bytes are gone")
+    };
+    match done {
+        Ok(msg) => tracing::info!(object = p.object.0, "uploader: {msg}"),
+        Err(e) => {
+            tracing::debug!(%e, object = p.object.0, "uploader: could not resolve a lost-buffer upload")
         }
     }
 }
@@ -2383,12 +2448,127 @@ impl Worker {
 
 #[cfg(test)]
 mod tests {
-    use super::{withdraw_write, Metered, Worker};
+    use super::{resolve_lost_buffer, uploader_loop, withdraw_write, Event, Metered, Worker};
     use crate::desktop::{Desktop, Notice, Status};
     use crate::model::is_writable;
+    use crate::state::{StateDb, UploadState, ROOT_INODE};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
-    use wusel_fsm::{Completion, Failure};
+    use wusel_fsm::{Completion, Failure, ObjectId};
+
+    /// Synchronous write-back runs no standing uploader, but a previous run's
+    /// stuck rows must still be revisited once at start-up. In `run_once` mode the
+    /// uploader must therefore make exactly one pass — resuming an owed upload
+    /// whose buffer is present — and return on its own, without a shutdown signal.
+    #[test]
+    fn run_once_resumes_owed_uploads_then_returns() {
+        use std::sync::mpsc::channel;
+
+        let base = std::env::temp_dir().join(format!("wusel-uploader-once-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let db_path = base.join("state.sqlite");
+        let scratch = base.join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+
+        // A resumable owed upload: a node, a pending row, and its buffer on disk.
+        let inode = {
+            let mut db = StateDb::open(&db_path).unwrap();
+            let node = db.insert_local_file(ROOT_INODE, "Report.odt").unwrap();
+            db.mark_pending_upload(ObjectId(node.inode), "Report.odt", "", None)
+                .unwrap();
+            node.inode
+        }; // drop the connection before the loop reopens the file
+        std::fs::write(scratch.join(inode.to_string()), b"bytes to upload").unwrap();
+
+        let (to_fsm, from_uploader) = channel::<Event>();
+        let (_shutdown_tx, shutdown_rx) = channel::<()>();
+
+        // Must return on its own (no shutdown signalled), having resumed the row.
+        uploader_loop(&to_fsm, &db_path, &scratch, true, &shutdown_rx);
+
+        let ev = from_uploader
+            .try_recv()
+            .expect("the owed upload was resumed");
+        assert!(
+            matches!(ev, Event::ResumeUpload { object, .. } if object == ObjectId(inode)),
+            "sync-mode start-up must resume the stuck pending upload"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A pending upload whose buffer is gone but which the node proves already
+    /// reached the server (a create with a server etag) is a stale leftover —
+    /// exactly the phantom two rows an old database kept. It must be cleared, not
+    /// resumed for ever.
+    #[test]
+    fn a_landed_create_with_a_lost_buffer_is_cleared() {
+        let mut db = StateDb::open_in_memory().unwrap();
+        let node = db.insert_local_file(ROOT_INODE, "Invoice.pdf").unwrap();
+        // A server etag means the content is on the server.
+        db.set_etag_size(node.inode, "srv-etag", 10).unwrap();
+        // A create: `base_etag` empty ("must not exist yet").
+        db.mark_pending_upload(ObjectId(node.inode), "Invoice.pdf", "", None)
+            .unwrap();
+        let p = db.pending_upload(ObjectId(node.inode)).unwrap().unwrap();
+
+        resolve_lost_buffer(&db, &p);
+
+        assert!(
+            db.pending_upload(ObjectId(node.inode)).unwrap().is_none(),
+            "a create already on the server must be cleared, not left pending"
+        );
+    }
+
+    /// An edit whose buffer is gone cannot be confirmed to have landed — the
+    /// local change may be lost — so it is parked as `error` for the user rather
+    /// than silently dropped or resumed for ever.
+    #[test]
+    fn an_edit_with_a_lost_buffer_is_parked_as_error() {
+        let mut db = StateDb::open_in_memory().unwrap();
+        let node = db.insert_local_file(ROOT_INODE, "Draft.odt").unwrap();
+        db.set_etag_size(node.inode, "e1", 20).unwrap();
+        // An edit based on a known version: `base_etag` non-empty.
+        db.mark_pending_upload(ObjectId(node.inode), "Draft.odt", "e1", None)
+            .unwrap();
+        let p = db.pending_upload(ObjectId(node.inode)).unwrap().unwrap();
+
+        resolve_lost_buffer(&db, &p);
+
+        let row = db
+            .pending_upload(ObjectId(node.inode))
+            .unwrap()
+            .expect("the row is parked, not removed");
+        assert!(
+            matches!(row.state, UploadState::Error),
+            "an unconfirmable lost-buffer edit must be parked as error"
+        );
+    }
+
+    /// A never-uploaded create (no server etag) whose buffer is gone is real
+    /// local data loss — park it as `error` so the user sees it, rather than
+    /// clear it as if it had succeeded.
+    #[test]
+    fn a_never_uploaded_create_with_a_lost_buffer_is_parked_as_error() {
+        let mut db = StateDb::open_in_memory().unwrap();
+        let node = db.insert_local_file(ROOT_INODE, "New.txt").unwrap();
+        // No `set_etag_size`: the node never reached the server (etag empty).
+        db.mark_pending_upload(ObjectId(node.inode), "New.txt", "", None)
+            .unwrap();
+        let p = db.pending_upload(ObjectId(node.inode)).unwrap().unwrap();
+
+        resolve_lost_buffer(&db, &p);
+
+        let row = db
+            .pending_upload(ObjectId(node.inode))
+            .unwrap()
+            .expect("the row is parked, not removed");
+        assert!(
+            matches!(row.state, UploadState::Error),
+            "a create that never reached the server must be parked, not cleared"
+        );
+    }
 
     /// Withdrawing the write permission is what makes an outdated offline copy
     /// read-only, so it must actually leave the row non-writable — and the empty

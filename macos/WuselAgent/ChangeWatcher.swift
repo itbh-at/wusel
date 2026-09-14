@@ -40,10 +40,17 @@ final class ChangeWatcher {
         do {
             let client = try SocketClient(socketPath: SharedPaths.socketPath)
             try client.watch()
-            AgentLog.log("watch: subscribed to the change stream")
+            AgentLog.log("watch: subscribed — signal the working set to re-drive any stalled work")
+            // A fresh subscription means we just (re)connected, possibly across a
+            // serve restart during which Finder's in-flight operations stalled.
+            // Nudge the working set once now so the extension re-enumerates and
+            // re-drives what is pending, rather than waiting for the next
+            // server-side change to arrive.
+            signalWorkingSet()
             while !stopped, let change = try client.nextPush() {
                 if case .changed(_, let path) = change {
-                    signal(path: path)
+                    AgentLog.log("watch: change at \(path) -> signal working set")
+                    signalWorkingSet()
                 }
             }
         } catch {
@@ -55,13 +62,12 @@ final class ChangeWatcher {
         }
     }
 
-    /// A server-side change happened; nudge Finder's change channel. On macOS only
-    /// the working set drives change enumeration — a per-container signal is
-    /// ignored — so signal that. The extension's working-set enumerator reports
-    /// the delta, limited to folders the user has opened.
-    private func signal(path: String) {
+    /// Nudge Finder's change channel. On macOS only the working set drives change
+    /// enumeration — a per-container signal is ignored — so signal that. The
+    /// extension's working-set enumerator reports the delta, limited to folders
+    /// the user has opened.
+    private func signalWorkingSet() {
         guard let manager = NSFileProviderManager(for: domain) else { return }
-        AgentLog.log("watch: change at \(path) -> signal working set")
         manager.signalEnumerator(for: .workingSet) { _ in }
     }
 }

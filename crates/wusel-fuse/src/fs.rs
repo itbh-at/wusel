@@ -783,13 +783,18 @@ impl Drop for Teardown {
 /// [`Extras::on_ready`], which is the only place one is used.
 pub type OnReady = Box<dyn FnOnce(SubmitHandle, Arc<Mutex<Provider>>) -> Option<ExtraRoute> + Send>;
 
-/// What the daemon wires into a mount besides the engine itself — everything a
-/// *second* frontend on this one substrate needs.
+/// What the daemon wires into a mount besides the engine itself — what a
+/// *second* frontend on this one substrate needs, and what the diagnostics
+/// socket reports on the daemon's behalf.
 ///
-/// It is a struct rather than more parameters because both fields are about the
-/// same thing (the co-hosted IPC socket) and both are `None` for a plain mount.
+/// It is a struct rather than more parameters because every field is optional
+/// and all of them are `None` for a plain mount.
 #[derive(Default)]
 pub struct Extras {
+    /// The notify_push listener's state, for `wusel doctor`. The daemon owns
+    /// the listener; the mount only serves its snapshot over the diagnostics
+    /// socket (see [`crate::diag`]).
+    pub push: Option<Arc<wusel_core::push::PushStatus>>,
     /// Called once the substrate is up, with a handle onto its request path;
     /// whatever route it returns then receives answers whose id the mount does
     /// not hold (see [`ExtraRoute`]).
@@ -901,6 +906,7 @@ pub fn mount_with(
         wusel_core::config::diag_socket_for_mount(mountpoint),
         substrate.diag_handle(),
         Arc::clone(&replies),
+        extras.push,
     );
     let dirs = Arc::new(Mutex::new(DirStreams {
         streams: std::collections::HashMap::new(),

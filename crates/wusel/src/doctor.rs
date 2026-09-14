@@ -299,7 +299,8 @@ impl Report {
             Some(probe_logs(unit.as_deref(), &red))
         };
 
-        let findings = derive_findings(&daemon, &mount, &engine, &recheck, &config);
+        let mut findings = derive_findings(&daemon, &mount, &engine, &recheck, &config);
+        findings.extend(push_findings(&engine, &connectivity));
 
         Report {
             tool: Tool {
@@ -924,6 +925,121 @@ fn derive_findings(
     f
 }
 
+/// Findings about live updates — the notify_push connection — from the state
+/// the daemon serves.
+///
+/// Separate from [`derive_findings`] because it judges a different thing: not
+/// whether the mount is healthy, but whether the server side of instant
+/// updates is — which no probe from here can see, since a mount without push
+/// works exactly like one with it, only staler. It leans on the connectivity
+/// probe for the one distinction that matters: an endpoint that keeps failing
+/// while the server answers is a reverse-proxy problem, not a network one, and
+/// the advice is the opposite.
+fn push_findings(engine: &Engine, connectivity: &Connectivity) -> Vec<Finding> {
+    use wusel_core::diag::PushPhase;
+    let mut f = Vec::new();
+    let Some(push) = engine.report.as_ref().and_then(|r| r.push.as_ref()) else {
+        return f;
+    };
+    let last = push.last_error.as_deref().unwrap_or("no error recorded");
+    let endpoint = push.endpoint.as_deref().unwrap_or("<endpoint unknown>");
+    let (level, message) = match push.phase {
+        PushPhase::Connected => (
+            "PASS",
+            format!(
+                "live updates are connected (notify_push, up for {} s)",
+                push.since_secs
+            ),
+        ),
+        PushPhase::Unavailable => {
+            let why = match &push.last_error {
+                Some(e) => format!("the capability lookup was refused: {e}"),
+                None => "the server does not offer notify_push".to_string(),
+            };
+            (
+                "INFO",
+                format!("no live updates — {why}; changes are picked up by polling"),
+            )
+        }
+        PushPhase::Discovering if push.failures > 0 => (
+            "WARN",
+            format!(
+                "the capability lookup has failed {} time(s) and is being retried — last: {last}",
+                push.failures
+            ),
+        ),
+        PushPhase::Discovering => (
+            "INFO",
+            "still asking the server whether it offers notify_push".to_string(),
+        ),
+        PushPhase::Connecting | PushPhase::Reconnecting if push.failures > 0 => {
+            // The whole reason this finding exists. A server that answers on
+            // its port while its WebSocket endpoint does not is the reverse
+            // proxy nine times out of ten — and from the user's side that looks
+            // like a flaky network, which is what they would otherwise chase.
+            let hint = if endpoint_is_loopback(endpoint) {
+                // The server hands out an address that only the server itself
+                // can reach — the app's `base_endpoint` was never set to the
+                // public URL. No proxy will fix that; the setting will.
+                " The server advertises a loopback address, which only the server itself can \
+                 reach: notify_push's `base_endpoint` is not set to the public URL. On the \
+                 server, run `occ notify_push:setup`, or set it by hand with \
+                 `occ config:app:set notify_push base_endpoint --value https://<server>/push`."
+            } else if connectivity.tcp_reachable == Some(true) {
+                " The server itself answers, so this is almost always the reverse proxy in \
+                 front of Nextcloud not passing WebSocket upgrades through to notify_push — \
+                 run `occ notify_push:self-test` on the server. Until it is fixed the mount \
+                 falls back to polling."
+            } else {
+                ""
+            };
+            (
+                "WARN",
+                format!(
+                    "the notify_push endpoint {endpoint} cannot be held: {} failure(s) since \
+                     the last connection, last: {last}.{hint}",
+                    push.failures
+                ),
+            )
+        }
+        PushPhase::Connecting | PushPhase::Reconnecting => (
+            "INFO",
+            format!("reconnecting to {endpoint} after a clean close"),
+        ),
+        PushPhase::Stopped => (
+            "INFO",
+            match &push.last_error {
+                Some(e) => format!("the notify_push listener has stopped: {e}"),
+                None => "the notify_push listener has stopped".to_string(),
+            },
+        ),
+        PushPhase::Unknown => (
+            "INFO",
+            "the daemon reports a notify_push phase this doctor does not know — the two are \
+             different versions"
+                .to_string(),
+        ),
+    };
+    f.push(finding(level, "push", message));
+    f
+}
+
+/// Whether a WebSocket URL points at the machine it was served from —
+/// `ws://127.0.0.1:7867/ws`, `localhost`, `::1`. The classic notify_push
+/// misconfiguration: the app works on the server, so its self-test passes, and
+/// every client in the world is told to connect to itself.
+fn endpoint_is_loopback(endpoint: &str) -> bool {
+    let rest = endpoint.split("://").nth(1).unwrap_or(endpoint);
+    let authority = rest.split('/').next().unwrap_or(rest);
+    // `[::1]:7867` keeps its brackets; `host:port` loses the port.
+    let host = if let Some(bracketed) = authority.strip_prefix('[') {
+        bracketed.split(']').next().unwrap_or(bracketed)
+    } else {
+        authority.rsplit_once(':').map_or(authority, |(h, _)| h)
+    };
+    host == "localhost" || host == "::1" || host.starts_with("127.") || host == "0.0.0.0"
+}
+
 // --- Text rendering ---------------------------------------------------------
 
 impl Report {
@@ -1104,6 +1220,26 @@ impl Report {
             self.connectivity.server_host.as_deref(),
         );
         push_kv(&mut o, "detail", self.connectivity.detail.as_deref());
+
+        o.push_str(&section("PUSH (notify_push live updates, from the daemon)"));
+        match self.engine.report.as_ref().and_then(|r| r.push.as_ref()) {
+            Some(p) => {
+                o.push_str(&format!(
+                    "  phase={} since={} s connects={} failures={}\n",
+                    p.phase.as_str(),
+                    p.since_secs,
+                    p.connects,
+                    p.failures,
+                ));
+                push_kv(&mut o, "endpoint", p.endpoint.as_deref());
+                if let Some(e) = &p.last_error {
+                    o.push_str(&format!("  last_error: {e}\n"));
+                }
+            }
+            None => {
+                o.push_str("  (unavailable: no daemon state, or a daemon without this report)\n")
+            }
+        }
 
         if let Some(logs) = &self.logs {
             o.push_str(&section(&format!(
@@ -1403,6 +1539,121 @@ mod tests {
             .any(|f| f.level == "FAIL" && f.section == "daemon"));
     }
 
+    fn engine_with_push(push: wusel_core::diag::PushReport) -> Engine {
+        let mut report = sample_report(0, &[]);
+        report.push = Some(push);
+        Engine {
+            available: true,
+            note: None,
+            report: Some(report),
+        }
+    }
+
+    fn a_push(phase: wusel_core::diag::PushPhase) -> wusel_core::diag::PushReport {
+        wusel_core::diag::PushReport {
+            phase,
+            since_secs: 12,
+            endpoint: Some("wss://cloud.example.org/push/ws".into()),
+            failures: 0,
+            connects: 0,
+            last_error: None,
+        }
+    }
+
+    /// The case doctor grew this check for: HTTP works, the mount works, only
+    /// the WebSocket keeps failing. That is the proxy, and the finding says so —
+    /// but only when the server demonstrably answers, since otherwise the hint
+    /// would send somebody with a real outage to their proxy config.
+    #[test]
+    fn a_failing_endpoint_behind_a_reachable_server_points_at_the_proxy() {
+        let engine = engine_with_push(wusel_core::diag::PushReport {
+            failures: 6,
+            last_error: Some("websocket upgrade refused with 502 Bad Gateway".into()),
+            ..a_push(wusel_core::diag::PushPhase::Reconnecting)
+        });
+        let reachable = Connectivity {
+            tcp_reachable: Some(true),
+            ..Connectivity::default()
+        };
+        let f = push_findings(&engine, &reachable);
+        assert_eq!(f.len(), 1);
+        assert_eq!((f[0].level, f[0].section), ("WARN", "push"));
+        assert!(f[0].message.contains("502"), "quotes the daemon's error");
+        assert!(f[0].message.contains("reverse proxy"));
+        assert!(f[0].message.contains("self-test"));
+
+        let f = push_findings(&engine, &Connectivity::default());
+        assert_eq!(f[0].level, "WARN");
+        assert!(
+            !f[0].message.contains("reverse proxy"),
+            "no proxy hint without a server that answers"
+        );
+    }
+
+    /// The other classic, seen in the wild: the server advertises
+    /// `ws://127.0.0.1:8080/push/ws`. Connection refused on every client, while
+    /// the server's own self-test passes — so the finding must name the setting,
+    /// not the proxy.
+    #[test]
+    fn a_loopback_endpoint_names_the_base_endpoint_setting() {
+        let engine = engine_with_push(wusel_core::diag::PushReport {
+            endpoint: Some("ws://127.0.0.1:8080/push/ws".into()),
+            failures: 3,
+            last_error: Some("[connect] … Connection refused (os error 111)".into()),
+            ..a_push(wusel_core::diag::PushPhase::Reconnecting)
+        });
+        let reachable = Connectivity {
+            tcp_reachable: Some(true),
+            ..Connectivity::default()
+        };
+        let f = push_findings(&engine, &reachable);
+        assert_eq!(f[0].level, "WARN");
+        assert!(f[0].message.contains("base_endpoint"), "{}", f[0].message);
+        assert!(!f[0].message.contains("reverse proxy"));
+    }
+
+    #[test]
+    fn loopback_detection_reads_the_host_only() {
+        assert!(endpoint_is_loopback("ws://127.0.0.1:8080/push/ws"));
+        assert!(endpoint_is_loopback("wss://localhost/push/ws"));
+        assert!(endpoint_is_loopback("ws://[::1]:7867/ws"));
+        assert!(!endpoint_is_loopback("wss://cloud.example.org/push/ws"));
+        assert!(!endpoint_is_loopback(
+            "wss://cloud.example.org:8443/push/ws"
+        ));
+        // A path or query mentioning localhost is not a loopback host.
+        assert!(!endpoint_is_loopback(
+            "wss://cloud.example.org/push/ws?via=localhost"
+        ));
+    }
+
+    #[test]
+    fn no_push_on_offer_is_information_not_a_warning() {
+        let engine = engine_with_push(a_push(wusel_core::diag::PushPhase::Unavailable));
+        let f = push_findings(&engine, &Connectivity::default());
+        assert_eq!(f[0].level, "INFO");
+        assert!(f[0].message.contains("polling"));
+    }
+
+    #[test]
+    fn a_connected_listener_passes() {
+        let engine = engine_with_push(a_push(wusel_core::diag::PushPhase::Connected));
+        let f = push_findings(&engine, &Connectivity::default());
+        assert_eq!(f[0].level, "PASS");
+    }
+
+    /// A daemon older than this field, or none at all: no finding rather than a
+    /// guess either way.
+    #[test]
+    fn a_report_without_push_state_says_nothing_about_it() {
+        let engine = Engine {
+            available: true,
+            note: None,
+            report: Some(sample_report(0, &[])),
+        };
+        assert!(push_findings(&engine, &Connectivity::default()).is_empty());
+    }
+
     fn fetching(object: u64) -> wusel_core::diag::ObjectReport {
         wusel_core::diag::ObjectReport {
             object,
@@ -1434,6 +1685,7 @@ mod tests {
                 file: 2,
             },
             replies_pending: Some(replies_pending),
+            push: None,
         }
     }
 }

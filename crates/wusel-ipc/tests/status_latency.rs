@@ -168,14 +168,9 @@ fn socket_status_draw_path_cold_vs_warm() {
     );
 
     let socket = std::env::temp_dir().join(format!("wusel-ipc-lat-{}.sock", std::process::id()));
-    let socket_for_thread = socket.clone();
+    let listener = wusel_ipc::bind(&socket).expect("bind the test socket");
     std::thread::spawn(move || {
-        let _ = wusel_ipc::serve(
-            driver,
-            events,
-            wusel_ipc::IpcDesktop::new(),
-            &socket_for_thread,
-        );
+        let _ = wusel_ipc::serve(driver, events, wusel_ipc::IpcDesktop::new(), listener);
     });
     let stream = connect(&socket);
     let mut r = BufReader::new(stream.try_clone().unwrap());

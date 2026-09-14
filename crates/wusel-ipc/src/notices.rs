@@ -28,6 +28,11 @@ use crate::wire::Severity;
 /// display.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NoticeOut {
+    /// The stable notice id (`Notice::kind`), e.g. `"connection-restored"`. The
+    /// localized title/body are for the banner; the agent also acts on some kinds
+    /// (a restored connection re-drives the File Provider reconcile), which it
+    /// cannot key off the translated text.
+    pub kind: String,
     pub severity: Severity,
     pub title: String,
     pub body: String,
@@ -90,6 +95,13 @@ pub struct IpcDesktop {
     /// spawns `serve` so this reflects the logged-in user's language rather than a
     /// launchd default.
     locale: String,
+    /// The server-reachability tracker, attached after construction (it needs
+    /// this object as its `Desktop` first, so the wiring is circular and settled
+    /// with a `OnceLock`). It answers the `reachable` op, which the macOS File
+    /// Provider consults before a destructive reimport. Absent on paths that do
+    /// not track health (the mount's status socket, tests) — there the op
+    /// defaults to reachable, since nothing gates on it.
+    reachable: std::sync::OnceLock<Arc<wusel_core::health::Reachability>>,
 }
 
 impl IpcDesktop {
@@ -107,7 +119,24 @@ impl IpcDesktop {
         Arc::new(IpcDesktop {
             notices: Notices::default(),
             locale,
+            reachable: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Attach the reachability tracker so the `reachable` op can answer. Called
+    /// once, after both objects exist (the tracker took this desktop as its
+    /// notifier first). A second call is ignored.
+    pub fn set_reachability(&self, reachable: Arc<wusel_core::health::Reachability>) {
+        let _ = self.reachable.set(reachable);
+    }
+
+    /// Whether the server is known reachable right now, for the `reachable` op.
+    /// Defaults to `true` when no tracker is attached (the mount's status socket,
+    /// tests) — nothing there gates on it, and "reachable" is the non-disruptive
+    /// answer.
+    #[must_use]
+    pub fn reachable_now(&self) -> bool {
+        self.reachable.get().is_none_or(|r| r.reachable_now())
     }
 
     /// Register a `notices` connection; it receives every notice from now on.
@@ -127,6 +156,7 @@ impl IpcDesktop {
     fn deliver(&self, notice: &Notice) -> usize {
         let message = notice.localize(&self.locale);
         self.notices.broadcast(NoticeOut {
+            kind: notice.kind().to_string(),
             severity: notice.severity().into(),
             title: message.title,
             body: message.body,
@@ -161,10 +191,42 @@ mod tests {
 
         for rx in [&a, &b] {
             let got = rx.try_recv().expect("each subscriber gets the notice");
+            // The stable id rides alongside the localized text so the agent can
+            // act on it (a restored connection re-drives the reconcile).
+            assert_eq!(got.kind, "connection-lost");
             assert_eq!(got.severity, Severity::Error);
             assert_eq!(got.title, "Verbindung verloren");
             assert!(got.body.contains("cloud.example.org"));
         }
+    }
+
+    #[test]
+    fn reachable_op_defaults_reachable_and_follows_the_tracker() {
+        let desktop = IpcDesktop::with_locale("en".into());
+        // No tracker attached (the mount's status socket, tests): the `reachable`
+        // op must not gate anything there, so it defaults to reachable.
+        assert!(
+            desktop.reachable_now(),
+            "with no tracker attached the op defaults to reachable"
+        );
+
+        // Attach the tracker (the daemon does this once, after both exist). A cold
+        // tracker has not reached the server yet — not known reachable.
+        let health = Arc::new(wusel_core::health::Reachability::new(
+            "https://cloud.example.org/",
+            Arc::clone(&desktop) as Arc<dyn wusel_core::desktop::Desktop>,
+        ));
+        desktop.set_reachability(Arc::clone(&health));
+        assert!(
+            !desktop.reachable_now(),
+            "a cold tracker is not yet known reachable"
+        );
+
+        health.ok();
+        assert!(
+            desktop.reachable_now(),
+            "reachable once the server has answered a request"
+        );
     }
 
     #[test]

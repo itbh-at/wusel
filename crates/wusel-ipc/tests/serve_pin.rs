@@ -87,10 +87,10 @@ fn pin_and_unpin_over_the_socket() {
     let driver = Arc::new(Driver::start(provider, wusel_core::runtime::Pools::default()).unwrap());
 
     let socket = std::env::temp_dir().join(format!("wusel-ipc-pin-{}.sock", std::process::id()));
-    let socket_for_thread = socket.clone();
+    let listener = wusel_ipc::bind(&socket).expect("bind the test socket");
     let driver_for_thread = Arc::clone(&driver);
     std::thread::spawn(move || {
-        let _ = wusel_ipc::serve(driver_for_thread, events, desktop, &socket_for_thread);
+        let _ = wusel_ipc::serve(driver_for_thread, events, desktop, listener);
     });
     let up = Instant::now();
     while !socket.exists() {

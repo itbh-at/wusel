@@ -566,6 +566,19 @@ async fn put(
 
 /// MKCOL: create a directory.
 async fn mkcol(stream: &mut TcpStream, fs_path: &Path) -> std::io::Result<()> {
+    // A collection that already exists answers `405`, as Nextcloud (RFC 4918)
+    // does — not `201`. Mirroring that is what lets the client's idempotent MKCOL
+    // be exercised: re-creating an existing folder must succeed, not error.
+    if fs_path.is_dir() {
+        return respond(
+            stream,
+            "405 Method Not Allowed",
+            "text/plain",
+            &[],
+            b"exists",
+        )
+        .await;
+    }
     match std::fs::create_dir_all(fs_path) {
         Ok(()) => respond(stream, "201 Created", "text/plain", &[], b"").await,
         Err(e) => {

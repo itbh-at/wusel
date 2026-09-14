@@ -315,9 +315,14 @@ pub enum Response {
     /// place that translates (`wusel_core::desktop::Notice::localize`), so the
     /// title and body cross the wire ready to display and the client never speaks
     /// the user's language itself. The agent turns each into a Notification Center
-    /// banner, with `severity` picking the sound/interruption level.
+    /// banner, with `severity` picking the sound/interruption level. `notice_kind`
+    /// is the stable id (`Notice::kind`, e.g. `"connection-restored"`) so the agent
+    /// can also *act* on a notice — a restored connection re-drives the reconcile —
+    /// without parsing the translated text. Named `notice_kind`, not `kind`, so it
+    /// never collides with the `kind` discriminant that tags a [`Response`].
     Notice {
         ok: bool,
+        notice_kind: String,
         severity: Severity,
         title: String,
         body: String,
@@ -327,6 +332,11 @@ pub enum Response {
     /// notice went nowhere (no agent listening), which the self-test surfaces so a
     /// missing banner is explained rather than silent.
     Notified { ok: bool, delivered: u32 },
+    /// The reply to `reachable`: whether the daemon currently has positive
+    /// evidence that the server is reachable. The macOS File Provider consults
+    /// this before a destructive reimport, which must not run against a server it
+    /// cannot reach (it would leave the folder wedged with a stuck upload error).
+    Reachable { ok: bool, reachable: bool },
 }
 
 /// One entry in a pulled change log (`changes`) — the batch mirror of a pushed
@@ -469,11 +479,12 @@ impl Response {
     }
 
     /// A `notice` event, pushed to a `notices` subscriber. `title` and `body` are
-    /// already localized.
+    /// already localized; `notice_kind` is the stable id the agent may act on.
     #[must_use]
-    pub fn notice(severity: Severity, title: String, body: String) -> Self {
+    pub fn notice(notice_kind: String, severity: Severity, title: String, body: String) -> Self {
         Response::Notice {
             ok: true,
+            notice_kind,
             severity,
             title,
             body,
@@ -486,6 +497,15 @@ impl Response {
         Response::Notified {
             ok: true,
             delivered,
+        }
+    }
+
+    /// A `reachable` reply: whether the server is known reachable right now.
+    #[must_use]
+    pub fn reachable(reachable: bool) -> Self {
+        Response::Reachable {
+            ok: true,
+            reachable,
         }
     }
 
@@ -517,6 +537,27 @@ mod tests {
             let mut cursor = std::io::Cursor::new(buf);
             let back = read_frame(&mut cursor).unwrap().unwrap();
             assert_eq!(back, payload);
+        }
+    }
+
+    #[test]
+    fn reachable_response_carries_its_flag() {
+        for flag in [true, false] {
+            let frame = Response::reachable(flag).to_frame().unwrap();
+            // Tagged by `kind` with the flag alongside — exactly what the Swift
+            // client decodes.
+            let v: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+            assert_eq!(v["kind"], "reachable");
+            assert_eq!(v["reachable"], flag);
+            // And it round-trips back to the same variant.
+            let back: Response = serde_json::from_slice(&frame).unwrap();
+            assert_eq!(
+                back,
+                Response::Reachable {
+                    ok: true,
+                    reachable: flag
+                }
+            );
         }
     }
 
@@ -648,14 +689,18 @@ mod tests {
     }
 
     #[test]
-    fn notice_carries_severity_title_and_body() {
+    fn notice_carries_kind_severity_title_and_body() {
         let n = Response::notice(
+            "upload-failed".into(),
             Severity::Error,
             "Upload failed".into(),
             "'big.iso' could not be uploaded.".into(),
         );
         let v: serde_json::Value = serde_json::from_slice(&n.to_frame().unwrap()).unwrap();
         assert_eq!(v["kind"], "notice");
+        // The notice's own stable id rides alongside, under `notice_kind` so it
+        // does not clash with the `kind` discriminant.
+        assert_eq!(v["notice_kind"], "upload-failed");
         assert_eq!(v["ok"], true);
         assert_eq!(v["severity"], "error");
         assert_eq!(v["title"], "Upload failed");

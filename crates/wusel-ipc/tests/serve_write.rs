@@ -99,14 +99,9 @@ fn creates_writes_publishes_moves_and_removes_over_the_socket() {
     );
 
     let socket = std::env::temp_dir().join(format!("wusel-ipc-write-{}.sock", std::process::id()));
-    let socket_for_thread = socket.clone();
+    let listener = wusel_ipc::bind(&socket).expect("bind the test socket");
     std::thread::spawn(move || {
-        let _ = wusel_ipc::serve(
-            driver,
-            events,
-            wusel_ipc::IpcDesktop::new(),
-            &socket_for_thread,
-        );
+        let _ = wusel_ipc::serve(driver, events, wusel_ipc::IpcDesktop::new(), listener);
     });
 
     let mut client = connect(&socket);

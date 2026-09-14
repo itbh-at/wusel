@@ -20,7 +20,7 @@
 //!
 //! **The bar stays high.** Every network-touching path reports here — a
 //! directory listing, a content read, an upload, the notify_push discovery —
-//! which is thousands of events, and exactly one notification per outage. Three
+//! which is thousands of events, and exactly one notification per outage. Four
 //! rules make that true:
 //!
 //! * *Only a failure of the server itself counts*: no answer at all
@@ -42,6 +42,10 @@
 //! * *One notice per incident.* While an outage lasts, later failures are
 //!   silent — and the first success clears the state, so the *next* outage is
 //!   announced again.
+//! * *A flapping link is not narrated wobble by wobble.* For
+//!   [`QUIET_AFTER_RESTORE`] after a recovery notice, a new outage changes the
+//!   status but earns no toast; it is announced only if it is still going on
+//!   when the window ends.
 //!
 //! **Good news only as resolution.** [`Notice::ConnectionRestored`] fires on the
 //! first successful request after an announced outage — never otherwise. A
@@ -55,6 +59,12 @@
 //! socket has never come up, and the reconnect loop once it has. So a mount
 //! nobody is touching still learns, within about half a minute, that the server
 //! went away — and that it is back.
+//!
+//! The reconnect loop reports the outcome of an HTTP request, never the
+//! socket's own failure: the WebSocket endpoint is a URL the server advertises,
+//! and a wrong one (a loopback `base_endpoint`, a proxy without upgrades) fails
+//! forever while the server is perfectly reachable. Letting it speak for the
+//! server announced "connection lost" after every successful listing.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -69,6 +79,15 @@ use crate::Error;
 /// which the WebDAV client retries anyway — never earns a toast.
 pub const CONFIRM_AFTER: Duration = Duration::from_secs(10);
 
+/// How long after an announced recovery the next outage stays quiet. A link
+/// that flaps — a train, a bad wireless cell — would otherwise be narrated
+/// wobble by wobble, two toasts each, which is the one thing a user reliably
+/// turns off. An outage that starts inside this window is still tracked, and
+/// the file manager's status still shows it; it is *announced* only if it is
+/// still going on when the window ends. So a long outage is never lost, and a
+/// short one right after a recovery is never news.
+pub const QUIET_AFTER_RESTORE: Duration = Duration::from_secs(300);
+
 /// Shared "can we reach the server?" state, and the notifications it owes.
 ///
 /// Cheap to call from anywhere: the success path is a single relaxed atomic load
@@ -81,8 +100,15 @@ pub struct Reachability {
     desktop: Arc<dyn Desktop>,
     /// Fast path only; [`Reachability::state`] is the truth.
     down: AtomicBool,
+    /// Set the first time a request actually reaches the server, and never
+    /// cleared. It distinguishes "we have positive evidence the server is
+    /// reachable" from a cold start that simply has not tried yet — a
+    /// destructive action (the File Provider reimport) must not run on the
+    /// latter, so "not tried yet" has to read as "do not".
+    ever_ok: AtomicBool,
     state: Mutex<State>,
     confirm_after: Duration,
+    quiet_after_restore: Duration,
 }
 
 /// The outage in progress, if any.
@@ -108,10 +134,18 @@ struct State {
     since: Option<Instant>,
     /// Whether the user has already been told about *this* outage.
     announced: bool,
+    /// Whether the file manager's status already shows this outage. Set as
+    /// soon as the outage is confirmed, told or not: the emblem is the quiet
+    /// channel, and it is right for exactly the outages a toast is not.
+    marked: bool,
     /// The most recent failure's kind — what the message will say. The latest
     /// one wins: it describes the state the server is in *now*, which is what
     /// the user is about to act on.
     fault: Option<Fault>,
+    /// When the last *announced* outage ended — the start of the quiet window
+    /// (see [`QUIET_AFTER_RESTORE`]). Survives the reset that ends an outage,
+    /// since it is about the one before.
+    restored_at: Option<Instant>,
 }
 
 impl Reachability {
@@ -127,28 +161,54 @@ impl Reachability {
         desktop: Arc<dyn Desktop>,
         confirm_after: Duration,
     ) -> Self {
+        Self::with_timings(server_url, desktop, confirm_after, QUIET_AFTER_RESTORE)
+    }
+
+    /// Both clocks chosen explicitly — the tests use it to see a flap, or to
+    /// switch the quiet window off and see every incident.
+    pub fn with_timings(
+        server_url: &str,
+        desktop: Arc<dyn Desktop>,
+        confirm_after: Duration,
+        quiet_after_restore: Duration,
+    ) -> Self {
         Self {
             server: display_host(server_url),
             desktop,
             down: AtomicBool::new(false),
+            ever_ok: AtomicBool::new(false),
             state: Mutex::new(State::default()),
             confirm_after,
+            quiet_after_restore,
         }
     }
 
     /// A request reached the server. Ends an outage, and tells the user it is
     /// over if they were told it had begun.
     pub fn ok(&self) {
+        // Positive evidence the server is reachable, recorded before the fast
+        // path so even the very first success (when nothing was "down") counts.
+        self.ever_ok.store(true, Ordering::Relaxed);
         // The overwhelmingly common case: nothing was wrong, nothing to do.
         if !self.down.load(Ordering::Relaxed) {
             return;
         }
-        let announced = {
+        let (announced, marked) = {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            let announced = state.announced;
-            *state = State::default();
+            let (announced, marked) = (state.announced, state.marked);
+            *state = State {
+                // The quiet window starts at an announced recovery and is
+                // otherwise inherited: an unannounced outage inside it does not
+                // extend it.
+                restored_at: if announced {
+                    Some(Instant::now())
+                } else {
+                    state.restored_at
+                },
+                ..State::default()
+            };
             self.down.store(false, Ordering::Relaxed);
-            announced
+            (announced, marked)
         };
         if announced {
             tracing::info!(server = %self.server, "the server is reachable again");
@@ -157,6 +217,8 @@ impl Reachability {
             self.desktop.notify(&Notice::ConnectionRestored {
                 server: self.server.clone(),
             });
+        }
+        if marked {
             self.desktop.set_status(Status::Idle);
         }
     }
@@ -168,7 +230,7 @@ impl Reachability {
         let Some(fault) = classify(error) else {
             return;
         };
-        let announce = {
+        let (mark, announce) = {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             state.fault = Some(fault);
             match state.since {
@@ -176,18 +238,32 @@ impl Reachability {
                 None => {
                     state.since = Some(Instant::now());
                     self.down.store(true, Ordering::Relaxed);
-                    false
+                    (false, false)
                 }
                 // Still failing, long enough to be an outage rather than a blip.
                 Some(since) => {
-                    let confirmed = !state.announced && since.elapsed() >= self.confirm_after;
-                    if confirmed {
+                    let confirmed = since.elapsed() >= self.confirm_after;
+                    // Inside the quiet window after a recovery the emblem
+                    // changes and the toast waits: if the outage is still on
+                    // when the window ends, a later failure announces it.
+                    let quiet = state
+                        .restored_at
+                        .is_some_and(|t| t.elapsed() < self.quiet_after_restore);
+                    let mark = confirmed && !state.marked;
+                    let announce = confirmed && !quiet && !state.announced;
+                    if mark {
+                        state.marked = true;
+                    }
+                    if announce {
                         state.announced = true;
                     }
-                    confirmed
+                    (mark, announce)
                 }
             }
         };
+        if mark {
+            self.desktop.set_status(Status::Error);
+        }
         if announce {
             let notice = match fault {
                 Fault::Unreachable => {
@@ -211,7 +287,6 @@ impl Reachability {
                 }
             };
             self.desktop.notify(&notice);
-            self.desktop.set_status(Status::Error);
         }
     }
 
@@ -220,6 +295,16 @@ impl Reachability {
     /// decision is made here, not by them.
     pub fn is_down(&self) -> bool {
         self.down.load(Ordering::Relaxed)
+    }
+
+    /// Whether the server is *known* reachable right now: we have reached it at
+    /// least once and the most recent attempt did not fail. Unlike [`is_down`],
+    /// this is `false` on a cold start that has not yet tried — a caller that is
+    /// about to do something destructive (the macOS File Provider reimport, which
+    /// deletes and re-creates the folder subtree) wants positive evidence, so
+    /// "not known yet" must read as "do not".
+    pub fn reachable_now(&self) -> bool {
+        self.ever_ok.load(Ordering::Relaxed) && !self.down.load(Ordering::Relaxed)
     }
 }
 
@@ -289,12 +374,14 @@ mod tests {
         }
     }
 
-    /// A tracker that announces on the second failure, whenever it comes.
+    /// A tracker that announces on the second failure, whenever it comes, and
+    /// every incident — no quiet window — so each test sees its own.
     fn immediate() -> (Arc<Spy>, Reachability) {
         let spy = Arc::new(Spy::default());
-        let reach = Reachability::with_confirm_after(
+        let reach = Reachability::with_timings(
             "https://cloud.example.org/",
             spy.clone(),
+            Duration::ZERO,
             Duration::ZERO,
         );
         (spy, reach)
@@ -302,6 +389,96 @@ mod tests {
 
     fn offline() -> Error {
         Error::Http("[connect] dns error".into())
+    }
+
+    /// A link that flaps: outage, recovery, outage again seconds later. The
+    /// second outage is shown (status) but not told (no toast) — and its end,
+    /// never announced, needs no announcement either.
+    #[test]
+    fn a_flap_right_after_a_recovery_changes_the_status_but_says_nothing() {
+        let spy = Arc::new(Spy::default());
+        let reach = Reachability::with_timings(
+            "https://cloud.example.org/",
+            spy.clone(),
+            Duration::ZERO,
+            Duration::from_secs(3600),
+        );
+        reach.failed(&offline());
+        reach.failed(&offline());
+        reach.ok();
+        assert_eq!(spy.notices().len(), 2, "lost, restored");
+        assert_eq!(
+            spy.statuses.lock().unwrap().as_slice(),
+            &[Status::Error, Status::Idle]
+        );
+
+        reach.failed(&offline());
+        reach.failed(&offline());
+        assert!(reach.is_down());
+        assert_eq!(spy.notices().len(), 2, "inside the quiet window: no toast");
+        assert_eq!(
+            spy.statuses.lock().unwrap().last(),
+            Some(&Status::Error),
+            "but the file manager shows it"
+        );
+        reach.ok();
+        assert_eq!(spy.notices().len(), 2, "nothing to resolve, nothing to say");
+        assert_eq!(spy.statuses.lock().unwrap().last(), Some(&Status::Idle));
+    }
+
+    /// The quiet window delays, it does not swallow: an outage that outlasts it
+    /// is announced by the first failure after the window ends.
+    #[test]
+    fn an_outage_that_outlasts_the_quiet_window_is_announced() {
+        let spy = Arc::new(Spy::default());
+        let reach = Reachability::with_timings(
+            "https://cloud.example.org/",
+            spy.clone(),
+            Duration::ZERO,
+            Duration::from_millis(50),
+        );
+        reach.failed(&offline());
+        reach.failed(&offline());
+        reach.ok();
+        reach.failed(&offline());
+        reach.failed(&offline());
+        assert_eq!(spy.notices().len(), 2, "still quiet");
+        std::thread::sleep(Duration::from_millis(60));
+        reach.failed(&offline());
+        assert_eq!(
+            spy.notices().len(),
+            3,
+            "the window ended, the outage did not"
+        );
+        assert!(matches!(spy.notices()[2], Notice::ConnectionLost { .. }));
+        reach.ok();
+        assert_eq!(spy.notices().len(), 4, "announced, so its end is too");
+    }
+
+    #[test]
+    fn reachable_now_wants_positive_evidence_and_no_failure() {
+        let (_spy, reach) = immediate();
+        // Cold start: the server has never been reached, so a destructive
+        // reimport must not run — "not known yet" reads as "do not".
+        assert!(
+            !reach.reachable_now(),
+            "a cold start that has not tried is not known reachable"
+        );
+
+        reach.ok();
+        assert!(reach.reachable_now(), "a success is positive evidence");
+
+        reach.failed(&offline());
+        assert!(
+            !reach.reachable_now(),
+            "the most recent attempt failed — not reachable right now"
+        );
+
+        reach.ok();
+        assert!(
+            reach.reachable_now(),
+            "reachable again once a request lands"
+        );
     }
 
     #[test]
