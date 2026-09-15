@@ -1,0 +1,64 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 IT Beratung Hermann GmbH
+#
+# Run the full gate before a push, so a feature branch is verified locally
+# before it is opened for review. The checks below are exactly the ones CI runs;
+# running them here catches a break at push time rather than later.
+#
+# It exists because of a whole class of bug the host checks miss: on macOS
+# `mise run clippy` and `check` exclude wusel-fuse (it needs the Linux FUSE
+# driver), so a break in that crate — or in its tests, which the full-workspace
+# clippy compiles — is invisible until a Linux build. `mise run fuse-test`
+# builds and lints wusel-fuse in the podman container, which is the one place
+# that break shows up before the push.
+#
+# Enable once per clone:  mise run setup-hooks   (sets core.hooksPath=.githooks)
+#
+# Escape hatch for work-in-progress you will not merge yet:
+#   WUSEL_SKIP_PREPUSH=1 git push
+set -eu
+
+if [ "${WUSEL_SKIP_PREPUSH:-}" = "1" ]; then
+    echo ">> pre-push gate skipped (WUSEL_SKIP_PREPUSH=1)" >&2
+    exit 0
+fi
+
+# Content reaching the GitHub remote has already been reviewed and checked, and
+# rerunning the whole suite on it — possibly where the container is not even
+# available — serves no purpose. Skip any push to it.
+remote_url="${2:-}"
+case "$remote_url" in
+    *github.com*) exit 0 ;;
+esac
+
+# Decide whether this push carries anything worth gating. Git feeds one line per
+# ref on stdin: "<local_ref> <local_sha> <remote_ref> <remote_sha>". A branch
+# deletion has an all-zero local sha and nothing to build; a tag names a tree
+# that was gated when it was a branch. Neither needs the suite.
+zero=0000000000000000000000000000000000000000
+run=0
+while read -r local_ref local_sha _; do
+    [ -z "$local_ref" ] && continue          # end marker for a delete-only push
+    [ "$local_sha" = "$zero" ] && continue    # deleting a remote branch
+    case "$local_ref" in refs/tags/*) continue ;; esac
+    run=1
+done
+[ "$run" -eq 0 ] && exit 0
+
+echo ">> pre-push gate: running the full local gate (host + container) ..." >&2
+echo "   skip with 'WUSEL_SKIP_PREPUSH=1 git push' for WIP you will not merge" >&2
+
+# The same checks CI runs, in the same order, through the same mise tasks — so
+# the two cannot drift. The container task (fuse-test) is last because it is the
+# slowest and the most likely to be the one that catches a wusel-fuse regression
+# the host tasks structurally cannot see.
+mise run fmt-check
+mise run headers-check
+mise run shellcheck
+mise run clippy
+mise run check
+mise run test
+mise run fuse-test
+
+echo ">> pre-push gate passed." >&2

@@ -52,7 +52,7 @@ description = "Check formatting without changing files (for CI)"
 run = "cargo fmt --all -- --check"
 
 [tasks.setup-hooks]
-description = "Point git at the checked-in hooks (.githooks/pre-commit auto-formats)"
+description = "Point git at the checked-in hooks (pre-commit auto-formats, pre-push runs the full gate)"
 run = "git config core.hooksPath .githooks"
 
 [tasks.headers]
