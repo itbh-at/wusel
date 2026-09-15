@@ -2,10 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 IT Beratung Hermann GmbH
 #
-# Auto-format staged Rust before every commit, so unformatted code can never
-# reach a commit — and therefore never reach main, where the publish's fmt-check
-# would otherwise catch it far too late. There is no internal CI running
-# rustfmt, so this hook is the gate.
+# Auto-format staged Rust before every commit, so unformatted code never reaches
+# a commit, and therefore never reaches main. rustfmt is not run for you
+# anywhere else, so this hook is the gate.
 #
 # Enable once per clone:  mise run setup-hooks   (sets core.hooksPath=.githooks)
 set -eu

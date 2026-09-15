@@ -120,7 +120,10 @@ XDG paths by hand instead of adding the `dirs` crate.)
   support (a File Provider frontend, not FUSE) is far-future, experimental work.
 - **Keep `main` green:** the full CI gate is `fmt-check`, `headers-check`,
   `shellcheck`, `clippy`, `check`, `test`, `build-fuse` — all of them, before
-  merging.
+  merging. The `.githooks/pre-push` hook (`mise run setup-hooks`) runs that same
+  gate — including `fuse-test`, which lints wusel-fuse in the container the host
+  checks cannot — before a feature branch is pushed, so a break is caught before
+  review rather than after.
 
 ## Project plans & decisions
 

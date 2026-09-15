@@ -146,10 +146,21 @@ final class Enumerator: NSObject, NSFileProviderEnumerator {
                             "change log reset (head=\(head) < since=\(since)) — server unreachable, deferring reconcile")
                     }
                 }
-                // Report a change only for a folder the user has opened, and only
-                // for files. An unopened folder must not be seeded (that shows it
-                // without a spinner then pops content in); a folder reported here
-                // would be prefetched by the system → enumerated → a crawl.
+                // Report a change only for a child of a folder the user has opened
+                // (an unopened folder must not be seeded — it would show without a
+                // spinner, then pop content in). Both files and directories are
+                // reported: a directory that only appears here — a folder created
+                // on the server while its parent was already open — never surfaces
+                // otherwise, because the parent's `enumerateItems` does not re-run
+                // on its own and this is the only change channel macOS serves. This
+                // does not crawl. The engine emits an `Entry` change on a folder's
+                // own path only when the folder itself is created, removed, renamed,
+                // or its availability flips in its parent — never merely because
+                // content changed somewhere below it (that lands as a change on the
+                // leaf's path, gated to opened parents above). And we only `stat`
+                // the item, never `enumerate` it — the runaway that once flooded the
+                // account came from enumerating a directory in this channel, not
+                // from reporting one.
                 let known = KnownContainers.snapshot()
                 var seen = Set<String>()
                 var updated: [NSFileProviderItem] = []
@@ -170,9 +181,7 @@ final class Enumerator: NSObject, NSFileProviderEnumerator {
                     }
                     switch statResult {
                     case .node(let node):
-                        if !node.isDir {
-                            updated.append(WuselItem(node: node, path: itemPath))
-                        }
+                        updated.append(WuselItem(node: node, path: itemPath))
                     case .error(.notFound):
                         deleted.append(id)
                     default:
