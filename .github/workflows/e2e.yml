@@ -61,11 +61,21 @@ jobs:
           found = {}
           for t in tags:
               m = re.fullmatch(r"(\d+)-apache", t["name"])
-              if m:
-                  found[int(m.group(1))] = t.get("digest") or ""
+              if not m:
+                  continue
+              # Only a tag that actually carries a linux/amd64 image counts: the
+              # runner is amd64, and a new major's tag is listed on Docker Hub
+              # hours before its amd64 manifest lands. Picking it in that window
+              # fails the pull and turns the binding major red for a reason that
+              # is nothing to do with us. Such a major simply waits for its image.
+              images = t.get("images") or []
+              if not any(i.get("architecture") == "amd64" and i.get("os") == "linux"
+                         for i in images):
+                  continue
+              found[int(m.group(1))] = t.get("digest") or ""
           majors = sorted(found, reverse=True)[:3]
           if not majors:
-              raise SystemExit("no <major>-apache tags found — Docker Hub response changed?")
+              raise SystemExit("no <major>-apache tags with a linux/amd64 image — Docker Hub response changed?")
           # The newest major is the one we promise to work with; the older two are
           # reported but never turn the workflow red.
           include = [{"nc": str(m), "required": i == 0} for i, m in enumerate(majors)]
