@@ -102,9 +102,10 @@ impl From<wusel_core::provider::FileState> for SyncState {
 /// conflate into one value.
 ///
 /// Filled from the engine's `is_group_folder_root`, the same read that answers
-/// the sync state — and the same answer the FUSE frontend serves as
-/// `user.wusel.kind`. The contract was on the wire before the engine could fill
-/// it, which is what let the two lines of work meet without a client changing.
+/// the sync state. The FUSE mount serves no extended attributes; a file manager
+/// learns the kind only from this socket. The contract was on the wire before
+/// the engine could fill it, which is what let the two lines of work meet
+/// without a client changing.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
@@ -166,7 +167,7 @@ pub fn write_frame(w: &mut impl Write, body: &[u8]) -> io::Result<()> {
 
 /// A request from the client. Only the fields an op needs are meaningful; the
 /// rest default and are ignored — `offset`/`len` for `fetch`/`write`, `to` for
-/// `move`, `dir` for `create`, `size`/`mtime` for `setattr`.
+/// `move`, `dir`/`exec` for `create`, `size`/`mtime`/`exec` for `setattr`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Request {
     /// Read path: `stat | enumerate | fetch`. Write path: `write | create |
@@ -192,10 +193,19 @@ pub struct Request {
     /// for a pre-epoch timestamp).
     #[serde(default)]
     pub mtime: Option<i64>,
+    /// `create` and `setattr`: the executable bit. Kept in the local state
+    /// only — WebDAV has no mode bits. Absent means "leave it" for `setattr`
+    /// and "not executable" for `create`; a directory ignores it.
+    #[serde(default)]
+    pub exec: Option<bool>,
     /// `changes` only: return the change log from this sequence anchor onward.
     /// `0` (the default) asks for the whole retained log.
     #[serde(default)]
     pub since: u64,
+    /// `weburl` only: ask for the "reveal in its folder" link (opens the parent
+    /// with the item highlighted) instead of the object link. Ignored elsewhere.
+    #[serde(default)]
+    pub reveal: bool,
 }
 
 /// One directory child, as `enumerate` reports it.
@@ -245,6 +255,9 @@ pub struct Entry {
     /// discriminant that tags a [`Response`].
     #[serde(default)]
     pub folder_kind: Kind,
+    /// Whether the file is executable — local state, never from the server.
+    #[serde(default)]
+    pub exec: bool,
 }
 
 /// A response header frame. Untagged so the JSON reads as a flat object with a
@@ -278,6 +291,9 @@ pub enum Response {
         /// `folder_kind` to avoid colliding with the `kind` response tag.
         #[serde(default)]
         folder_kind: Kind,
+        /// Whether the file is executable (see [`Entry::exec`]).
+        #[serde(default)]
+        exec: bool,
     },
     /// A directory's children (`enumerate`).
     Entries { ok: bool, entries: Vec<Entry> },
@@ -337,6 +353,14 @@ pub enum Response {
     /// this before a destructive reimport, which must not run against a server it
     /// cannot reach (it would leave the folder wedged with a stuck upload error).
     Reachable { ok: bool, reachable: bool },
+    /// The reply to `update`: how many files the in-place refresh re-fetched
+    /// (`0` means the offline copy was already current). Backs a frontend's
+    /// "Update now" on a pinned-stale/pending item.
+    Updated { ok: bool, count: u64 },
+    /// The reply to `weburl`: the Nextcloud web link for the requested path —
+    /// the object link, or the reveal link when asked. The frontend opens it or
+    /// copies it; the engine built it so credentials never leave the daemon.
+    WebUrl { ok: bool, url: String },
 }
 
 /// One entry in a pulled change log (`changes`) — the batch mirror of a pushed
@@ -412,6 +436,7 @@ impl Response {
         stale: bool,
         state: Option<SyncState>,
         folder_kind: Kind,
+        exec: bool,
     ) -> Self {
         Response::Node {
             ok: true,
@@ -425,6 +450,7 @@ impl Response {
             stale,
             state,
             folder_kind,
+            exec,
         }
     }
 
@@ -509,6 +535,18 @@ impl Response {
         }
     }
 
+    /// An `updated` reply: the in-place refresh re-fetched `count` files.
+    #[must_use]
+    pub fn updated(count: u64) -> Self {
+        Response::Updated { ok: true, count }
+    }
+
+    /// A `weburl` reply: the Nextcloud web link the frontend asked for.
+    #[must_use]
+    pub fn web_url(url: String) -> Self {
+        Response::WebUrl { ok: true, url }
+    }
+
     /// Serialise this header to its frame bytes.
     ///
     /// # Errors
@@ -562,6 +600,40 @@ mod tests {
     }
 
     #[test]
+    fn updated_response_carries_the_count() {
+        let frame = Response::updated(3).to_frame().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+        assert_eq!(v["kind"], "updated");
+        assert_eq!(v["count"], 3);
+        let back: Response = serde_json::from_slice(&frame).unwrap();
+        assert_eq!(back, Response::Updated { ok: true, count: 3 });
+    }
+
+    #[test]
+    fn weburl_response_carries_the_link() {
+        let url = "https://cloud.example.org/index.php/f/192".to_string();
+        let frame = Response::web_url(url.clone()).to_frame().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+        assert_eq!(v["kind"], "web_url");
+        assert_eq!(v["url"], url);
+        let back: Response = serde_json::from_slice(&frame).unwrap();
+        assert_eq!(back, Response::WebUrl { ok: true, url });
+    }
+
+    #[test]
+    fn reveal_flag_round_trips_on_a_request() {
+        let req = Request {
+            op: "weburl".into(),
+            path: "/Docs/plan.txt".into(),
+            reveal: true,
+            ..Default::default()
+        };
+        let frame = serde_json::to_vec(&req).unwrap();
+        let back: Request = serde_json::from_slice(&frame).unwrap();
+        assert!(back.reveal);
+    }
+
+    #[test]
     fn two_frames_read_back_in_order() {
         // A bytes response is two frames; the reader must get the header, then
         // the content, in that order out of one stream.
@@ -609,6 +681,7 @@ mod tests {
             true,
             Some(SyncState::PinnedStale),
             Kind::Plain,
+            true,
         );
         let v: serde_json::Value = serde_json::from_slice(&node.to_frame().unwrap()).unwrap();
         // `kind: "node"` is the response-shape discriminant; the object's folder
@@ -623,6 +696,7 @@ mod tests {
         assert_eq!(v["stale"], true);
         assert_eq!(v["state"], "pinned-stale");
         assert_eq!(v["folder_kind"], "plain");
+        assert_eq!(v["exec"], true);
         // The spelling a client's emblem table matches on: hyphenated, and
         // distinct from `pinned`, which is the whole point of the value.
         assert_eq!(
@@ -642,6 +716,7 @@ mod tests {
             stale: false,
             state: None,
             folder_kind: Kind::GroupFolder,
+            exec: false,
         }]);
         let v: serde_json::Value = serde_json::from_slice(&entries.to_frame().unwrap()).unwrap();
         assert_eq!(v["kind"], "entries");
@@ -655,6 +730,7 @@ mod tests {
         // cloud emblem on every folder.
         assert!(v["entries"][0]["state"].is_null());
         assert_eq!(v["entries"][0]["folder_kind"], "group_folder");
+        assert_eq!(v["entries"][0]["exec"], false);
 
         let bytes = Response::bytes(5);
         let v: serde_json::Value = serde_json::from_slice(&bytes.to_frame().unwrap()).unwrap();

@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
+use crate::activity::Activity;
 use crate::content::{CachingSource, ContentSource, LiveWebDav};
 use crate::desktop::{self, Desktop, Notice};
 use crate::model::{basename, RemoteEntry};
@@ -128,6 +129,11 @@ pub fn read_range_from_scratch(path: &std::path::Path, offset: u64, len: u32) ->
 pub struct Provider {
     state: StateDb,
     dav: WebDavClient,
+    /// The instance base URL (e.g. `https://cloud.example.org`), kept so a
+    /// frontend can ask for an object's web link ([`Self::server_url`]) without
+    /// reaching into the credentials — the WebDAV client owns the same value but
+    /// does not expose it.
+    server_url: String,
     /// Sync→async bridge: FUSE/OS callbacks are synchronous, WebDAV is async.
     rt: Arc<tokio::runtime::Runtime>,
     /// FUSE dispatch-thread count (see [`crate::config::Settings::dispatch_threads`]).
@@ -169,6 +175,9 @@ pub struct Provider {
     /// file the user just created (a stale snapshot racing the upload). Shared with
     /// both background threads; only ever bumped on the FUSE thread.
     write_epoch: Arc<AtomicU64>,
+    /// Filled by the runtime's decider; read by the sync walk and handed to
+    /// the workers through [`WriteContext`].
+    activity: Arc<Activity>,
     /// Send a directory (inode, path) to the background revalidator.
     reval_tx: Sender<(u64, String)>,
     /// Receive finished background revalidations to apply on the FUSE thread.
@@ -403,7 +412,7 @@ pub type ObjectId = u64;
 
 /// A file's local-availability state, for OS-integration emblems (the
 /// file-manager badges "online-only / here / kept offline"). Deliberately
-/// coarse and cheap — see [`Provider::file_state`].
+/// coarse and cheap — derived by the runtime (`sync_state`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileState {
     /// Online-only: no local copy; opening it fetches from the server.
@@ -461,6 +470,9 @@ const SYNC_MAX_DEPTH: u32 = 64;
 /// It owns a **second** state connection and its own HTTP client/runtime, so it
 /// reconciles autonomously and never blocks the FUSE thread. Changed entries are
 /// reported for kernel invalidation (see [`Invalidation`]).
+// Each argument is a separate handle the thread takes over at spawn; a struct
+// holding them would exist only to be destructured again on the first line.
+#[allow(clippy::too_many_arguments)]
 fn sync_loop(
     mut state: StateDb,
     pins: Arc<crate::pins::Pins>,
@@ -468,6 +480,7 @@ fn sync_loop(
     triggers: Receiver<()>,
     invalidations: Sender<Invalidation>,
     write_epoch: Arc<AtomicU64>,
+    activity: &Activity,
     pinned: PinnedRefresh,
 ) {
     let rt = match tokio::runtime::Builder::new_current_thread()
@@ -480,6 +493,10 @@ fn sync_loop(
             return;
         }
     };
+    // The root's ETag as of the last walk that completed undisturbed. In memory
+    // only: after a restart the first walk runs in full, which is the catch-up
+    // a restart wants anyway.
+    let mut walked_root: Option<String> = None;
     while triggers.recv().is_ok() {
         // Coalesce a burst of push events into a single walk.
         while triggers.try_recv().is_ok() {}
@@ -487,23 +504,49 @@ fn sync_loop(
         if !matches!(state.children_loaded(ROOT_INODE), Ok(true)) {
             continue;
         }
+        // One Depth-0 request answers "did anything change at all?". A failed
+        // probe is `None` and walks anyway — the probe may only save work,
+        // never skip a walk it cannot vouch for.
+        let root = rt.block_on(dav.root_etag()).unwrap_or_else(|e| {
+            tracing::debug!(%e, "syncer: root ETag probe failed — walking anyway");
+            None
+        });
+        if root.is_some() && root == walked_root {
+            tracing::debug!("sync walk: root ETag unchanged — nothing to do");
+            continue;
+        }
         // Collected across the whole walk and settled once: hundreds of pinned
         // files can change together when somebody reorganises a shared folder.
         let mut stale = Vec::new();
-        if let Err(e) = walk_dir(
+        // A local change during the walk can make it skip a listing (see
+        // `walk_dir`), so such a walk does not vouch for the root ETag.
+        let epoch = write_epoch.load(Ordering::SeqCst);
+        let since = activity.seq();
+        let walked = walk_dir(
             &mut state,
             &pins,
             &dav,
             &rt,
             &invalidations,
             &write_epoch,
+            activity,
             &mut stale,
             ROOT_INODE,
             "",
             0,
-        ) {
-            tracing::debug!(%e, "syncer: walk aborted");
-        }
+        );
+        walked_root = match walked {
+            // The ETag from *before* the walk: a change made while it ran bumps
+            // the root again, so the next trigger still walks.
+            Ok(()) if write_epoch.load(Ordering::SeqCst) == epoch && activity.seq() == since => {
+                root
+            }
+            Ok(()) => None,
+            Err(e) => {
+                tracing::debug!(%e, "syncer: walk aborted");
+                None
+            }
+        };
         pinned.settle(&stale);
     }
 }
@@ -521,6 +564,7 @@ fn walk_dir(
     rt: &tokio::runtime::Runtime,
     invalidations: &Sender<Invalidation>,
     write_epoch: &AtomicU64,
+    activity: &Activity,
     // Pinned files found to have moved on. Collected here and settled once by
     // the caller: the decision is per walk, not per directory.
     stale: &mut Vec<NodeRow>,
@@ -538,12 +582,16 @@ fn walk_dir(
     // reconciling it could delete a file the user just created. Discard it; the
     // next push re-walks with a fresh listing.
     let epoch = write_epoch.load(Ordering::SeqCst);
+    let since = activity.seq();
     let entries = rt.block_on(dav.propfind_dir(path))?;
     if write_epoch.load(Ordering::SeqCst) != epoch {
         tracing::debug!(%path, inode, "sync walk: listing stale (concurrent local write) — skipping");
         return Ok(());
     }
-    state.reconcile_children(inode, path, &entries)?;
+    if !reconcile_if_quiet(state, activity, since, None, inode, path, &entries)? {
+        tracing::debug!(%path, inode, "sync walk: directory busy with a local change — skipping");
+        return Ok(());
+    }
     tracing::debug!(%path, inode, "PROPFIND (sync walk)");
 
     let new_names: std::collections::HashSet<&str> =
@@ -609,6 +657,7 @@ fn walk_dir(
                     rt,
                     invalidations,
                     write_epoch,
+                    activity,
                     stale,
                     o.inode,
                     &child_path,
@@ -618,6 +667,40 @@ fn walk_dir(
         }
     }
     Ok(())
+}
+
+/// Apply a listing of `inode` taken at activity `since`, keeping it away from
+/// what the machine changed in the meantime (see [`crate::activity`]):
+///
+/// * the whole listing is dropped if the directory itself was changing — a
+///   rename or remove in it holds the directory for its whole length, and the
+///   listing may show the server halfway through it;
+/// * a child that was changing — a file being uploaded or renamed — keeps its
+///   row; the listing may predate that change.
+///
+/// `holder` is the object whose flow asks for the listing, if it is one: its
+/// own work is not a reason to distrust the listing it asked for. Returns
+/// whether the listing was applied.
+///
+/// The check sits right before the reconcile, and that is enough although the
+/// two are not one atomic step: a flow that starts after the check has not
+/// reached the server when the listing was taken, so the listing is simply
+/// older than that flow, and the flow's own commits land after the reconcile's.
+fn reconcile_if_quiet(
+    state: &mut StateDb,
+    activity: &Activity,
+    since: u64,
+    holder: Option<u64>,
+    inode: u64,
+    path: &str,
+    entries: &[RemoteEntry],
+) -> Result<bool> {
+    let quiet = |object: u64| Some(object) == holder || activity.quiet_since(object, since);
+    if !quiet(inode) {
+        return Ok(false);
+    }
+    state.reconcile_children_except(inode, path, entries, |child| !quiet(child))?;
+    Ok(true)
 }
 
 /// Count and total size of the cached content blobs (files without an
@@ -651,12 +734,19 @@ pub struct WriteContext {
     /// Bumped on every local mutation of directory membership, so a listing
     /// taken before it cannot delete what we just made.
     pub write_epoch: Arc<AtomicU64>,
+    /// Which objects the machine is working on; a listing of a busy directory
+    /// is not applied (see [`crate::activity`]).
+    pub activity: Arc<Activity>,
     /// Where add/removes are reported for kernel invalidation.
     pub invalidations: Sender<Invalidation>,
 }
 
 /// Handle an upload the server refused (412): merge if we can, otherwise keep
 /// the server version and park ours beside it under a second name.
+///
+/// `base_etag` is the version our edit started from — the merge base. `node`
+/// is the row as it stands now, which may already carry the server's newer
+/// version.
 ///
 /// This also covers a **deferred create** that lost the race against a
 /// same-named server-side create — its `If-None-Match: *` failed, there is no
@@ -668,12 +758,16 @@ pub fn run_conflict_resolution(
     ctx: &WriteContext,
     state: &mut StateDb,
     node: &NodeRow,
+    base_etag: &str,
     scratch: &std::path::Path,
     size: u64,
 ) -> Result<()> {
+    if settle_false_conflict(ctx, state, node, scratch, size)? {
+        return Ok(());
+    }
     if ctx.text_merge {
         let local = std::fs::read(scratch)?;
-        if let Some((merged, theirs)) = run_text_merge(ctx, node, &local)? {
+        if let Some((merged, theirs)) = run_text_merge(ctx, node, base_etag, &local)? {
             // Upload the merge **conditionally against the very version it was
             // merged from**. The result is only correct for that "theirs"; an
             // unconditional PUT here would silently discard a third change that
@@ -742,12 +836,100 @@ pub fn run_conflict_resolution(
         copy: copy.clone(),
     });
     ctx.write_epoch.fetch_add(1, Ordering::SeqCst);
-    run_reload_dir(ctx, state, node.parent)?;
+    run_reload_dir(ctx, state, node.parent, node.inode)?;
     Ok(())
 }
 
-/// Attempt a 3-way text merge (base = the cached last-known copy, ours = the
-/// buffer, theirs = the server's current version).
+/// A 412 that is no conflict with anybody: settle it without a copy.
+///
+/// The precondition only says the server holds something other than what we
+/// assumed — and that something can be our own earlier attempt. An upload that
+/// landed while its answer was lost (a gateway timeout after the server had
+/// committed) leaves us believing it never happened, so the next attempt
+/// collides with the file it created itself. So look at what is really there:
+///
+/// * **The same bytes.** There is nothing to keep apart; adopt that version.
+///   This was the duplicate `… (conflicted copy …).zip` of a retried upload.
+/// * **We were creating the file, and what is there is empty.** An empty file
+///   holds nobody's data, so overwriting it — conditionally on exactly that
+///   version — loses nothing. This was `cat > f` on a bad connection: the
+///   shell's early, empty flush landed unanswered, the content went into a copy
+///   and the file itself stayed empty.
+///
+/// Returns `true` when settled; anything else is a real conflict for the caller.
+fn settle_false_conflict(
+    ctx: &WriteContext,
+    state: &mut StateDb,
+    node: &NodeRow,
+    scratch: &std::path::Path,
+    size: u64,
+) -> Result<bool> {
+    let Some((server_size, server_etag)) = ctx.rt.block_on(ctx.dav.remote_meta(&node.path))? else {
+        return Ok(false); // gone again — nothing of ours to settle against
+    };
+    // We held no version of it, so this upload was creating the file.
+    let creating = node.file_id.is_none() && node.etag.is_empty();
+    let (etag, how) = if server_size == size && same_bytes(ctx, &node.path, scratch)? {
+        (server_etag, "the server already holds these bytes")
+    } else if creating && server_size == 0 {
+        let pre = crate::webdav::Precondition::Match(server_etag);
+        let result = if size > crate::webdav::CHUNK_SIZE {
+            ctx.rt
+                .block_on(ctx.dav.put_chunked(&node.path, scratch, size, &pre, None))?
+        } else {
+            let local = std::fs::read(scratch)?;
+            ctx.rt
+                .block_on(ctx.dav.put_conditional(&node.path, local, &pre, None))?
+        };
+        match result {
+            crate::webdav::PutResult::Uploaded(etag) => (
+                etag.unwrap_or_default(),
+                "replaced the empty file an earlier attempt left",
+            ),
+            // It changed again under us: that one is a real conflict.
+            crate::webdav::PutResult::Conflict => return Ok(false),
+        }
+    } else {
+        return Ok(false);
+    };
+    state.set_etag_size(node.inode, &etag, size)?;
+    tracing::info!(path = %node.path, "upload refusal settled without a copy: {how}");
+    // Learn the file id if we can. If this listing fails as well, the version
+    // just recorded already makes the file count as on the server.
+    ctx.write_epoch.fetch_add(1, Ordering::SeqCst);
+    if let Err(e) = run_reload_dir(ctx, state, node.parent, node.inode) {
+        tracing::debug!(%e, path = %node.path, "relist after settling an upload refusal failed");
+    }
+    Ok(true)
+}
+
+/// Whether the server's content at `path` is byte for byte the file `local`.
+///
+/// Streamed and compared chunk by chunk, since the caller has matched the sizes
+/// already and a large file must not be held in memory just to be compared.
+fn same_bytes(ctx: &WriteContext, path: &str, local: &std::path::Path) -> Result<bool> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(local)?;
+    ctx.rt.block_on(async {
+        let mut resp = ctx.dav.get_streaming(path).await?;
+        let mut mine = Vec::new();
+        while let Some(theirs) = resp.chunk().await? {
+            mine.resize(theirs.len(), 0);
+            if file.read_exact(&mut mine).is_err() || mine[..] != theirs[..] {
+                return Ok::<bool, Error>(false);
+            }
+        }
+        // Their bytes ended; ours must end in the same place.
+        Ok(file.read(&mut [0u8; 1])? == 0)
+    })
+}
+
+/// Attempt a 3-way text merge (base = the cached copy of `base_etag`, ours =
+/// the buffer, theirs = the server's current version).
+///
+/// The base is looked up by the version the edit started from, never by the
+/// row's: the row may already carry theirs, and a base equal to theirs merges
+/// into ours unchanged — the server's edit silently gone.
 ///
 /// `None` when a merge is not possible: no clean base, non-UTF-8 content, or a
 /// real conflict. On success it returns the merged bytes **and** the
@@ -756,9 +938,18 @@ pub fn run_conflict_resolution(
 fn run_text_merge(
     ctx: &WriteContext,
     node: &NodeRow,
+    base_etag: &str,
     local: &[u8],
 ) -> Result<Option<(Vec<u8>, crate::webdav::Precondition)>> {
-    let Some(base) = ctx.content.cached_bytes(node) else {
+    if base_etag.is_empty() {
+        return Ok(None); // a create: there is no version it started from
+    }
+    // Struct update syntax: a copy of the row that names the base version.
+    let base_node = NodeRow {
+        etag: base_etag.to_string(),
+        ..node.clone()
+    };
+    let Some(base) = ctx.content.cached_bytes(&base_node) else {
         return Ok(None); // no clean base to merge against
     };
     let (theirs, theirs_etag) = ctx.rt.block_on(ctx.dav.get_with_etag(&node.path))?;
@@ -811,15 +1002,58 @@ pub fn run_unpin_subtree(
 /// Re-list a directory (PROPFIND + reconcile), so a mutation we just made shows
 /// up with its server-assigned ids.
 ///
+/// `holder` is the object whose flow asks for the listing — the directory
+/// itself for an `ls`, the file for the relist after its first upload. The
+/// listing is kept away from whatever *else* the machine is changing (see
+/// [`reconcile_if_quiet`]): an upload's relist of its parent must not undo a
+/// rename running in that parent at the same time.
+///
 /// # Errors
 /// If the listing or the reconcile fails.
-pub fn run_reload_dir(ctx: &WriteContext, state: &mut StateDb, inode: u64) -> Result<()> {
+pub fn run_reload_dir(
+    ctx: &WriteContext,
+    state: &mut StateDb,
+    inode: u64,
+    holder: u64,
+) -> Result<()> {
+    reload_dir(ctx, state, inode, Some(holder))
+}
+
+/// [`run_reload_dir`] for a background refresh, which runs beside the machine
+/// rather than as a step of one of its flows: the listing is dropped if the
+/// directory was busy while it was taken (see [`crate::activity`]). Nobody
+/// waits for a refresh, and the next access schedules another.
+///
+/// # Errors
+/// If the PROPFIND or the reconcile fails.
+pub fn run_refresh_beside(ctx: &WriteContext, state: &mut StateDb, inode: u64) -> Result<()> {
+    reload_dir(ctx, state, inode, None)
+}
+
+fn reload_dir(
+    ctx: &WriteContext,
+    state: &mut StateDb,
+    inode: u64,
+    holder: Option<u64>,
+) -> Result<()> {
     let Some(dir) = state.node_by_inode(inode)? else {
         return Ok(());
     };
     let before = state.children_of(inode)?;
+    let since = ctx.activity.seq();
     let entries = ctx.rt.block_on(ctx.dav.propfind_dir(&dir.path))?;
-    state.reconcile_children(inode, &dir.path, &entries)?;
+    if !reconcile_if_quiet(
+        state,
+        &ctx.activity,
+        since,
+        holder,
+        inode,
+        &dir.path,
+        &entries,
+    )? {
+        tracing::debug!(path = %dir.path, inode, "listing: directory busy with a local change — skipping");
+        return Ok(());
+    }
 
     // Report what changed, exactly as the syncer's own walk does. Whoever
     // re-lists a directory owes the kernel the same notification, or a file
@@ -967,6 +1201,7 @@ impl Provider {
         // Shared with both background threads so a stale PROPFIND (issued before a
         // local write, applied after) never drives a reconcile — see `write_epoch`.
         let write_epoch = Arc::new(AtomicU64::new(0));
+        let activity = Arc::new(Activity::new());
 
         let (reval_tx, job_rx) = std::sync::mpsc::channel::<(u64, String)>();
         let (res_tx, reval_rx) = std::sync::mpsc::channel::<RevalResult>();
@@ -1038,6 +1273,7 @@ impl Provider {
 
         let sync_dav = dav.with_http_client(crate::tls::client(&settings.tls)?);
         let sync_epoch = write_epoch.clone();
+        let sync_activity = Arc::clone(&activity);
         // The syncer is where a pinned file is discovered to have moved on, so
         // it carries the policy for what to do about it. It starts here, before
         // anybody has installed a desktop backend, so it is given the slot the
@@ -1063,6 +1299,7 @@ impl Provider {
                     sync_rx,
                     sync_inval,
                     sync_epoch,
+                    &sync_activity,
                     sync_pinned,
                 )
             })
@@ -1070,6 +1307,7 @@ impl Provider {
 
         Ok(Self {
             state,
+            server_url: dav.server_url().to_string(),
             pins,
             open_pinned: settings.open_pinned,
             async_upload: matches!(settings.upload, crate::config::UploadMode::Async),
@@ -1087,6 +1325,7 @@ impl Provider {
             db_path,
             text_merge: settings.text_merge,
             write_epoch,
+            activity,
             reval_tx,
             reval_rx,
             reval_pending: HashSet::new(),
@@ -1233,6 +1472,7 @@ impl Provider {
             desktop: Arc::clone(&self.desktop),
             text_merge: self.text_merge,
             write_epoch: Arc::clone(&self.write_epoch),
+            activity: Arc::clone(&self.activity),
             invalidations: self.inval_tx.clone(),
         }
     }
@@ -1302,6 +1542,9 @@ impl Provider {
     /// If the path is unknown, is not pinned, or a download fails.
     pub fn refresh(&mut self, path: &str) -> Result<usize> {
         let path = path.trim_matches('/').to_string();
+        if path.is_empty() && !self.pins.is_pinned("")? {
+            return self.refresh_every_pin();
+        }
         if !self.pins.is_pinned(&path)? {
             return Err(Error::Other(format!(
                 "not pinned, so there is nothing to keep up to date: {path}"
@@ -1332,6 +1575,45 @@ impl Provider {
             // same fetch.
             self.content.pin_file(&node)?;
             Ok(1)
+        }
+    }
+
+    /// [`refresh`](Self::refresh) with no path and no whole-account pin: every
+    /// pin there is. A pin inside a pinned folder is left to that folder, which
+    /// covers it anyway.
+    ///
+    /// One pin that fails — its path gone from the server, a download that
+    /// breaks off — does not keep the others from being updated; the failures
+    /// are counted and reported together at the end.
+    fn refresh_every_pin(&mut self) -> Result<usize> {
+        let pins = self.pins.all()?;
+        if pins.is_empty() {
+            return Err(Error::Other(
+                "nothing is pinned, so there is nothing to keep up to date".into(),
+            ));
+        }
+        let (mut done, mut failed, mut first_error) = (0, 0, None);
+        for (path, _) in &pins {
+            let inside_pinned_folder = pins
+                .iter()
+                .any(|(dir, is_dir)| *is_dir && path.starts_with(&format!("{dir}/")));
+            if inside_pinned_folder {
+                continue;
+            }
+            match self.refresh(path) {
+                Ok(n) => done += n,
+                Err(e) => {
+                    tracing::warn!(%path, %e, "update: pin could not be brought up to date");
+                    failed += 1;
+                    first_error.get_or_insert(e);
+                }
+            }
+        }
+        match first_error {
+            None => Ok(done),
+            Some(e) => Err(Error::Other(format!(
+                "{failed} pin(s) could not be brought up to date ({done} file(s) were): {e}"
+            ))),
         }
     }
 
@@ -1421,6 +1703,14 @@ impl Provider {
     /// If the pins file cannot be read.
     pub fn is_pinned(&self, path: &str) -> Result<bool> {
         self.pins.is_pinned(path)
+    }
+
+    /// The instance base URL (e.g. `https://cloud.example.org`), so a frontend
+    /// can build an object's web link with [`crate::web`]. No trailing slash is
+    /// promised — `web::object_url`/`reveal_url` trim it themselves.
+    #[must_use]
+    pub fn server_url(&self) -> &str {
+        &self.server_url
     }
 
     /// Whether `node`'s offline copy is out of date — a newer version exists on
@@ -1520,6 +1810,186 @@ mod tests {
     /// crate-wide (see `crate::TEST_ENV_LOCK`) — config.rs tests read the same
     /// variables, and a per-module lock would not exclude those.
     use crate::TEST_ENV_LOCK as ENV_LOCK;
+
+    fn file_entry(path: &str, size: u64, etag: &str, file_id: u64) -> RemoteEntry {
+        RemoteEntry {
+            path: path.into(),
+            is_dir: false,
+            size,
+            etag: etag.into(),
+            mtime: 0,
+            file_id: Some(file_id),
+            permissions: "RGDNVW".into(),
+            mount_type: String::new(),
+            is_mount_root: false,
+        }
+    }
+
+    /// An atomic save, caught by a sync walk between its two steps: the server
+    /// has done the `MOVE`, the rows have not been moved yet. The listing shows
+    /// the temporary gone, so applying it deletes the temporary's row — and the
+    /// rename's `MoveRows` then fails on a row that no longer exists (EIO).
+    #[test]
+    fn a_listing_taken_during_a_rename_is_not_applied() {
+        let seed = || {
+            let mut state = StateDb::open_in_memory().unwrap();
+            state
+                .reconcile_children(
+                    ROOT_INODE,
+                    "",
+                    &[
+                        file_entry("init.el", 100, "old", 1),
+                        file_entry("init.el.tmp", 189, "new", 2),
+                    ],
+                )
+                .unwrap();
+            let tmp = state.node_by_path("init.el.tmp").unwrap().unwrap();
+            (state, tmp.inode)
+        };
+        // What the server holds once the MOVE has run.
+        let after_move = [file_entry("init.el", 189, "new", 2)];
+
+        // The failure this guards against: the listing applied mid-rename.
+        let (mut state, tmp) = seed();
+        state
+            .reconcile_children(ROOT_INODE, "", &after_move)
+            .unwrap();
+        assert!(
+            state.move_subtree(tmp, ROOT_INODE, "init.el").is_err(),
+            "applied mid-rename, the listing takes the row the rename still has to move"
+        );
+
+        // The walk takes its snapshot, the rename starts on the directory, the
+        // listing comes back while it runs.
+        let (mut state, tmp) = seed();
+        let activity = Activity::new();
+        let since = activity.seq();
+        activity.set_busy([ROOT_INODE]);
+        let applied = reconcile_if_quiet(
+            &mut state,
+            &activity,
+            since,
+            None,
+            ROOT_INODE,
+            "",
+            &after_move,
+        )
+        .unwrap();
+        assert!(!applied, "a busy directory's listing must be dropped");
+        state.move_subtree(tmp, ROOT_INODE, "init.el").unwrap();
+        activity.set_busy([]);
+
+        // Finished by now, but it ran while the listing was taken: still dropped.
+        assert!(!reconcile_if_quiet(
+            &mut state,
+            &activity,
+            since,
+            None,
+            ROOT_INODE,
+            "",
+            &after_move
+        )
+        .unwrap());
+        // A listing taken afterwards is applied.
+        let since = activity.seq();
+        assert!(reconcile_if_quiet(
+            &mut state,
+            &activity,
+            since,
+            None,
+            ROOT_INODE,
+            "",
+            &after_move
+        )
+        .unwrap());
+        let saved = state.node_by_path("init.el").unwrap().unwrap();
+        assert_eq!((saved.inode, saved.size), (tmp, 189));
+    }
+
+    /// A listing taken while one file in the directory is being uploaded: the
+    /// listing may predate the upload, so it must not delete that file's row —
+    /// but everything else in the directory is still brought up to date.
+    #[test]
+    fn a_listing_leaves_a_changing_child_alone() {
+        let mut state = StateDb::open_in_memory().unwrap();
+        state
+            .reconcile_children(
+                ROOT_INODE,
+                "",
+                &[
+                    file_entry("uploading.txt", 10, "a", 1),
+                    file_entry("other.txt", 10, "a", 2),
+                ],
+            )
+            .unwrap();
+        let uploading = state.node_by_path("uploading.txt").unwrap().unwrap();
+        let activity = Activity::new();
+        let since = activity.seq();
+        activity.set_busy([uploading.inode]);
+
+        // Taken before the upload landed: `uploading.txt` is not there yet.
+        let listing = [file_entry("other.txt", 20, "b", 2)];
+        assert!(
+            reconcile_if_quiet(&mut state, &activity, since, None, ROOT_INODE, "", &listing)
+                .unwrap()
+        );
+        assert!(
+            state.node_by_inode(uploading.inode).unwrap().is_some(),
+            "the file being uploaded keeps its row"
+        );
+        assert_eq!(state.node_by_path("other.txt").unwrap().unwrap().size, 20);
+
+        // The upload's own relist of its parent: its own flow is no reason to
+        // distrust the listing, so its row is updated.
+        let own = [
+            file_entry("uploading.txt", 30, "c", 1),
+            file_entry("other.txt", 20, "b", 2),
+        ];
+        assert!(reconcile_if_quiet(
+            &mut state,
+            &activity,
+            since,
+            Some(uploading.inode),
+            ROOT_INODE,
+            "",
+            &own
+        )
+        .unwrap());
+        assert_eq!(
+            state.node_by_inode(uploading.inode).unwrap().unwrap().size,
+            30
+        );
+    }
+
+    /// The relist after a file's first upload, while a rename runs in the same
+    /// directory: the directory is held by the rename, so the listing is dropped
+    /// even though the upload's own flow asked for it.
+    #[test]
+    fn an_upload_relist_waits_out_a_rename_in_its_directory() {
+        let mut state = StateDb::open_in_memory().unwrap();
+        state
+            .reconcile_children(ROOT_INODE, "", &[file_entry("a.tmp", 10, "a", 1)])
+            .unwrap();
+        let uploaded = state.insert_local_file(ROOT_INODE, "new.txt").unwrap();
+        let activity = Activity::new();
+        let since = activity.seq();
+        activity.set_busy([ROOT_INODE, uploaded.inode]);
+        let after_move = [
+            file_entry("a.txt", 10, "a", 1),
+            file_entry("new.txt", 5, "n", 3),
+        ];
+        assert!(!reconcile_if_quiet(
+            &mut state,
+            &activity,
+            since,
+            Some(uploaded.inode),
+            ROOT_INODE,
+            "",
+            &after_move
+        )
+        .unwrap());
+        assert!(state.node_by_path("a.tmp").unwrap().is_some());
+    }
 
     #[test]
     fn conflict_copy_names_are_deduplicated_per_attempt() {

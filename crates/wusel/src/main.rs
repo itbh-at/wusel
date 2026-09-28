@@ -59,7 +59,7 @@ enum Command {
         mountpoint: Option<String>,
     },
     /// Run the engine and serve its intent protocol over a Unix-domain socket
-    /// (the macOS File Provider IPC spike — read path only, no FUSE).
+    /// (the backend of the macOS File Provider frontend; no FUSE).
     Serve {
         /// Socket to bind; defaults to a per-account path under the runtime dir.
         #[arg(long)]
@@ -95,6 +95,9 @@ enum Command {
         /// `setattr` only: the new modification time (Unix seconds).
         #[arg(long)]
         mtime: Option<i64>,
+        /// `create`/`setattr`: the executable bit (kept locally, never synced).
+        #[arg(long)]
+        exec: Option<bool>,
     },
     /// Manage the systemd user service (Linux).
     Service {
@@ -130,6 +133,13 @@ enum Command {
     },
     /// List the pins for the account.
     Pins,
+    /// Nextcloud web URLs for a file or folder — what a file manager's "open in
+    /// Nextcloud" / "copy internal link" actions use. Prints the URL; the caller
+    /// opens it (no platform opener is baked in, so it is the same on every OS).
+    Web {
+        #[command(subcommand)]
+        action: WebCmd,
+    },
     /// List configured accounts.
     Accounts,
     /// Manage named accounts.
@@ -181,12 +191,28 @@ enum Command {
 #[derive(Subcommand)]
 enum CacheCmd {
     /// Drop cached data so the next access loads fresh from the server: the
-    /// whole account (metadata, content and pins — like a fresh connection;
+    /// whole account (metadata and content — like a fresh connection; pins,
     /// credentials and config are kept) or one path's subtree. Stop a running
     /// mount first. Separates "stale cache" from "server-side" problems.
     Clear {
         /// Remote path (e.g. "Photos"); no path = the whole account.
         path: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum WebCmd {
+    /// Print the Nextcloud web URL for a path. The default is the object link
+    /// (`…/f/<id>`): it opens a file in the web viewer, navigates into a folder,
+    /// and — being id-based — survives a rename, so it doubles as the "internal
+    /// link" to copy. `--reveal` prints the link that opens the *parent* folder
+    /// with the object highlighted instead.
+    Url {
+        /// Path: relative to the account root, or absolute in the mount.
+        path: String,
+        /// Print the "reveal in its folder" link instead of the object link.
+        #[arg(long)]
+        reveal: bool,
     },
 }
 
@@ -291,6 +317,7 @@ fn main() -> anyhow::Result<()> {
             dir,
             size,
             mtime,
+            exec,
         } => cmd_ipc(
             &account,
             IpcArgs {
@@ -303,6 +330,7 @@ fn main() -> anyhow::Result<()> {
                 dir,
                 size,
                 mtime,
+                exec,
             },
         ),
         Command::Service { action } => cmd_service(&account, action),
@@ -310,6 +338,9 @@ fn main() -> anyhow::Result<()> {
         Command::Unpin { path } => cmd_unpin(&account, path.as_deref().unwrap_or("")),
         Command::Update { path } => cmd_update(&account, path.as_deref().unwrap_or("")),
         Command::Pins => cmd_pins(&account),
+        Command::Web { action } => match action {
+            WebCmd::Url { path, reveal } => cmd_web_url(&account, &path, reveal),
+        },
         Command::Accounts => cmd_accounts_list(),
         Command::Account { action } => match action {
             AccountCmd::List => cmd_accounts_list(),
@@ -681,7 +712,7 @@ fn cmd_mount(account: &Account, mountpoint: Option<&str>) -> anyhow::Result<()> 
 
     let http = build_http_client(&settings.tls)?;
     let dav_user = resolve_dav_user(
-        &http,
+        &settings.tls,
         &creds.server,
         &creds.login_name,
         &creds.app_password,
@@ -717,6 +748,7 @@ fn cmd_mount(account: &Account, mountpoint: Option<&str>) -> anyhow::Result<()> 
         provider.sync_trigger(),
         Some(std::sync::Arc::clone(&health)),
     );
+    start_poller(&push, provider.sync_trigger(), settings.poll_secs);
 
     provider.set_desktop(desktop);
 
@@ -895,7 +927,7 @@ fn cmd_mount(_account: &Account, _mountpoint: Option<&str>) -> anyhow::Result<()
     )
 }
 
-// --- socket frontend (macOS File Provider IPC spike) ------------------------
+// --- socket frontend (macOS File Provider backend) -------------------------
 
 /// Run the engine for `account` and serve its intent protocol over a
 /// Unix-domain socket. Deliberately **not** behind the `fuse` feature: driving
@@ -1002,6 +1034,11 @@ fn cmd_serve(account: &Account, socket: Option<&str>) -> anyhow::Result<()> {
         provider.sync_trigger(),
         Some(std::sync::Arc::clone(&health)),
     );
+    start_poller(
+        &_push,
+        provider.sync_trigger(),
+        account.settings().poll_secs,
+    );
 
     // Route engine notices to the fan-out for the life of the daemon.
     provider.set_desktop(
@@ -1070,6 +1107,7 @@ struct IpcArgs<'a> {
     dir: bool,
     size: Option<u64>,
     mtime: Option<i64>,
+    exec: Option<bool>,
 }
 
 /// A client for a running `wusel serve` socket. `stat`/`enumerate` and the
@@ -1140,7 +1178,9 @@ fn cmd_ipc(account: &Account, args: IpcArgs) -> anyhow::Result<()> {
         dir: args.dir,
         size: args.size,
         mtime: args.mtime,
+        exec: args.exec,
         since: 0,
+        reveal: false,
     };
 
     // `write` streams its payload from stdin in the frame after the request.
@@ -1473,7 +1513,7 @@ fn build_provider(
     // This is usually the mount's first request, so it is also where an outage is
     // first seen: the outcome goes to `health` (when present) like any other.
     let dav_user = resolve_dav_user(
-        &http,
+        &account.settings().tls,
         &creds.server,
         &creds.login_name,
         &creds.app_password,
@@ -1514,7 +1554,7 @@ fn build_provider(
 /// is first seen: the outcome goes to `health` like any other, and the user is
 /// told once it is clear the server is really gone rather than briefly busy.
 fn resolve_dav_user(
-    http: &reqwest::Client,
+    tls: &config::TlsSettings,
     server: &str,
     login: &str,
     password: &str,
@@ -1524,8 +1564,13 @@ fn resolve_dav_user(
         .enable_all()
         .build()
         .ok()?;
+    // A client of its own, not the engine's: hyper spawns a connection's driver
+    // task on the runtime that opened it, and this runtime is dropped right
+    // after. With HTTP/2 that connection is the one the engine would go on to
+    // share for every request — its driver gone with this runtime.
+    let http = wusel_core::tls::client(tls).ok()?;
     match rt.block_on(wusel_core::capabilities::whoami(
-        http, server, login, password,
+        &http, server, login, password,
     )) {
         Ok(id) => {
             if let Some(health) = health {
@@ -1871,6 +1916,51 @@ fn pin_target(
 }
 
 /// Pin a path and hydrate it now (a directory recursively).
+/// Print the Nextcloud web URL for a path — the backend of a file manager's
+/// "open in Nextcloud" / "copy internal link". Building the string is all it
+/// does; the caller opens it. So it behaves the same on every OS, with no
+/// `xdg-open`-style platform opener baked into the engine.
+fn cmd_web_url(account: &Account, path: &str, reveal: bool) -> anyhow::Result<()> {
+    let (account, remote) = resolve_pin_target(account, path)?;
+    let creds = wusel_core::credentials::load(&account.credentials_path(), account.name())
+        .with_context(|| {
+            format!(
+                "no credentials — run `wusel login{} <server-url>` first",
+                account_flag(&account)
+            )
+        })?;
+    // A web link is built from local metadata only — the file id and the server
+    // base — so this stays a fast, offline operation with no network round-trip.
+    // That matters because a file manager spawns it on a menu click, on its own
+    // main thread; going to the network here would stall the window.
+    let state = open_state(&account)?;
+    let node = state
+        .node_by_path(&remote)
+        .context("could not read the local metadata")?
+        .ok_or_else(|| anyhow::anyhow!("'{remote}' is not in this account's metadata"))?;
+    // No file id means the object exists only locally — a deferred create not yet
+    // flushed — so there is nothing on the server for a web link to point at.
+    let file_id = node.file_id.ok_or_else(|| {
+        anyhow::anyhow!("'{remote}' is not on the server yet — nothing to link to")
+    })?;
+    let url = if reveal {
+        wusel_core::web::reveal_url(&creds.server, file_id, &parent_dir(&remote))
+    } else {
+        wusel_core::web::object_url(&creds.server, file_id)
+    };
+    println!("{url}");
+    Ok(())
+}
+
+/// The rooted, account-relative parent of `remote`, for the reveal link's
+/// `?dir=`: `Docs/plan.txt` → `/Docs`, a name at the root → `/`.
+fn parent_dir(remote: &str) -> String {
+    match remote.trim_matches('/').rsplit_once('/') {
+        Some((parent, _)) => format!("/{parent}"),
+        None => "/".to_string(),
+    }
+}
+
 fn cmd_pin(account: &Account, path: Option<&str>, all: bool) -> anyhow::Result<()> {
     let (account, remote) = pin_target(account, path, all)?;
     let mut provider = build_provider(&account, None)?;
@@ -2190,8 +2280,9 @@ fn cmd_accounts_list() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Removes a named account: its credentials, state and cache. The files on the
-/// server are untouched; a running mount must be stopped separately.
+/// Removes a named account: its credentials (file and keyring entry), config,
+/// pins, state and cache. The files on the server are untouched; a running
+/// mount must be stopped separately.
 fn cmd_account_remove(name: &str) -> anyhow::Result<()> {
     let account = Account::new(name);
     if account.is_default() {
@@ -2200,6 +2291,9 @@ fn cmd_account_remove(name: &str) -> anyhow::Result<()> {
     if !account.credentials_path().exists() {
         bail!("no such account: {}", account.name());
     }
+    // Before the directories: the keyring entry is keyed by the account's name
+    // and would otherwise outlive the account it belongs to.
+    wusel_core::credentials::forget(account.name());
     for dir in [
         account.config_dir(),
         account.state_dir(),
@@ -2216,6 +2310,23 @@ fn cmd_account_remove(name: &str) -> anyhow::Result<()> {
     );
     println!("Note: stop a running instance first — this does not unmount it.");
     Ok(())
+}
+
+/// Poll for remote changes while notify_push is absent or down — `[sync]
+/// poll_secs`, `0` = off. Shared by `mount` and `serve`, which set up the same
+/// listener.
+fn start_poller(
+    push: &wusel_core::push::PushListener,
+    trigger: std::sync::mpsc::Sender<()>,
+    secs: u64,
+) {
+    if secs > 0 {
+        wusel_core::push::poll_while_disconnected(
+            push.status(),
+            trigger,
+            std::time::Duration::from_secs(secs),
+        );
+    }
 }
 
 /// The `--account NAME` fragment for help text (empty for the default account).
@@ -2247,7 +2358,8 @@ fn init_tracing() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                "wusel=info,wusel_core=info,wusel_fuse=info,wusel_desktop=info".into()
+                "wusel=info,wusel_core=info,wusel_fuse=info,wusel_desktop=info,wusel_ipc=info"
+                    .into()
             }),
         )
         .init();
@@ -2256,6 +2368,16 @@ fn init_tracing() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parent_dir_roots_the_account_relative_parent() {
+        assert_eq!(parent_dir("Docs/plan.txt"), "/Docs");
+        assert_eq!(parent_dir("a/b/c.txt"), "/a/b");
+        // A name at the account root has the root as its parent.
+        assert_eq!(parent_dir("plan.txt"), "/");
+        // Leading/trailing slashes on the input do not change the parent.
+        assert_eq!(parent_dir("/Docs/plan.txt"), "/Docs");
+    }
 
     #[test]
     fn unit_is_templated_and_uses_the_given_binary() {

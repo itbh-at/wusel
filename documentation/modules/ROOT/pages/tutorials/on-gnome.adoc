@@ -43,9 +43,11 @@ changes.
 * Permission to install a package (`sudo`).
 ****
 
-== Step 1 — Install the package
+== Step 1 — Install the packages
 
-Wusel is published as a signed repository, so your package manager installs it
+Wusel comes as two packages: `wusel`, the mount, and `wusel-nautilus`, which
+adds emblems and a context menu to Files. Wusel is published as a signed
+repository, so your package manager installs it
 and keeps it updated like anything else. Run the block for your distribution.
 
 Fedora:
@@ -64,6 +66,9 @@ sudo zypper addrepo https://download.opensuse.org/repositories/home:/cdhermann:/
 sudo zypper install wusel
 ----
 
+On Fedora and openSUSE, `wusel` pulls in `wusel-nautilus` by itself because
+Files is installed. Debian and Ubuntu do not, so there you name both.
+
 Debian 13 or Ubuntu 26.04 — substitute `xUbuntu_26.04` for `Debian_13` on Ubuntu:
 
 [source,sh]
@@ -72,7 +77,7 @@ echo 'deb http://download.opensuse.org/repositories/home:/cdhermann:/wusel/Debia
   | sudo tee /etc/apt/sources.list.d/home:cdhermann:wusel.list
 curl -fsSL https://download.opensuse.org/repositories/home:cdhermann:wusel/Debian_13/Release.key \
   | gpg --dearmor | sudo tee /etc/apt/trusted.gpg.d/home_cdhermann_wusel.gpg > /dev/null
-sudo apt update && sudo apt install wusel
+sudo apt update && sudo apt install wusel wusel-nautilus
 ----
 
 Anything else — Arch, an older Ubuntu, a distribution not listed —
@@ -96,7 +101,9 @@ It prints a URL. Open it, confirm in the browser, and come back to the terminal.
 You should see:
 
 ----
-✓ Logged in as <you> on <server>
+✓ Logged in as '<you>' on <server>
+  app password stored in the OS keyring
+  server: Nextcloud <version>
 ----
 
 Your real account password is never sent to Wusel. What it received is a
@@ -182,15 +189,19 @@ Its emblem turns into a green check. That file is now downloaded and exempt from
 eviction — it is readable with the network off. `wusel pin Documents` does the
 same for a whole folder, recursively, and `wusel unpin` releases it.
 
-In Files, the same thing is the right-click action *Make Available Offline*.
+In Files, the same thing is the right-click *Wusel* submenu's *Make Available
+Offline*; *Stop Keeping Offline* in the same submenu releases it.
 
 == Step 7 — Watch it update itself
 
 Change a file in Nextcloud's web interface — or from your phone — and watch the
 open Files window. If your server has the
-https://apps.nextcloud.com/apps/notify_push[`notify_push`] app, the change
-appears within moments, with no refresh. Without it, Wusel catches up within
-half a minute or so.
+https://apps.nextcloud.com/apps/notify_push[`notify_push`] app, Wusel learns of
+the change within moments: the file's emblem updates by itself, and opening it
+gives the new content. A file added or removed on the server shows in a window
+that is already open once you reload it (kbd:[F5]). Without `notify_push`, Wusel
+re-lists a folder you open once its listing is older than half a minute, and
+checks the whole tree every five minutes.
 
 == That is the whole thing
 
@@ -199,7 +210,7 @@ use it, and updates itself. Nothing needs starting; the service comes back at
 every login.
 
 Try the Activities overview as well: start typing a filename and your Nextcloud
-results appear under *Wusel (Nextcloud)*. That search runs on the server, so it
+results appear under *Wusel*. That search runs on the server, so it
 finds files you have never downloaded.
 
 .Where to go next

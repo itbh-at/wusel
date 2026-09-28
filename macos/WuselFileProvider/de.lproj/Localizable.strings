@@ -2,7 +2,11 @@
    Emblem-Beschriftungen (NSFileProviderDecorations). File Provider lokalisiert
    diese über Localizable.strings — nicht InfoPlist.strings — mit dem Namen bzw.
    Label aus der Info.plist als Schlüssel. */
-"Make Available Offline" = "Offline verfügbar machen";
-"Remove Offline Availability" = "Offline-Verfügbarkeit aufheben";
+"Make Available Offline" = "Wusel: Offline verfügbar machen";
+"Remove Offline Availability" = "Wusel: Offline-Verfügbarkeit aufheben";
+"Update Now" = "Wusel: Jetzt aktualisieren";
+"Open in Nextcloud" = "Wusel: In Nextcloud öffnen";
+"Open Folder in Nextcloud" = "Wusel: Ordner in Nextcloud öffnen";
+"Copy Internal Link" = "Wusel: Internen Link kopieren";
 "Available Offline" = "Offline verfügbar";
 "Offline Copy Outdated" = "Offline-Kopie veraltet";

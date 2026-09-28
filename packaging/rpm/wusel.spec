@@ -40,33 +40,49 @@ BuildRequires:  make
 BuildRequires:  pkgconf-pkg-config
 BuildRequires:  nautilus-devel
 BuildRequires:  glib2-devel
+BuildRequires:  gtk4-devel
 BuildRequires:  fuse3-devel
 
-# fusermount3 (unprivileged mount) at runtime. libfuse3 / libnautilus-extension
-# come in automatically as auto-generated soname dependencies of the binary/.so.
+# fusermount3 (unprivileged mount) at runtime — the binary links no libfuse; it
+# speaks the kernel protocol itself. libnautilus-extension comes in
+# automatically, as a soname dependency of the extension in the subpackage.
 Requires:       fuse3
-# The Nautilus extension and GNOME Shell search provider live in this package;
-# they are inert without their host. `Suggests` rather than `Recommends`, because
-# dnf installs weak dependencies by default: on a desktop these are already
-# present and the difference is invisible, but on a server, a minimal install or
-# a KDE machine `Recommends` drags in the whole GNOME stack — several hundred
-# packages — for a mount that needs `fuse3` and nothing else.
-Suggests:       nautilus
+# The Nautilus extension is its own subpackage (below), because its libraries
+# are hard dependencies of whatever package holds it. The GNOME Shell search
+# provider is the wusel binary answering D-Bus and needs no library; it is
+# inert without its host. `Suggests` rather than `Recommends`, because dnf
+# installs weak dependencies by default: on a server, a minimal install or a
+# KDE machine `Recommends` drags in the GNOME stack for a mount that needs
+# `fuse3` and nothing else.
+Suggests:       %{name}-nautilus
 Suggests:       gnome-shell
 
 %description
 Wusel makes a Nextcloud appear as an ordinary folder on Linux — VFS-first:
 files are online-only by default and are fetched on access (on-demand
-hydration), instead of mirroring everything locally. It is more than just FUSE:
-this package also ships the GNOME/Nautilus integration (per-file emblems, a
-pin/unpin context menu, sidebar cloud-provider status) and a GNOME Shell search
-provider backed by Nextcloud Unified Search.
+hydration), instead of mirroring everything locally. It needs no desktop.
+Where there is one, it adds notifications, a cloud-provider entry in the file
+manager's sidebar and a GNOME Shell search provider backed by Nextcloud Unified
+Search — all over D-Bus, with no library dependency. Emblems and the context
+menu in GNOME Files come with %{name}-nautilus.
 
 The mount runs as a systemd *user* service, one instance per account:
     wusel login https://cloud.example.org
     systemctl --user enable --now wusel@default
 Then log out and back in so Nautilus loads the extension and GNOME Shell picks
 up the search provider. See the Installation page in the documentation.
+
+%package nautilus
+Summary:        GNOME Files (Nautilus) integration for Wusel
+Requires:       %{name}%{?_isa} = %{version}-%{release}
+Supplements:    (%{name} and nautilus)
+
+%description nautilus
+Per-file emblems for the offline and sync state, and a "Wusel" context menu in
+GNOME Files: keep files or folders offline, update them, open them in Nextcloud
+and copy their internal link. A separate package so that a server or a desktop
+without GNOME Files gets the mount without the file-manager libraries this
+extension needs.
 
 %prep
 # Source0 unpacks to %{name}-%{version} (built with `git archive
@@ -150,9 +166,6 @@ fi
 # systemd user unit template (per-account instances: wusel@<account>).
 # Path hardcoded so the build needs no systemd-rpm-macros for the unit-dir macro.
 /usr/lib/systemd/user/wusel@.service
-# Native Nautilus extension + its emblem icons.
-%{_libdir}/nautilus/extensions-4/libwusel-nautilus.so
-%{_datadir}/icons/hicolor/scalable/emblems/wusel-emblem-*.svg
 # App icons. The full-colour logo is the app-grid/launcher icon (`.desktop`
 # Icon=); the symbolic (monochrome) one is the file-manager sidebar entry, which
 # GTK re-tints to the theme foreground so it stays legible in Dark Mode.
@@ -175,8 +188,21 @@ fi
 # dirs — no per-package scriptlet needed. The systemd user unit is a template
 # with no system-wide preset to apply; each user enables their own instance.
 
+%files nautilus
+# Native Nautilus extension + its emblem icons.
+%{_libdir}/nautilus/extensions-4/libwusel-nautilus.so
+%{_datadir}/icons/hicolor/scalable/emblems/wusel-emblem-*.svg
+
 %changelog
-* Sun Sep 14 2026 Christoph D. Hermann <christoph.hermann@itbh.at> - 0.4.1-1
+* Mon Sep 28 2026 Christoph D. Hermann <christoph.hermann@itbh.at> - 0.5.0-1
+- HTTP/2 over TLS; periodic sync polling and a catch-up after every notify_push reconnect
+- GNOME Files integration split into its own package (wusel-nautilus) with a Wusel submenu
+- `wusel web url`; the executable bit is kept locally (FUSE and macOS Finder)
+- Upload correctness: no conflicted copy of your own upload; rename/remove wait for the upload
+- Text merge starts from the base version; SQLite immediate transactions; safer listings
+- macOS (experimental): Finder web actions, shown only where they fit the selection
+
+* Mon Sep 14 2026 Christoph D. Hermann <christoph.hermann@itbh.at> - 0.4.1-1
 - Judge server reachability by HTTP, not the notify_push WebSocket: a broken
   push endpoint no longer reports the server offline; an unreachable one still is
 - Make re-creating an existing folder (MKCOL) idempotent so it succeeds
@@ -193,7 +219,7 @@ fi
 - Real storage quota via statfs; Team/Group folder roots marked; opt-in notify
   hook; searchable documentation; a page comparing Wusel to the official client
 
-* Thu Aug 27 2026 Christoph D. Hermann <christoph.hermann@itbh.at> - 0.3.2-1
+* Wed Sep 02 2026 Christoph D. Hermann <christoph.hermann@itbh.at> - 0.3.2-1
 - A permanently failed upload is now surfaced once instead of retried forever
   in silence, phantom "waiting" uploads left by a delete or rename are cleared,
   and notify_push recovers on its own after a transient discovery error.
@@ -202,7 +228,7 @@ fi
 - The Debian and Ubuntu packages build again; the documentation installs from
   the signed repository rather than from a downloaded file.
 
-* Tue Aug 25 2026 Christoph D. Hermann <christoph.hermann@itbh.at> - 0.3.0-1
+* Wed Aug 26 2026 Christoph D. Hermann <christoph.hermann@itbh.at> - 0.3.0-1
 - Debian/Ubuntu and Arch packages join the Fedora RPM, built from the same
   recipes and published through the Open Build Service.
 - The documentation is restructured onto the Diataxis framework.

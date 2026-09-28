@@ -104,7 +104,7 @@ record is cleared (`rm -rf ~/.cache/thumbnails/fail/gnome-thumbnail-factory`).
 Today, only the indexer half has an answer: `[desktop]
 exclude_from_indexers` (on by default) makes the mount serve synthetic
 `.trackerignore` / `.nomedia` markers that GNOME Tracker/LocalSearch honour —
-see xref:reference/file-states.adoc[File states]. Previews are not covered
+see xref:reference/files-and-directories.adoc#_inside_the_mount[Files and directories]. Previews are not covered
 by it. Turning thumbnails off in the file manager works, but it is a global
 setting; there is no per-folder scope for it.
 
@@ -145,7 +145,7 @@ The mount says which case it is in, at `info`, once per fetch:
 
 [source,console]
 ----
-$ journalctl --user -u wusel@default | grep quota
+$ journalctl --user -u wusel@default | grep -E 'quota|free-space'
 ... storage quota updated used=534696340 available=10202721900
 ... the server reported no usable free-space figure (unlimited, or not yet
     computed) — statfs keeps its placeholder used=614388147

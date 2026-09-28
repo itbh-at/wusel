@@ -39,8 +39,9 @@ The source in this repository is the whole product. The company earns from
 == What is free (the open promise)
 
 Everything in this repository is licensed under *Apache-2.0*. That is the entire
-client — `wusel-core` plus every OS frontend (FUSE today; macOS File Provider and
-Windows Cloud Filter as they land) — and it is *fully functional*:
+client — `wusel-core` plus every OS frontend (FUSE on Linux and the
+experimental macOS File Provider today; Windows Cloud Filter when it lands) — and
+it is *fully functional*:
 
 * *No licence check, no activation, no phone-home.* There is deliberately no
   licensing logic anywhere in the code, and there never will be. A gate in open

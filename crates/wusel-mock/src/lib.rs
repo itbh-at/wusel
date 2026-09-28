@@ -12,12 +12,21 @@
 //! * `PUT` / `MKCOL` / `DELETE` / `MOVE` → mutate the backing directory, so a
 //!   write round-trip (write then re-list/read) can be tested end-to-end.
 //!
-//! Two **fault-injection markers** in a file's name let a test provoke server
+//! **Fault-injection markers** in a file's name let a test provoke server
 //! behaviour that is otherwise hard to stage — see [`Config::failed_once`] and
 //! [`etag_headers`]:
 //!
 //! * `*.fail-once` — the first `PUT` to it answers `500`, then it succeeds.
 //! * `*.no-etag*` — its `PUT`/`MOVE` answers carry no `ETag` header.
+//! * `*.lost-once.*` — the first `PUT` to it **lands**, and is then answered
+//!   `504`: the server committed, the answer never made it back. Mid-name, so a
+//!   conflicted copy of it (`x.lost-once (conflicted copy …).ext`) is not hit.
+//! * `*.relist-fails` (a directory) — after the first `PUT` into it, its next
+//!   listing answers `503`, once: the relist a client does right after an
+//!   upload fails.
+//! * `*.fail-perm` — every `PUT` to it is refused permanently (`403`).
+//! * `.proxy-403` in a chunked upload's target — the file is assembled, but the
+//!   assembly `MOVE` is answered `403`, as a reverse proxy that mangles it would.
 //!
 //! Everything is hand-rolled on `tokio` — no HTTP framework, no XML crate, no
 //! percent-coding crate. It is a mock: the correctness bar is "the `wusel-core`
@@ -39,6 +48,7 @@ use std::collections::HashSet;
 use std::fs::Metadata;
 use std::hash::{Hash, Hasher};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -61,6 +71,15 @@ struct Config {
     /// succeeds afterwards, so a test can assert the client retries without
     /// losing the buffered content. Shared across connections via `Arc`.
     failed_once: Arc<Mutex<HashSet<String>>>,
+    /// Test-only fault injection: `*.lost-once.*` paths whose first `PUT` has
+    /// already landed-and-failed (see `put`).
+    lost_once: Arc<Mutex<HashSet<String>>>,
+    /// Test-only fault injection: `*.relist-fails` directories that received a
+    /// `PUT` and whose next Depth-1 listing therefore fails (see `put`).
+    relist_armed: Arc<Mutex<HashSet<String>>>,
+    /// …and those whose one injected failure has been spent, so later uploads
+    /// into them (a retry, a conflicted copy) are listed normally.
+    relist_spent: Arc<Mutex<HashSet<String>>>,
     /// Directories the mock presents as Team/Group folder roots — rel paths, as
     /// the server would mount them. Each listed directory carries
     /// `nc:mount-type=group` with `nc:is-mount-root=true`, and everything inside
@@ -107,6 +126,9 @@ pub async fn serve(listener: TcpListener, root: PathBuf, user: &str) -> std::io:
         uploads_prefix: format!("/remote.php/dav/uploads/{user}"),
         uploads_dir,
         failed_once: Arc::new(Mutex::new(HashSet::new())),
+        lost_once: Arc::new(Mutex::new(HashSet::new())),
+        relist_armed: Arc::new(Mutex::new(HashSet::new())),
+        relist_spent: Arc::new(Mutex::new(HashSet::new())),
         group_folders: std::env::var("WUSEL_MOCK_GROUP_FOLDERS")
             .ok()
             .into_iter()
@@ -554,6 +576,41 @@ async fn put(
         return respond_io_error(stream, &e).await;
     }
     set_file_mtime(fs_path, req.oc_mtime);
+    // Test-only fault injection: the first upload into a `*.relist-fails`
+    // directory arms that directory's next listing to fail — once — the relist a
+    // client does right after the upload, to learn the new file's id.
+    if let Some((dir, _)) = req.rel.rsplit_once('/') {
+        let spent = cfg
+            .relist_spent
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(dir);
+        if dir.ends_with(".relist-fails") && !spent {
+            cfg.relist_armed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(dir.to_string());
+        }
+    }
+    // Test-only fault injection: the first PUT to a `*.lost-once.*` file has
+    // landed above, and is now answered as a failure — the gateway timeout a
+    // client sees when the server committed but the answer never made it back.
+    if req.rel.contains(".lost-once.")
+        && cfg
+            .lost_once
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(req.rel.clone())
+    {
+        return respond(
+            stream,
+            "504 Gateway Timeout",
+            "text/plain",
+            &[],
+            b"injected lost answer",
+        )
+        .await;
+    }
     respond(
         stream,
         "201 Created",
@@ -746,6 +803,15 @@ async fn read_request(stream: &mut TcpStream, cfg: &Config) -> std::io::Result<O
     }))
 }
 
+/// Depth-1 listings of the account root served so far. Process-wide, so a test
+/// can assert that a request was *not* made — which no response can show. Sound
+/// because every mock test file is its own binary running a single test.
+pub static ROOT_LISTINGS: AtomicUsize = AtomicUsize::new(0);
+
+/// Depth-0 `getetag` probes of the account root served so far (the quota
+/// request, also Depth 0 on the root, is not counted). See [`ROOT_LISTINGS`].
+pub static ROOT_ETAG_PROBES: AtomicUsize = AtomicUsize::new(0);
+
 /// PROPFIND: describe the target and (at Depth 1, for a directory) its children.
 async fn propfind(
     stream: &mut TcpStream,
@@ -763,9 +829,38 @@ async fn propfind(
     {
         tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
     }
+    // Test-only fault injection (see `put`): the listing that follows an upload
+    // into a `*.relist-fails` directory fails once.
+    if req.depth != "0"
+        && cfg
+            .relist_armed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&req.rel)
+    {
+        cfg.relist_spent
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(req.rel.clone());
+        return respond(
+            stream,
+            "503 Service Unavailable",
+            "text/plain",
+            &[],
+            b"injected relist failure",
+        )
+        .await;
+    }
     let Ok(meta) = std::fs::metadata(fs_path) else {
         return respond(stream, "404 Not Found", "text/plain", &[], b"not found").await;
     };
+    if req.rel.is_empty() {
+        if req.depth != "0" {
+            ROOT_LISTINGS.fetch_add(1, Ordering::SeqCst);
+        } else if req.body.windows(7).any(|w| w == b"getetag") {
+            ROOT_ETAG_PROBES.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 
     let mut body = String::from(
         "<?xml version=\"1.0\"?>\n\
@@ -1176,6 +1271,9 @@ mod tests {
             uploads_prefix: "/remote.php/dav/uploads/alice".into(),
             uploads_dir: PathBuf::from("/tmp/wusel-mock-uploads"),
             failed_once: Arc::new(Mutex::new(HashSet::new())),
+            lost_once: Arc::new(Mutex::new(HashSet::new())),
+            relist_armed: Arc::new(Mutex::new(HashSet::new())),
+            relist_spent: Arc::new(Mutex::new(HashSet::new())),
             group_folders: Vec::new(),
         }
     }

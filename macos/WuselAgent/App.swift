@@ -52,6 +52,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// opened-folder reconcile when the connection is restored.
     private lazy var notices = NoticeWatcher(socketPath: SharedPaths.socketPath, domain: domain)
 
+    /// Carries out the web actions the sandboxed extension cannot (open a link in
+    /// the browser, copy it to the clipboard).
+    private let webActions = WebActionResponder()
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         AgentLog.log("starting; bundle=\(Bundle.main.bundlePath)")
 
@@ -71,6 +75,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // can miss a serve orphaned the instant after spawning — left behind.
         reapStrayAgents()
         reapStrayServes()
+
+        // Listen for the extension's web-action requests (open/copy a link). It
+        // needs no serve, so start it now; a request that arrived while we were
+        // away is drained on start.
+        webActions.start()
 
         // (1) Run the engine. The extension drives it over this socket.
         serve.start()

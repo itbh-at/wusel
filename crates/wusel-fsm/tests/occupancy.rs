@@ -11,8 +11,8 @@
 
 use wusel_fsm::registry::Buffer;
 use wusel_fsm::{
-    Action, Completion, Failure, Intent, Job, Machine, NodeFacts, ObjectId, Outcome, Request,
-    RequestId,
+    Action, Completion, Failure, Intent, Job, Machine, NodeFacts, ObjectId, Outcome, Precondition,
+    Request, RequestId,
 };
 
 const A: ObjectId = ObjectId(1);
@@ -37,6 +37,7 @@ fn a_file() -> Completion {
         etag: "v1".into(),
         size: 4096,
         materialised: true,
+        identified: true,
         ..NodeFacts::default()
     })
 }
@@ -584,10 +585,9 @@ fn renaming_a_temporary_onto_a_document_publishes_what_it_holds() {
         }]
     );
 
-    // It exists locally and has never been on the server, so the rename is ours
-    // alone — rows only, no server-side MOVE.
-    let actions = m.on_completion(
-        parent,
+    // Resolved: the move is handed to the file itself, which is idle, so it
+    // starts there at once by reading its own row. The directory stays parked.
+    let temporary = || {
         Completion::Node(NodeFacts {
             id: child,
             found: true,
@@ -595,8 +595,15 @@ fn renaming_a_temporary_onto_a_document_publishes_what_it_holds() {
             materialised: false,
             ignored: true,
             ..NodeFacts::default()
-        }),
-    );
+        })
+    };
+    let actions = m.on_completion(parent, temporary());
+    assert_eq!(jobs(&actions), vec![Job::ReadNode { object: child }]);
+    assert!(m.is_busy(parent), "the directory is occupied for the move");
+
+    // It exists locally and has never been on the server, so the rename is ours
+    // alone — rows only, no server-side MOVE.
+    let actions = m.on_completion(child, temporary());
     assert_eq!(
         jobs(&actions),
         vec![Job::MoveRows {
@@ -606,7 +613,12 @@ fn renaming_a_temporary_onto_a_document_publishes_what_it_holds() {
         }]
     );
 
-    let actions = m.on_completion(parent, Completion::Done);
+    let actions = m.on_completion(child, Completion::Done);
+    assert_eq!(answers(&actions), vec![(vec![RequestId(1)], Outcome::Ok)]);
+    assert!(
+        !m.is_busy(parent),
+        "the directory is released with the move"
+    );
     assert!(
         actions.iter().any(|a| matches!(
             a,
@@ -616,6 +628,263 @@ fn renaming_a_temporary_onto_a_document_publishes_what_it_holds() {
             } if *object == child
         )),
         "the renamed buffer must be published under its new name: {actions:?}"
+    );
+}
+
+/// The one job a step handed out.
+fn only_job(actions: &[Action]) -> Job {
+    let js = jobs(actions);
+    assert_eq!(js.len(), 1, "exactly one job expected: {actions:?}");
+    js[0].clone()
+}
+
+/// `echo q > n1; mv n1 n2`, with the rename arriving while the new file's first
+/// upload is still on its way.
+///
+/// The upload reads the file's path when it starts. A rename that moved the rows
+/// underneath it sent the bytes to the old name and left nothing under the new
+/// one. The rename has to wait for that upload — the collision policy says so —
+/// and then, the file being on the server by then, move it there too.
+#[test]
+fn a_rename_waits_for_the_upload_of_the_file_it_renames() {
+    let mut m = Machine::new();
+    let parent = A;
+    let child = B;
+    let new_file = || {
+        Completion::Node(NodeFacts {
+            id: child,
+            found: true,
+            parent,
+            materialised: false,
+            ..NodeFacts::default()
+        })
+    };
+
+    // n1: created, written, closed — its first upload is in flight.
+    let mut buffer = Buffer::new(String::new());
+    buffer.dirty = true;
+    m.registry_mut().open(child, buffer);
+    let a = m.on_request(req(10, child, Intent::Publish));
+    assert_eq!(only_job(&a), Job::ReadNode { object: child });
+    let a = m.on_completion(child, new_file());
+    assert!(matches!(only_job(&a), Job::MarkPending { .. }));
+    let a = m.on_completion(child, Completion::Done);
+    assert!(matches!(only_job(&a), Job::BufferSize { .. }));
+    let a = m.on_completion(child, Completion::Size(1));
+    assert!(matches!(only_job(&a), Job::Upload { .. }));
+
+    // mv n1 n2 — keyed on the directory, as the kernel sends it.
+    let a = m.on_request(req(
+        1,
+        parent,
+        Intent::Move {
+            from_name: "n1".into(),
+            to_parent: parent,
+            to_name: "n2".into(),
+        },
+    ));
+    assert_eq!(
+        only_job(&a),
+        Job::ReadChild {
+            parent,
+            name: "n1".into()
+        }
+    );
+    let a = m.on_completion(parent, new_file());
+    // Handed to the file, which is busy: the move waits its turn. Nothing runs
+    // beside the upload, nobody is answered yet, the directory stays occupied.
+    assert!(
+        jobs(&a).is_empty(),
+        "the move must not run beside the upload: {a:?}"
+    );
+    assert!(answers(&a).is_empty());
+    assert!(m.is_busy(parent));
+
+    // The upload lands and the publish runs to its end...
+    let a = m.on_completion(
+        child,
+        Completion::Uploaded {
+            etag: "e1".into(),
+            size: 1,
+        },
+    );
+    assert!(matches!(only_job(&a), Job::RecordVersion { .. }));
+    let a = m.on_completion(child, Completion::Done);
+    assert!(matches!(only_job(&a), Job::StoreBlob { .. }));
+    let a = m.on_completion(child, Completion::Done);
+    assert!(matches!(only_job(&a), Job::ListRemote { .. }));
+    let a = m.on_completion(child, Completion::Listed);
+    assert!(matches!(only_job(&a), Job::ClearPending { .. }));
+    let a = m.on_completion(child, Completion::Done);
+    assert!(matches!(only_job(&a), Job::DiscardBuffer { .. }));
+    // ...and only then does the move start, reading where the file is now.
+    let a = m.on_completion(child, Completion::Done);
+    assert_eq!(only_job(&a), Job::ReadNode { object: child });
+
+    // The upload gave it a server identity, so this is a MOVE there as well as
+    // in the rows — the bytes end up under the new name.
+    let a = m.on_completion(
+        child,
+        Completion::Node(NodeFacts {
+            id: child,
+            found: true,
+            parent,
+            materialised: true,
+            ..NodeFacts::default()
+        }),
+    );
+    assert_eq!(
+        only_job(&a),
+        Job::MoveRemote {
+            object: child,
+            to_parent: parent,
+            to_name: "n2".into()
+        }
+    );
+    let a = m.on_completion(child, Completion::Done);
+    assert_eq!(
+        only_job(&a),
+        Job::MoveRows {
+            object: child,
+            to_parent: parent,
+            to_name: "n2".into()
+        }
+    );
+    let a = m.on_completion(child, Completion::Done);
+    assert_eq!(answers(&a), vec![(vec![RequestId(1)], Outcome::Ok)]);
+    assert!(
+        !m.is_busy(parent),
+        "the directory is released with the move"
+    );
+    assert!(!m.is_busy(child));
+}
+
+/// A rename abandoned while it still waits behind the upload must not leave
+/// its directory parked for good.
+#[test]
+fn an_abandoned_rename_still_releases_its_directory() {
+    let mut m = Machine::new();
+    let parent = A;
+    let child = B;
+
+    // B busy with anything long-running; a read will do.
+    let a = m.on_request(req(10, child, read(0, 16)));
+    assert_eq!(only_job(&a), Job::ReadNode { object: child });
+
+    let _ = m.on_request(req(
+        1,
+        parent,
+        Intent::Move {
+            from_name: "n1".into(),
+            to_parent: parent,
+            to_name: "n2".into(),
+        },
+    ));
+    let _ = m.on_completion(
+        parent,
+        Completion::Node(NodeFacts {
+            id: child,
+            found: true,
+            parent,
+            ..NodeFacts::default()
+        }),
+    );
+    assert!(m.is_busy(parent), "parked on the queued relocation");
+
+    // The caller gives up while the move is still queued on the file.
+    let a = m.abandon(RequestId(1));
+    assert_eq!(
+        answers(&a),
+        vec![(vec![RequestId(1)], Outcome::Failed(Failure::Interrupted))]
+    );
+    assert!(!m.is_busy(parent), "the directory must not stay parked");
+}
+
+/// `echo q > n1; rm n1`, with the delete arriving while the new file's first
+/// upload is still on its way.
+///
+/// Deleting only the rows underneath that upload let it land anyway, and the
+/// next listing brought the file back. The delete has to wait for the upload —
+/// the collision policy says so — and then delete what really landed.
+#[test]
+fn a_remove_waits_for_the_upload_of_the_file_it_removes() {
+    let mut m = Machine::new();
+    let parent = A;
+    let child = B;
+    let new_file = || {
+        Completion::Node(NodeFacts {
+            id: child,
+            found: true,
+            parent,
+            materialised: false,
+            ..NodeFacts::default()
+        })
+    };
+
+    // n1: created, written, closed — its first upload is in flight.
+    let mut buffer = Buffer::new(String::new());
+    buffer.dirty = true;
+    m.registry_mut().open(child, buffer);
+    let _ = m.on_request(req(10, child, Intent::Publish));
+    let _ = m.on_completion(child, new_file()); // -> MarkPending
+    let _ = m.on_completion(child, Completion::Done); // -> BufferSize
+    let a = m.on_completion(child, Completion::Size(1));
+    assert!(matches!(only_job(&a), Job::Upload { .. }));
+
+    // rm n1 — keyed on the directory, as the kernel sends it.
+    let a = m.on_request(req(1, parent, Intent::Remove { name: "n1".into() }));
+    assert_eq!(
+        only_job(&a),
+        Job::ReadChild {
+            parent,
+            name: "n1".into()
+        }
+    );
+    let a = m.on_completion(parent, new_file());
+    assert!(
+        jobs(&a).is_empty(),
+        "the delete must not run beside the upload: {a:?}"
+    );
+    assert!(answers(&a).is_empty());
+    assert!(m.is_busy(parent));
+
+    // The upload lands and the publish runs to its end ...
+    let _ = m.on_completion(
+        child,
+        Completion::Uploaded {
+            etag: "e1".into(),
+            size: 1,
+        },
+    ); // -> RecordVersion
+    let _ = m.on_completion(child, Completion::Done); // -> StoreBlob
+    let _ = m.on_completion(child, Completion::Done); // -> ListRemote
+    let _ = m.on_completion(child, Completion::Listed); // -> ClearPending
+    let _ = m.on_completion(child, Completion::Done); // -> DiscardBuffer
+    let a = m.on_completion(child, Completion::Done);
+    // ... and only then does the delete start, reading where the file is now.
+    assert_eq!(only_job(&a), Job::ReadNode { object: child });
+
+    // It is on the server now, so the delete goes there too.
+    let a = m.on_completion(
+        child,
+        Completion::Node(NodeFacts {
+            id: child,
+            found: true,
+            parent,
+            materialised: true,
+            ..NodeFacts::default()
+        }),
+    );
+    assert_eq!(only_job(&a), Job::DeleteRemote { object: child });
+    let a = m.on_completion(child, Completion::Done);
+    assert_eq!(only_job(&a), Job::DiscardBuffer { object: child });
+    let a = m.on_completion(child, Completion::Done);
+    assert_eq!(only_job(&a), Job::RemoveRows { object: child });
+    let a = m.on_completion(child, Completion::Done);
+    assert_eq!(answers(&a), vec![(vec![RequestId(1)], Outcome::Ok)]);
+    assert!(
+        !m.is_busy(parent),
+        "the directory is released with the delete"
     );
 }
 
@@ -655,5 +924,67 @@ fn a_listing_fetched_from_the_server_does_not_ask_for_a_refresh() {
     assert!(
         !actions.iter().any(|a| matches!(a, Action::Refresh { .. })),
         "the listing that just ran *is* the refresh: {actions:?}"
+    );
+}
+
+/// A new file's first upload lands, then the listing that should give it its
+/// server id fails, and the buffer is kept for the retry. Whatever is uploaded
+/// next from that buffer is based on the version that landed — it asserts that
+/// version, not "must not exist" and not nothing, or it collides with our own
+/// file or overwrites blind.
+#[test]
+fn a_kept_buffer_is_based_on_the_version_its_upload_landed_as() {
+    let mut m = Machine::new();
+    let mut buffer = Buffer::new(String::new());
+    buffer.dirty = true;
+    m.registry_mut().open(A, buffer);
+    let new_file = Completion::Node(NodeFacts {
+        id: A,
+        found: true,
+        parent: B,
+        materialised: false,
+        ..NodeFacts::default()
+    });
+
+    let _ = m.on_request(req(1, A, Intent::Publish)); // -> ReadNode
+    let _ = m.on_completion(A, new_file); // -> MarkPending
+    let _ = m.on_completion(A, Completion::Done); // -> BufferSize
+    let _ = m.on_completion(A, Completion::Size(0)); // -> Upload
+    let _ = m.on_completion(
+        A,
+        Completion::Uploaded {
+            etag: "e1".into(),
+            size: 0,
+        },
+    ); // -> RecordVersion
+    let _ = m.on_completion(A, Completion::Done); // -> StoreBlob
+    let a = m.on_completion(A, Completion::Done);
+    assert_eq!(jobs(&a), vec![Job::ListRemote { object: B }]);
+    // The relist fails: the flow ends; the buffer and the owed upload stay.
+    let _ = m.on_completion(A, Completion::Failed(Failure::Io));
+    assert!(!m.is_busy(A));
+
+    // More is written and flushed. The row reads as on the server now — its
+    // version was recorded — though still without an id.
+    let _ = m.on_request(req(2, A, Intent::Publish));
+    let _ = m.on_completion(
+        A,
+        Completion::Node(NodeFacts {
+            id: A,
+            found: true,
+            parent: B,
+            materialised: true,
+            etag: "e1".into(),
+            ..NodeFacts::default()
+        }),
+    ); // -> MarkPending
+    let _ = m.on_completion(A, Completion::Done); // -> BufferSize
+    let a = m.on_completion(A, Completion::Size(8));
+    assert!(
+        matches!(
+            jobs(&a).as_slice(),
+            [Job::Upload { precondition: Precondition::Match(e), .. }] if e == "e1"
+        ),
+        "the next upload must assert the version that landed: {a:?}"
     );
 }

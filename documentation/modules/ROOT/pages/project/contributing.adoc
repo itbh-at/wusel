@@ -80,13 +80,15 @@ checkout — there is no separate CI script to keep in sync.
 
 | *CI* (`ci.yml`)
 | every push to `main` and every pull request
-| Formatting, licence headers, clippy (`-D warnings`), `check`, the native test
-  suite, and a Linux build of the FUSE frontend. The real-mount e2e is *not* run
+| Formatting, licence headers, `shellcheck`, clippy (`-D warnings`), `check`,
+  the native test suite, and a Linux build of the FUSE frontend
+  (`mise run build-fuse`). The real-mount e2e is *not* run
   here (it needs a privileged `/dev/fuse`); CI only proves the frontend builds.
 
 | *E2E* (`e2e.yml`)
 | nightly, plus manual dispatch
-| The real-Nextcloud end-to-end run above, across the *three newest maintained
+| An end-to-end run against a real Nextcloud (FUSE mount and 3-way merge),
+  across the *three newest maintained
   Nextcloud majors*. Which those are is discovered from Docker Hub at run time,
   not written into the workflow, so a new Nextcloud release joins the matrix on
   its own. Only the newest is binding: the older two are run and reported, but
@@ -96,19 +98,25 @@ checkout — there is no separate CI script to keep in sync.
   day costs nothing while a Nextcloud patch release re-arms the run.
 
 | *Docs* (`pages.yml`)
-| every push to `main` and every pull request
-| Builds this Antora site; pushes to `main` also publish it to GitHub Pages at
-  https://wusel.itbh.at/[wusel.itbh.at]. Pull requests build
-  only, as validation.
+| every push to `main`, every pull request, a successful tag-triggered
+  *Release* run, plus manual dispatch
+| Builds this Antora site; every trigger except a pull request also publishes
+  it to GitHub Pages at https://wusel.itbh.at/[wusel.itbh.at]. Pull requests
+  build only, as validation.
 
 | *Release* (`release.yml`)
-| a `v*` tag
-| Builds the packages for `x86_64` and `aarch64` and attaches them to a GitHub
-  Release. See xref:reference/packages.adoc[Packages].
+| a `v*` tag, plus manual dispatch
+| Builds the RPM and the `.deb` for `x86_64` and `aarch64` and attaches them to
+  a GitHub Release; a manual run builds them as run artifacts without creating a
+  release. See xref:reference/packages.adoc[Packages].
 |===
 
-Before pushing, `mise run fmt-check`, `mise run clippy`, `mise run check` and
-`mise run test` reproduce the CI job locally — see
+`mise run fmt-check`, `headers-check`, `shellcheck`, `clippy`, `check`, `test`
+and `build-fuse` reproduce the CI job locally; on macOS `build-fuse` cannot run
+on the host — see xref:how-to/develop-on-macos.adoc[Develop on macOS]. After
+`mise run setup-hooks`, a `pre-push` hook runs the same checks except
+`build-fuse`, plus `mise run fuse-test` in the podman container, before every
+push; `WUSEL_SKIP_PREPUSH=1 git push` skips it for work in progress. See
 xref:tutorials/set-up-a-development-environment.adoc[Set up a development
 environment].
 

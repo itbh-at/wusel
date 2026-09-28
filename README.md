@@ -16,8 +16,9 @@ instead of mirroring everything locally.
 The goal is what the official client on Linux still does not offer today:
 a true on-demand filesystem. `wusel` is deliberately **more than just FUSE** —
 FUSE only makes the files appear; on top of it sits a full GNOME desktop
-integration (sidebar, emblems, notifications, Shell search). Native macOS
-(File Provider) and Windows (Cloud Filter) frontends remain planned.
+integration (sidebar, emblems, notifications, Shell search). A native macOS
+frontend (File Provider, in [`macos/`](macos/)) is in the tree as experimental
+work; a Windows (Cloud Filter) frontend remains planned.
 
 **Documentation: <https://wusel.itbh.at/>** ·
 **Product page: <https://itbh.at/en/wusel/>**
@@ -42,10 +43,11 @@ cached, or pinned offline:
 ## Architecture in one sentence
 
 A platform-independent **engine** (`wusel-core`: Login Flow v2, WebDAV, sync,
-state) plus interchangeable, thin **frontends** (`wusel-fuse` for Linux),
-held together by the daemon **`wusel`**. This separation makes it possible to
-develop and test the bulk of the work natively on macOS — only the mount needs
-a FUSE driver.
+state) plus interchangeable, thin **frontends** (`wusel-fuse` for Linux, the
+File Provider extension in `macos/` over the `wusel-ipc` socket), held
+together by the daemon **`wusel`**. This separation makes it possible to develop
+and test the bulk of the work natively on macOS — only the mount needs a FUSE
+driver.
 
 Details: [Architecture](documentation/modules/ROOT/pages/explanation/architecture.adoc) ·
 Order of work: [Roadmap](documentation/modules/ROOT/pages/project/roadmap.adoc). The
@@ -56,9 +58,19 @@ docs are an [Antora](https://antora.org) component under
 
 ## Install
 
-On Fedora, take the RPM from the
-[latest release](https://github.com/itbh-at/wusel/releases/latest) — a `v*` tag
-builds and publishes `x86_64` and `aarch64` packages:
+Signed package repositories for Fedora, openSUSE Tumbleweed, Debian and Ubuntu
+are published through the openSUSE Build Service — see [Install a
+package](documentation/modules/ROOT/pages/how-to/install-a-package.adoc). The
+[latest release](https://github.com/itbh-at/wusel/releases/latest) also carries
+the Fedora RPMs and the Debian `.deb`s as single files — a `v*` tag builds them
+for `x86_64` and `aarch64`; an Arch `PKGBUILD` is in
+[`packaging/aur/`](packaging/aur/).
+
+There are two packages. `wusel` is the mount; it needs no desktop and brings
+`fuse3` and nothing else. `wusel-nautilus` is the GNOME Files integration
+(emblems, context menu) and brings only what Nautilus itself uses. On Fedora
+and openSUSE, `wusel` pulls it in where GNOME Files is installed; on Debian and
+Ubuntu, name both: `sudo apt install wusel wusel-nautilus`.
 
 ```sh
 sudo dnf install ./wusel-*.rpm
@@ -81,8 +93,8 @@ itself.
 
 | Nextcloud | |
 |---|---|
-| newest maintained major (currently **34**) | binding — the E2E badge above turns red if it breaks |
-| the two before it (currently **33**, **32**) | tested and reported, but never fail the build |
+| newest maintained major (currently **35**) | binding — the E2E badge above turns red if it breaks |
+| the two before it (currently **34**, **33**) | tested and reported, but never fail the build |
 
 Older majors are outside Nextcloud's own maintenance and are not tested. Which
 majors ran, and how each fared, is in the summary of the latest
@@ -92,7 +104,9 @@ majors ran, and how each fared, is in the summary of the latest
 
 | Crate           | Role                                                                          | Platform                                     |
 | --------------- | ----------------------------------------------------------------------------- | -------------------------------------------- |
+| `wusel-fsm`     | Decision core: occupancy and flow steps over plain data, no I/O               | everywhere                                   |
 | `wusel-core`    | Engine: auth, WebDAV, sync, state                                             | everywhere                                   |
+| `wusel-ipc`     | Socket frontend speaking the engine's intent protocol (used by macOS)         | everywhere                                   |
 | `wusel-fuse`    | FUSE frontend (library)                                                       | Linux                                        |
 | `wusel-desktop` | OS integration (notifications, file-manager status) behind `desktop::Desktop` | Linux (no-op elsewhere)                      |
 | `wusel-mock`    | Mock Nextcloud server for the tests                                           | dev-only                                     |
@@ -108,10 +122,11 @@ wusel service enable                     # optional: auto-mount at login (system
 
 Files appear *online-only* and are streamed from the server as you read them
 (pin a file to keep it offline); server-side changes propagate via `notify_push`
-(with a TTL fallback). Real mtimes and read-only permissions are reflected.
+(with TTL revalidation, and periodic polling while `notify_push` is not
+connected). Real mtimes and read-only permissions are reflected.
 
-- **Pinning** ("always keep offline"): `wusel pin <path>` (a directory, a file,
-  or nothing for the whole account), `wusel unpin`, `wusel pins`.
+- **Pinning** ("always keep offline"): `wusel pin <path>` (a directory or a
+  file; `wusel pin --all` for the whole account), `wusel unpin`, `wusel pins`.
 - **Multiple accounts** (optional): add `--account work` to `login`/`mount`;
   `wusel accounts`, `wusel account remove <name>`. The default account needs no flag.
 - **What is happening right now**: `wusel status` names the uploads still owed to
@@ -152,17 +167,17 @@ mise run fuse-shell   # Linux shell with /dev/fuse (works on macOS too, via podm
 cargo run -p wusel --features fuse -- mount /mnt/nc
 ```
 
-The mount is Linux-only. Native macOS and Windows support (their own File
-Provider / Cloud Filter frontends, not FUSE) is far-future, experimental work; on
-a Mac, test the mount inside the podman container.
+The FUSE mount is Linux-only; on a Mac, test it inside the podman container.
+The native macOS frontend (File Provider, not FUSE) lives in `macos/` and is
+experimental; a Windows frontend (Cloud Filter) is planned.
 
 ### CI
 
 GitHub Actions runs the same `mise run …` tasks on every push and pull request
-(format, licence headers, clippy, check, tests, plus a Linux FUSE build), builds
-the docs, runs a nightly end-to-end test against a real Nextcloud, and publishes
-the RPMs on a `v*` tag. Details: [How Wusel is
-tested](documentation/modules/ROOT/pages/explanation/testing.adoc).
+(`fmt-check`, `headers-check`, `shellcheck`, `clippy`, `check`, `test`,
+`build-fuse`), builds the docs, runs a nightly end-to-end test against a real
+Nextcloud, and publishes the RPM and `.deb` packages on a `v*` tag. Details:
+[How Wusel is tested](documentation/modules/ROOT/pages/explanation/testing.adoc).
 
 ## Status
 
@@ -170,7 +185,8 @@ See the [Roadmap](documentation/modules/ROOT/pages/project/roadmap.adoc). Workin
 
 - **Engine** — authentication (Login Flow v2), the live tree (listing +
   on-demand content with real mtimes/permissions), whole-file caching with
-  LRU/age eviction, instant invalidation via `notify_push`, configurable TLS
+  LRU/age eviction, change detection via `notify_push` (periodic polling when it
+  is unavailable), configurable TLS
   trust, multiple accounts, pinning ("always keep offline").
 - **Read-write mount** — create/edit/rename/delete, chunked upload for large
   files, lossless conflict handling with opt-in 3-way text merge.
@@ -178,17 +194,20 @@ See the [Roadmap](documentation/modules/ROOT/pages/project/roadmap.adoc). Workin
   (opt-out via `[auth] keyring = false`; if the keyring is unusable the password
   stays in the 0600 file).
 - **GNOME desktop integration** — a *Wusel (Nextcloud)* sidebar entry with live
-  sync status (`libcloudproviders`), per-file emblems and a pin/unpin
-  context menu via a native Nautilus extension (with live emblem refresh),
+  sync status (`libcloudproviders`), per-file emblems and a *Wusel* context
+  submenu (keep offline, update, open in Nextcloud, copy link) via a native
+  Nautilus extension (with live emblem refresh, packaged as `wusel-nautilus`),
   localized desktop notifications, and a GNOME Shell search provider backed by
   Nextcloud Unified Search.
 - **Runs like a system component** — a systemd user service, exclusion from
   desktop indexers by default (so a crawler cannot trigger a download storm),
-  `wusel cache clear` for a clean slate, and a Fedora RPM.
+  `wusel cache clear` for a clean slate, and RPM, DEB and Arch packages.
+- **macOS** (experimental) — a File Provider extension: files in Finder,
+  offline pin/unpin from the context menu.
 
-Next up are refinements rather than new pillars — see the roadmap: proactive
-refresh of pinned files, gettext i18n for the file-manager labels, advisory
-locking, and the KDE equivalent of the GNOME integration.
+Next up are refinements rather than new pillars — see the roadmap: gettext i18n
+for the file-manager labels, advisory locking, and the KDE equivalent of the
+GNOME integration.
 
 ## Security
 
@@ -197,5 +216,5 @@ Found a vulnerability? Please report it privately — see [SECURITY.md](SECURITY
 ## License
 
 [Apache-2.0](LICENSE). Chosen so the free sources can also be shipped as signed,
-commercial store builds — see _Licensing_ in the
+commercial store builds — see
 [Licence](documentation/modules/ROOT/pages/project/licence.adoc).

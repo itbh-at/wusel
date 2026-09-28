@@ -295,6 +295,8 @@ pub fn list_accounts() -> Vec<String> {
 /// revalidate_secs = 30   # re-list a directory older than this (no-push fallback)
 /// push_floor_secs = 5    # min interval between push-triggered re-lists of a dir
 /// quota_revalidate_secs = 60  # how long a fetched storage quota is trusted
+/// poll_secs = 300        # walk for remote changes this often while notify_push
+///                        # is absent or disconnected; 0 = never
 /// text_merge = false     # opt-in: 3-way-merge text on conflict (else a copy)
 /// refresh_pinned = "ask" # manual | ask | auto — what to do when a pinned
 ///                        # file's server copy has moved on
@@ -332,6 +334,11 @@ pub struct Settings {
     /// contents, and a refresh is a request some applications trigger before
     /// every save.
     pub quota_revalidate_secs: u64,
+    /// How often the sync walk runs while notify_push is absent or not
+    /// connected; `0` turns polling off. Coarser than `revalidate_secs`,
+    /// because it covers what nobody is looking at — above all pinned files
+    /// — while what somebody opens is re-listed on access anyway.
+    pub poll_secs: u64,
     pub cache_max_bytes: Option<u64>,
     pub cache_max_age_secs: Option<u64>,
     pub tls: TlsSettings,
@@ -411,6 +418,7 @@ impl Default for Settings {
             revalidate_secs: 30,
             push_floor_secs: 5,
             quota_revalidate_secs: 60,
+            poll_secs: 300,
             cache_max_bytes: Some(5 * 1024 * 1024 * 1024), // 5 GiB
             cache_max_age_secs: None,
             tls: TlsSettings::default(),
@@ -667,6 +675,7 @@ struct RawSync {
     revalidate_secs: Option<u64>,
     push_floor_secs: Option<u64>,
     quota_revalidate_secs: Option<u64>,
+    poll_secs: Option<u64>,
     text_merge: Option<bool>,
     refresh_pinned: Option<String>,
     open_pinned: Option<String>,
@@ -706,6 +715,9 @@ fn parse_settings(text: &str) -> crate::Result<Settings> {
     }
     if let Some(v) = raw.sync.quota_revalidate_secs {
         s.quota_revalidate_secs = v;
+    }
+    if let Some(v) = raw.sync.poll_secs {
+        s.poll_secs = v;
     }
     if let Some(v) = raw.sync.ignore_patterns {
         s.ignore_patterns = v; // an explicit list REPLACES the built-in default
@@ -927,6 +939,12 @@ mod tests {
     }
 
     #[test]
+    fn parses_poll_secs() {
+        let s = parse_settings("[sync]\npoll_secs = 0\n").unwrap();
+        assert_eq!(s.poll_secs, 0, "0 turns polling off");
+    }
+
+    #[test]
     fn parses_quota_revalidate_secs() {
         let s = parse_settings("[sync]\nquota_revalidate_secs = 120\n").unwrap();
         assert_eq!(s.quota_revalidate_secs, 120);
@@ -938,6 +956,7 @@ mod tests {
         assert_eq!(s.revalidate_secs, 30);
         assert_eq!(s.push_floor_secs, 5);
         assert_eq!(s.quota_revalidate_secs, 60);
+        assert_eq!(s.poll_secs, 300);
         assert!(s.cache_max_bytes.is_some());
         assert_eq!(s.cache_max_age_secs, None);
         // TLS defaults: verify against the OS store, no custom CA.

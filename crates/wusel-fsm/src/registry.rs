@@ -113,6 +113,17 @@ impl Registry {
         }
     }
 
+    /// Record that the buffer's content now stands on the server as `etag`, so
+    /// its next upload is based on that version. Matters only for a buffer kept
+    /// after its upload landed but a later step failed: without it the next
+    /// upload would still claim the version the buffer started from. No-op when
+    /// no buffer is open.
+    pub fn set_base_etag(&mut self, object: ObjectId, etag: &str) {
+        if let Some(b) = self.buffers.get_mut(&object) {
+            b.base_etag = etag.to_string();
+        }
+    }
+
     /// Mark the buffer written to. No-op when none is open, which is the
     /// harmless reading: nothing to dirty.
     pub fn mark_dirty(&mut self, object: ObjectId) {

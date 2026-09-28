@@ -9,7 +9,7 @@
 
 Wusel is published as a *signed repository* through the openSUSE Build Service,
 so your package manager installs it and keeps it up to date like anything else
-on the machine. Pick your family below; each is two commands.
+on the machine. Pick your family below; each takes a few commands.
 
 If your distribution is not one of the four, skip to <<single-file>> or build
 from source: xref:how-to/install-from-source.adoc[Install from source].
@@ -34,6 +34,10 @@ sudo dnf install wusel
 The repository is built for Fedora 44. `dnf` imports the signing key on first
 install and asks you to confirm its fingerprint.
 
+`sudo dnf install wusel` is enough on GNOME: where GNOME Files is installed,
+`dnf` adds `wusel-nautilus` (emblems and the context menu) on its own. Naming
+both — `sudo dnf install wusel wusel-nautilus` — does the same and is harmless.
+
 == openSUSE Tumbleweed
 
 [source,sh]
@@ -42,6 +46,9 @@ sudo zypper addrepo https://download.opensuse.org/repositories/home:/cdhermann:/
 sudo zypper refresh
 sudo zypper install wusel
 ----
+
+As on Fedora, `zypper` adds `wusel-nautilus` on its own where GNOME Files is
+installed; naming it as well is harmless.
 
 == Debian 13
 
@@ -52,8 +59,12 @@ echo 'deb http://download.opensuse.org/repositories/home:/cdhermann:/wusel/Debia
 curl -fsSL https://download.opensuse.org/repositories/home:cdhermann:wusel/Debian_13/Release.key \
   | gpg --dearmor | sudo tee /etc/apt/trusted.gpg.d/home_cdhermann_wusel.gpg > /dev/null
 sudo apt update
-sudo apt install wusel
+sudo apt install wusel wusel-nautilus
 ----
+
+`apt` does not add `wusel-nautilus` on its own, so name it on a GNOME desktop:
+it brings the emblems and the context menu to GNOME Files. Without GNOME Files,
+`sudo apt install wusel` alone.
 
 == Ubuntu 26.04
 
@@ -66,14 +77,15 @@ echo 'deb http://download.opensuse.org/repositories/home:/cdhermann:/wusel/xUbun
 curl -fsSL https://download.opensuse.org/repositories/home:cdhermann:wusel/xUbuntu_26.04/Release.key \
   | gpg --dearmor | sudo tee /etc/apt/trusted.gpg.d/home_cdhermann_wusel.gpg > /dev/null
 sudo apt update
-sudo apt install wusel
+sudo apt install wusel wusel-nautilus
 ----
 
 == Arch Linux
 
 Not on the AUR yet, but the `PKGBUILD` is in the repository and builds the way
-any AUR package does — there is nothing AUR-specific about running it from a
-local checkout:
+any AUR package does. The checkout only supplies the `PKGBUILD`: it downloads
+the source tarball of the release tag its `pkgver` names and builds that, not
+the files in your checkout.
 
 [source,sh]
 ----
@@ -83,12 +95,15 @@ makepkg -si
 ----
 
 `-s` installs the build dependencies through `pacman` first; `-i` installs the
-result. Updating means pulling and running it again.
+result — both packages, `wusel` and `wusel-nautilus`. Without GNOME Files, run
+`makepkg -s` instead and install only the first:
+`sudo pacman -U wusel-[0-9]*.pkg.tar.zst`. Updating means pulling a `PKGBUILD` with a newer `pkgver` and running it
+again.
 
 [[single-file]]
 == A single file, for everything else
 
-Every release also attaches one RPM and one `.deb` per architecture to its
+Every release also attaches both packages, as RPM and as `.deb`, per architecture to its
 https://github.com/itbh-at/wusel/releases/latest[GitHub Release]. These are
 *unsigned*, and nothing updates them for you — fetch the next release the same
 way. Use them when you cannot add a repository, or when your distribution is
@@ -97,9 +112,11 @@ one.
 
 [source,sh]
 ----
-sudo dnf install ./wusel-*.rpm      # RPM-based
-sudo apt install ./wusel_*.deb      # Debian-based
+sudo dnf install ./wusel-*.rpm                              # RPM-based
+sudo apt install ./wusel_*.deb ./wusel-nautilus_*.deb       # Debian-based
 ----
+
+Without GNOME Files, take only the `wusel` file.
 
 Use `apt`, not `dpkg -i`. `apt` resolves the dependencies; `dpkg` only reports
 that they are missing.
@@ -125,8 +142,8 @@ system picks up each new release.
 | `sudo apt update && sudo apt upgrade`, or unattended-upgrades.
 
 | Arch
-| Nothing automatic. `makepkg -si` again in a fresh checkout; the AUR would
-  change that, and is a xref:project/roadmap.adoc[roadmap] item.
+| Nothing automatic. `makepkg -si` again once the `PKGBUILD` names a newer
+  release; the AUR would change that.
 
 | A single file from a GitHub Release
 | Nothing. Download the next one and install it over the top.
@@ -156,8 +173,10 @@ always works.
 
 == What is installed, and what is not
 
-The one required dependency is `fuse3`. The GNOME pieces are *suggested*, so
-neither package manager installs them by default: on a server or a KDE machine
-you get the mount and about five packages rather than a desktop stack. What is
-then missing is the sidebar entry, the emblems and the Shell search — not the
-filesystem. See xref:reference/platform-support.adoc[Platform support].
+The mount needs no desktop. `wusel` brings `fuse3` and nothing else — about
+four packages — and its notifications, sidebar entry and Shell search need no
+further library. The GNOME Files integration is `wusel-nautilus`, and it brings
+only what Nautilus itself uses. On a server or a KDE machine, install `wusel`
+alone; what is then missing is the emblems and the context menu — not the
+filesystem. See xref:reference/packages.adoc[Packages] and
+xref:reference/platform-support.adoc[Platform support].

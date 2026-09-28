@@ -45,6 +45,20 @@ pub fn client(settings: &TlsSettings) -> Result<reqwest::Client> {
     // legitimate uploads/downloads. `connect_timeout` bounds the handshake,
     // `read_timeout` bounds a *stalled* (not a slow) body.
 
+    // HTTP/2 flow control: the receiver says how much it may be sent before it
+    // acknowledges, per stream and per connection, so a download runs at no more
+    // than window / round-trip time. Over HTTP/1.1 the kernel grows the TCP window
+    // by itself; HTTP/2 needs it said. Measured through a 300 ms link: with
+    // hyper's adaptive window, which starts at 64 KiB and grows slowly, two
+    // concurrent 32 MiB reads on a fresh connection took 117 s against 9.5 s
+    // over HTTP/1.1. Fixed windows avoid the slow start: one 8 MiB read-ahead
+    // chunk fits a stream's window, and the connection's leaves room for
+    // several streams at once. They cost no memory up front — they only cap what
+    // may be in flight — and every body here is read to its end at once.
+    builder = builder
+        .http2_initial_stream_window_size(16 * 1024 * 1024)
+        .http2_initial_connection_window_size(64 * 1024 * 1024);
+
     if settings.http1_only {
         // Pin HTTP/1.1: some reverse proxies mangle HTTP/2 request bodies for
         // WebDAV chunked uploads (the upload arrives at Nextcloud as 0 bytes).

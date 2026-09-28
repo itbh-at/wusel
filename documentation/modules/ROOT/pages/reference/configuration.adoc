@@ -4,7 +4,7 @@
 ////
 
 = Configuration reference
-:description: Every key in config.toml — section, type, default and meaning — plus the environment variables that control logging.
+:description: Every key in config.toml — section, type, default and meaning — plus the environment variable that controls logging.
 
 Configuration is entirely optional: Wusel runs with no `config.toml` at all.
 This page lists every key it will read if one exists.
@@ -38,15 +38,23 @@ applies.
 | `max_age`
 | duration
 | unset
-| Evict a cached blob once it is older than this, regardless of the size
-  budget. Unset means age alone never evicts.
+| Evict a cached blob once it has gone unused this long, regardless of the size
+  budget; every read counts as a use. Unset, or `"0"`, means age alone never
+  evicts.
 |===
 
-*Size* accepts a plain byte count or a suffix: `B`, `KB`, `MB`, `GB`, `TB`,
-`KiB`, `MiB`, `GiB`, `TiB`. The two families are the same here — `GB` is
-1&nbsp;073&nbsp;741&nbsp;824 bytes, not 10^9^.
+*Size* is a quoted string: a plain byte count or a number with a suffix — `B`,
+`KB`, `MB`, `GB`, `TB`, `KiB`, `MiB`, `GiB`, `TiB`, in any case. The two
+families are the same here — `GB` is 1&nbsp;073&nbsp;741&nbsp;824 bytes, not
+10^9^.
 
-*Duration* accepts a plain second count or a suffix: `s`, `m`, `h`, `d`.
+*Duration* is a quoted string: a plain second count or a number with a suffix —
+`s`, `m`, `h`, `d`.
+
+Both must be quoted. An unquoted number (`max_size = 5000`) is a TOML type error,
+which makes the whole file malformed, so every key falls back to its default. A
+quoted value that does not parse is warned about and only that key keeps its
+default.
 
 == `[sync]`
 
@@ -60,6 +68,15 @@ applies.
 | How old a directory listing may be before it is revalidated against the
   server. This is the fallback path; with `notify_push` available, changes
   usually arrive sooner than this.
+
+| `poll_secs`
+| integer (seconds)
+| `300`
+| How often the sync walk looks for remote changes while `notify_push` is
+  absent from the server or not connected. While it is connected, its events
+  drive the walk and polling stays idle. Covers what nobody has open — above all
+  pinned files; a directory someone opens is revalidated on access anyway. `0`
+  turns polling off.
 
 | `push_floor_secs`
 | integer (seconds)
@@ -89,16 +106,19 @@ applies.
 | `manual` \| `ask` \| `auto`
 | `ask`
 | What happens when a pinned file's server copy has moved on. `manual` shows the
-  emblem and nothing else; `ask` sends one aggregated notification with an
-  action; `auto` fetches by itself, but only over a connection known to be
-  unmetered — otherwise it behaves as `ask`.
+  emblem and nothing else; `ask` sends one aggregated notification, with no
+  action button — the update itself is the file manager's "Update Now" or
+  `wusel update`; `auto` fetches by itself, but only over a connection known to
+  be unmetered — otherwise it behaves as `ask`.
 
 | `open_pinned`
 | `newest` \| `newest-unmetered` \| `offline`
 | `newest`
 | What to serve when an out-of-date pinned file is *opened*. `newest` always
   fetches the current version; `newest-unmetered` fetches unless the connection
-  is metered; `offline` always serves the local copy. A stale copy handed out is
+  is metered; `offline` always serves the local copy. Also accepted: `online`
+  for `newest`, `newest_unmetered` and `unmetered` for `newest-unmetered`, and
+  `local` for `offline`. A stale copy handed out is
   never handed out silently — the user is told, because saving it produces a
   conflict otherwise nobody expects.
 
@@ -154,7 +174,7 @@ path.
 | integer
 | the machine's parallelism, clamped to 4–8
 | How many FUSE dispatch threads serve kernel requests, and how many worker
-  threads the engine uses for concurrent network I/O. Independent reads,
+  threads the engine uses for concurrent network I/O (never fewer than two). Independent reads,
   uploads and listings run in parallel up to this many. Any value is clamped to
   1–16 on load. Setting it to `1` restores the pre-0.2.0 behaviour, in which one
   slow read stalls every other operation behind it.
@@ -170,7 +190,9 @@ path.
 | path to a PEM file
 | unset
 | An additional CA (or a self-signed server certificate) to trust, *in addition
-  to* the operating system's trust store. The clean path for a self-hosted
+  to* the operating system's trust store. A self-signed server certificate is
+  accepted only if it does not carry `basicConstraints CA:TRUE`; one that does is
+  rejected as a CA used as an end entity. The clean path for a self-hosted
   server; see
   xref:how-to/connect-to-a-self-signed-server.adoc[Connect to a server with a
   private certificate].
@@ -187,7 +209,8 @@ path.
 | `false`
 | Force HTTP/1.1 instead of negotiating HTTP/2. An escape hatch for reverse
   proxies that mishandle HTTP/2 request bodies on chunked uploads — the symptom
-  is Nextcloud logging "expected N bytes, got 0".
+  is Nextcloud logging "expected N bytes, got 0". The notify_push WebSocket uses
+  HTTP/1.1 either way.
 |===
 
 == `[auth]`
@@ -241,7 +264,8 @@ path.
 
 | `db_path`
 | path
-| `~/.local/state/wusel/state.sqlite`
+| `~/.local/state/wusel/state.sqlite`, or
+  `~/.local/state/wusel/accounts/<name>/state.sqlite`
 | Where the state database goes. An explicit value is always honoured, including
   over the automatic relocation Wusel performs when the default location turns
   out to be on a network filesystem.
@@ -262,6 +286,7 @@ max_age  = "30d"          # default: age alone never evicts
 revalidate_secs = 60      # default 30
 push_floor_secs = 10      # default 5
 quota_revalidate_secs = 300  # default 60
+poll_secs       = 900     # default 300
 text_merge      = true    # default false
 refresh_pinned  = "auto"  # default "ask"
 open_pinned     = "offline"  # default "newest"
@@ -295,7 +320,7 @@ to be changeable without a config edit when something is already wrong.
 | Variable | Default | Meaning
 
 | `RUST_LOG`
-| `wusel=info,wusel_core=info,wusel_fuse=info,wusel_desktop=info`
+| `wusel=info,wusel_core=info,wusel_fuse=info,wusel_desktop=info,wusel_ipc=info`
 | Standard `tracing` filter syntax. `debug` adds every HTTP request and the FUSE
   narrative; `trace` adds per-read cache hits and is very loud. Scope it to one
   crate — `RUST_LOG=wusel_core=debug` — rather than turning everything up.
@@ -303,3 +328,6 @@ to be changeable without a config edit when something is already wrong.
 
 For a running systemd service, set it in a drop-in rather than in the shell; see
 xref:how-to/diagnose-a-problem.adoc[Diagnose a problem].
+
+This page lists user-facing variables only. The `WUSEL_*` variables the test
+suites set are test hooks, not configuration.

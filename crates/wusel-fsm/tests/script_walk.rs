@@ -28,6 +28,7 @@ fn file(size: u64, blob_current: bool) -> Completion {
         size,
         blob_current,
         materialised: true,
+        identified: true,
         children_loaded: false,
         listing_stale: false,
         stale_copy_ok: false,
@@ -203,7 +204,14 @@ fn a_rejected_upload_goes_through_conflict_resolution_and_still_records() {
     let (flow, _) = advance(flow, Completion::Size(4096), &facts); // -> Upload
 
     let (flow, next) = advance(flow, Completion::Rejected, &facts);
-    assert_eq!(next, Next::Do(Job::ResolveConflict { object: OBJ }));
+    // It carries the buffer's base, the version the merge must start from.
+    assert_eq!(
+        next,
+        Next::Do(Job::ResolveConflict {
+            object: OBJ,
+            base_etag: "v1".into(),
+        })
+    );
 
     // The sub-script records the version, stores the bytes and reconciles the
     // parent itself — whichever way it resolved — so all that is left here is
@@ -422,5 +430,108 @@ fn an_aborted_flow_gives_up_at_the_next_step_boundary() {
         next,
         Next::Abandoned,
         "nobody is waiting, so nobody is told"
+    );
+}
+
+// --- chmod -----------------------------------------------------------------
+
+fn chmod(exec: bool, mtime: Option<i64>) -> Intent {
+    Intent::SetAttr {
+        size: None,
+        mtime,
+        exec: Some(exec),
+    }
+}
+
+#[test]
+fn chmod_records_the_executable_bit_and_answers_with_the_row() {
+    let facts = Facts::default();
+    let (flow, _) = start(OBJ, chmod(true, None), REQ, &facts);
+    let (flow, next) = advance(flow, file(10, false), &facts);
+    assert_eq!(
+        next,
+        Next::Do(Job::RecordExec {
+            object: OBJ,
+            exec: true
+        })
+    );
+    let (flow, next) = advance(flow, Completion::Done, &facts);
+    assert_eq!(
+        next,
+        Next::Do(Job::ReadNode { object: OBJ }),
+        "answered with what the attributes became"
+    );
+    let (_, next) = advance(flow, file(10, false), &facts);
+    assert_eq!(next, Next::Done);
+}
+
+#[test]
+fn a_timestamp_and_a_mode_in_one_call_are_both_recorded() {
+    // `cp -p` and `rsync -a` may set both in one `setattr`.
+    let facts = Facts::default();
+    let (flow, _) = start(OBJ, chmod(false, Some(1_700_000_000)), REQ, &facts);
+    let (flow, next) = advance(flow, file(10, false), &facts);
+    assert_eq!(
+        next,
+        Next::Do(Job::RecordMtime {
+            object: OBJ,
+            mtime: 1_700_000_000
+        })
+    );
+    let (_, next) = advance(flow, Completion::Done, &facts);
+    assert_eq!(
+        next,
+        Next::Do(Job::RecordExec {
+            object: OBJ,
+            exec: false
+        })
+    );
+}
+
+#[test]
+fn chmod_on_a_directory_is_accepted_and_records_nothing() {
+    let facts = Facts::default();
+    let (flow, _) = start(OBJ, chmod(false, None), REQ, &facts);
+    let dir = Completion::Node(NodeFacts {
+        id: OBJ,
+        parent: ObjectId(1),
+        ignored: false,
+        found: true,
+        dir: true,
+        writable: true,
+        etag: "d1".into(),
+        size: 0,
+        blob_current: false,
+        materialised: true,
+        identified: true,
+        children_loaded: true,
+        listing_stale: false,
+        stale_copy_ok: false,
+    });
+    let (_, next) = advance(flow, dir, &facts);
+    assert_eq!(next, Next::Done);
+}
+
+#[test]
+fn a_file_created_executable_is_inserted_so() {
+    let facts = Facts::default();
+    let (_, next) = start(
+        ObjectId(1),
+        Intent::Materialise {
+            name: "run.sh".into(),
+            dir: false,
+            exec: true,
+        },
+        REQ,
+        &facts,
+    );
+    assert_eq!(
+        next,
+        Next::Do(Job::InsertNode {
+            parent: ObjectId(1),
+            name: "run.sh".into(),
+            dir: false,
+            exec: true,
+        })
     );
 }

@@ -89,6 +89,43 @@ async fn notify_file_stamps_invalidation() {
     );
 }
 
+/// Authenticating is itself a sync trigger: whatever changed while no
+/// connection existed — before the start, during an outage — produced events
+/// nobody received.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authenticating_triggers_a_catch_up_walk() {
+    let ws = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ws_port = ws.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        if let Ok((stream, _)) = ws.accept().await {
+            let mut sock = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _login = sock.next().await;
+            let _pass = sock.next().await;
+            sock.send(Message::Text("authenticated".into()))
+                .await
+                .unwrap();
+            // No file event at all.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    });
+    let http_port = capabilities_server(ws_port).await;
+
+    let (sync_tx, sync_rx) = std::sync::mpsc::channel::<()>();
+    let _listener = wusel_core::push::spawn(
+        &format!("http://127.0.0.1:{http_port}"),
+        "alice",
+        "app-pw",
+        wusel_core::config::TlsSettings::default(),
+        Arc::new(AtomicI64::new(0)),
+        sync_tx,
+        None,
+    );
+    let got = tokio::task::spawn_blocking(move || sync_rx.recv_timeout(Duration::from_secs(5)))
+        .await
+        .unwrap();
+    assert!(got.is_ok(), "authenticated → the syncer walks");
+}
+
 /// Records what the user would have been told.
 #[derive(Default)]
 struct Spy {

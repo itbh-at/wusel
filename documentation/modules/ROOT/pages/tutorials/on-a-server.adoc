@@ -95,9 +95,10 @@ sudo apt update && sudo apt install wusel
 Anything else — Arch, an older Ubuntu, a distribution not listed —
 xref:how-to/install-a-package.adoc[Install a package] has the remaining routes.
 
-You get the binary, the systemd unit and `fuse3` — about five packages. The
-GNOME pieces are *suggested*, not required, so nothing graphical is pulled onto
-your server.
+You get the binary, the systemd unit and `fuse3` — about four packages. The
+mount needs no desktop, and none is pulled onto your server: the GNOME Files
+integration is a separate package, `wusel-nautilus`, which a server does not
+need.
 
 == Step 2 — Log in, keeping the password in a file
 
@@ -114,7 +115,9 @@ It prints a URL. Open that URL in a browser on *any* machine, confirm, and come
 back to the SSH session. You should see:
 
 ----
-✓ Logged in as <you> on <server>
+✓ Logged in as '<you>' on <server>
+  credentials stored at /home/<you>/.config/wusel/credentials.json (0600)
+  server: Nextcloud <version>
 ----
 
 The password lands in `~/.config/wusel/credentials.json`, mode `0600`.
@@ -199,7 +202,7 @@ emblem from — the daemon serves this socket alongside the mount:
 wusel ipc stat /Some.txt
 ----
 
-xref:reference/file-states.adoc[File states] lists the five values.
+xref:reference/file-states.adoc[File states] lists the eight values.
 
 == Step 6 — Prove it survives logout
 
@@ -228,14 +231,17 @@ wusel pins               # what is pinned
 ----
 
 Pinned files are downloaded now and never evicted. Pinning the whole account —
-`wusel pin` with no path — is the old "download everything" behaviour, and on a
+`wusel pin --all` — is the old "download everything" behaviour, and on a
 server it is sometimes exactly right. Mind the disk: a pin overrides the cache
 size budget on purpose.
 
 If the server copy of a pinned file moves on, it is marked stale rather than
-silently refetched. `wusel update` brings pins up to date; for an unattended
-box, `[sync] refresh_pinned = "auto"` in `config.toml` does it without asking.
-See xref:how-to/keep-files-offline.adoc[Keep files offline].
+silently refetched. `wusel update` brings every pin up to date, which makes it a
+natural job for a systemd timer or cron on an unattended box.
+`[sync] refresh_pinned = "auto"` in `config.toml` refetches without asking only
+when NetworkManager reports the connection as not metered; without
+NetworkManager the answer is unknown, and `auto` behaves like `ask`. See
+xref:how-to/keep-files-offline.adoc[Keep files offline].
 
 == That is the whole thing
 

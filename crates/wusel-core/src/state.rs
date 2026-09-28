@@ -9,11 +9,11 @@
 //!
 //! Cache state (which files are local) deliberately lives *outside* this DB, in
 //! sidecar files next to the blobs (see [`crate::content`]); the user-visible
-//! availability state is derived in [`crate::provider::Provider::file_state`].
+//! availability state is derived by the runtime (`sync_state`).
 //!
 //! The FUSE layer holds no state itself — everything lives here, transactionally.
 
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
 use wusel_fsm::ObjectId;
 
 use crate::model::{basename, RemoteEntry};
@@ -63,6 +63,29 @@ impl StateDb {
         Ok(Self { conn })
     }
 
+    /// Begin a transaction that is going to write, holding the write lock from
+    /// its first statement on.
+    ///
+    /// rusqlite's plain `transaction()` is SQLite's default `BEGIN DEFERRED`: it
+    /// takes no lock until the first statement, and only a *read* lock if that
+    /// statement is a `SELECT`. Every write transaction here reads first (the
+    /// row to move, the occupant to replace, the children to compare), so it
+    /// has to upgrade that read lock to a write lock mid-way. If another
+    /// connection — the syncer, a worker — has committed in between, SQLite
+    /// refuses the upgrade with `SQLITE_BUSY` *at once*: waiting could not help,
+    /// because the snapshot this transaction already read from is outdated. The
+    /// busy timeout is never consulted. That surfaced as EIO on a rename while
+    /// a sync walk was reconciling the same directory.
+    ///
+    /// `BEGIN IMMEDIATE` takes the write lock up front, before anything is
+    /// read. Contention then happens at the one point where waiting works, and
+    /// the busy timeout set in [`Self::open`] does its job.
+    fn write_tx(&mut self) -> Result<Transaction<'_>> {
+        Ok(self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?)
+    }
+
     /// In-memory DB for tests.
     pub fn open_in_memory() -> Result<Self> {
         let db = Self {
@@ -91,6 +114,7 @@ impl StateDb {
                 loaded_at INTEGER NOT NULL DEFAULT 0,         -- unix seconds of the last listing
                 permissions TEXT NOT NULL DEFAULT '',         -- oc:permissions letters
                 group_root  INTEGER NOT NULL DEFAULT 0,       -- root of a Team/Group folder?
+                exec        INTEGER NOT NULL DEFAULT 0,       -- executable bit; local only, never synced
                 UNIQUE(parent, name)
             );
             CREATE INDEX IF NOT EXISTS idx_nodes_parent ON nodes(parent);
@@ -123,6 +147,7 @@ impl StateDb {
         for stmt in [
             "ALTER TABLE nodes ADD COLUMN permissions TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE nodes ADD COLUMN group_root INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE nodes ADD COLUMN exec INTEGER NOT NULL DEFAULT 0",
         ] {
             if let Err(e) = self.conn.execute(stmt, []) {
                 if !e.to_string().contains("duplicate column name") {
@@ -143,7 +168,25 @@ impl StateDb {
         parent_path: &str,
         children: &[RemoteEntry],
     ) -> Result<()> {
-        let tx = self.conn.transaction()?;
+        self.reconcile_children_except(parent, parent_path, children, |_| false)
+    }
+
+    /// [`Self::reconcile_children`], leaving alone every existing row for which
+    /// `protected` answers `true`: it is neither updated from the listing nor
+    /// deleted for being absent from it.
+    ///
+    /// For a listing that may be older than a local change to some of the
+    /// children — a file whose rename or upload is running while the listing
+    /// is taken. Those rows are newer than the listing; the rest of the
+    /// directory is reconciled as usual.
+    pub fn reconcile_children_except(
+        &mut self,
+        parent: u64,
+        parent_path: &str,
+        children: &[RemoteEntry],
+        protected: impl Fn(u64) -> bool,
+    ) -> Result<()> {
+        let tx = self.write_tx()?;
 
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for c in children {
@@ -170,6 +213,9 @@ impl StateDb {
                 )
                 .optional()?;
             if let Some((inode, was_dir)) = existing {
+                if protected(inode) {
+                    continue;
+                }
                 if was_dir != c.is_dir {
                     delete_subtree(&tx, inode)?;
                 }
@@ -221,7 +267,7 @@ impl StateDb {
             let mut v = Vec::new();
             for row in rows {
                 let (inode, name, file_id) = row?;
-                if !seen.contains(&name) && file_id.is_some() {
+                if !seen.contains(&name) && file_id.is_some() && !protected(inode) {
                     v.push(inode);
                 }
             }
@@ -317,14 +363,14 @@ impl StateDb {
     pub fn node_by_inode(&self, inode: u64) -> Result<Option<NodeRow>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT inode, parent, name, path, is_dir, size, etag, mtime, file_id, permissions, group_root FROM nodes WHERE inode = ?1")?;
+            .prepare("SELECT inode, parent, name, path, is_dir, size, etag, mtime, file_id, permissions, group_root, exec FROM nodes WHERE inode = ?1")?;
         Ok(stmt.query_row([inode], NodeRow::from_row).optional()?)
     }
 
     /// A child of `parent` by name (for `lookup`). `None` if not present.
     pub fn child_by_name(&self, parent: u64, name: &str) -> Result<Option<NodeRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT inode, parent, name, path, is_dir, size, etag, mtime, file_id, permissions, group_root
+            "SELECT inode, parent, name, path, is_dir, size, etag, mtime, file_id, permissions, group_root, exec
              FROM nodes WHERE parent = ?1 AND name = ?2 AND inode != ?1",
         )?;
         Ok(stmt
@@ -365,6 +411,15 @@ impl StateDb {
         self.conn.execute(
             "UPDATE nodes SET mtime = ?2 WHERE inode = ?1",
             rusqlite::params![inode, mtime],
+        )?;
+        Ok(())
+    }
+
+    /// Set or clear a file's executable bit (local only, see [`NodeRow::exec`]).
+    pub fn set_exec(&self, inode: u64, exec: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE nodes SET exec = ?2 WHERE inode = ?1 AND is_dir = 0",
+            rusqlite::params![inode, exec as i64],
         )?;
         Ok(())
     }
@@ -410,7 +465,7 @@ impl StateDb {
         new_parent: u64,
         new_name: &str,
     ) -> Result<(String, String)> {
-        let tx = self.conn.transaction()?;
+        let tx = self.write_tx()?;
         // A cyclic parent link would make the rewrite walk below push children
         // forever (it would never pop its way out), so this is not a nicety: it
         // is the difference between an error and an unkillable, memory-eating
@@ -531,7 +586,7 @@ impl StateDb {
 
     /// Remove a node and its entire subtree (after a server-side delete/rename).
     pub fn remove_subtree(&mut self, inode: u64) -> Result<()> {
-        let tx = self.conn.transaction()?;
+        let tx = self.write_tx()?;
         delete_subtree(&tx, inode)?;
         tx.commit()?;
         Ok(())
@@ -547,7 +602,7 @@ impl StateDb {
     /// A single node by its full remote path (`""` = the root). `None` if unknown.
     pub fn node_by_path(&self, path: &str) -> Result<Option<NodeRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT inode, parent, name, path, is_dir, size, etag, mtime, file_id, permissions, group_root
+            "SELECT inode, parent, name, path, is_dir, size, etag, mtime, file_id, permissions, group_root, exec
              FROM nodes WHERE path = ?1",
         )?;
         Ok(stmt
@@ -561,7 +616,7 @@ impl StateDb {
     /// a real server object; only our knowledge of its contents is dropped.
     /// Returns the number of forgotten nodes. (Diagnostic aid: `cache clear`.)
     pub fn forget_children(&mut self, inode: u64) -> Result<usize> {
-        let tx = self.conn.transaction()?;
+        let tx = self.write_tx()?;
         let kids: Vec<u64> = {
             let mut stmt =
                 tx.prepare("SELECT inode FROM nodes WHERE parent = ?1 AND inode != ?1")?;
@@ -742,7 +797,7 @@ impl StateDb {
     /// If the state cannot be read.
     pub fn node_by_file_id(&self, file_id: u64) -> Result<Option<NodeRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT inode, parent, name, path, is_dir, size, etag, mtime, file_id, permissions, group_root
+            "SELECT inode, parent, name, path, is_dir, size, etag, mtime, file_id, permissions, group_root, exec
              FROM nodes WHERE file_id = ?1",
         )?;
         Ok(stmt.query_row([file_id], NodeRow::from_row).optional()?)
@@ -771,7 +826,7 @@ impl StateDb {
 }
 
 const SELECT_NODE_COLS_WHERE_PARENT: &str =
-    "SELECT inode, parent, name, path, is_dir, size, etag, mtime, file_id, permissions, group_root
+    "SELECT inode, parent, name, path, is_dir, size, etag, mtime, file_id, permissions, group_root, exec
      FROM nodes WHERE parent = ?1 AND inode != ?1";
 
 /// How far up the parent chain [`descends_from`] is willing to walk. Far beyond
@@ -919,6 +974,12 @@ pub struct NodeRow {
     /// [`crate::model::is_group_folder_root`]. Stored as the answer rather
     /// than its two ingredients: it is the only question anything asks.
     pub group_root: bool,
+    /// Whether the file is executable. WebDAV has no mode bits, so this lives
+    /// in the local state only — set by `chmod`, never uploaded, and lost with
+    /// the row (`cache clear`, a rename done on the server). A file from the
+    /// server therefore never arrives executable. Always `false` for a
+    /// directory.
+    pub exec: bool,
 }
 
 impl NodeRow {
@@ -935,6 +996,7 @@ impl NodeRow {
             file_id: row.get::<_, Option<i64>>(8)?.map(|v| v as u64),
             permissions: row.get(9)?,
             group_root: row.get::<_, i64>(10).unwrap_or(0) != 0,
+            exec: row.get::<_, i64>(11)? != 0,
         })
     }
 
@@ -1239,6 +1301,58 @@ mod tests {
             vec![("Photos".to_string(), true), ("a.txt".to_string(), false)]
         );
     }
+    /// An atomic save (temporary renamed over the file) while another
+    /// connection — the syncer reconciling the same directory — is mid-write.
+    /// The rename has to wait for that writer, not fail: failing is an EIO on
+    /// the rename after the server-side MOVE already happened, which leaves the
+    /// file's row at its old size over the new contents.
+    #[test]
+    fn move_subtree_waits_for_a_concurrent_writer_instead_of_failing() {
+        let base = std::env::temp_dir().join(format!("wusel-immediate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let path = base.join("state.sqlite");
+
+        let mut db = StateDb::open(&path).unwrap();
+        db.reconcile_children(ROOT_INODE, "", &[entry("init.el", false)])
+            .unwrap();
+        let tmp = db.insert_local_file(ROOT_INODE, "init.el.tmp").unwrap();
+
+        // The other writer: holds the write lock, writes, and commits only after
+        // the rename has started and read what it needs.
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let other_path = path.clone();
+        let other = std::thread::spawn(move || {
+            let mut conn = Connection::open(&other_path).unwrap();
+            conn.busy_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            tx.execute(
+                "UPDATE nodes SET size = size WHERE inode = ?1",
+                [ROOT_INODE],
+            )
+            .unwrap();
+            locked_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            tx.commit().unwrap();
+        });
+
+        locked_rx.recv().unwrap();
+        let moved = db.move_subtree(tmp.inode, ROOT_INODE, "init.el");
+        other.join().unwrap();
+        moved.expect("the rename must wait for the other writer, not fail with SQLITE_BUSY");
+        assert_eq!(
+            db.node_by_path("init.el").unwrap().unwrap().inode,
+            tmp.inode,
+            "the temporary replaced the file"
+        );
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn move_subtree_rejects_a_move_into_its_own_subtree() {
         let mut db = StateDb::open_in_memory().unwrap();

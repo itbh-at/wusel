@@ -10,7 +10,7 @@ Nextcloud ships its own desktop client, so the fair question is how Wusel
 differs. It is less a matter of features than of what each program *is*:
 
 *The official client is a sync application.* It keeps your folders in step with
-the server. A new beta adds on-demand files on Linux — but through a separate
+the server. An upcoming beta adds on-demand files on Linux — but through a separate
 FUSE helper that the sync client starts and drives, an on-demand layer on a sync
 app.
 
@@ -33,31 +33,33 @@ That difference is not wording. It changes what you can actually do:
   stack plus a Python file-manager extension.
 * *Fewer parts to break.* One process runs from a `read` to the network, rather
   than a sync client driving a separate, experimental FUSE daemon over a socket
-  — a seam the proposal's own author still lists as unfinished: "missing is
+  — a seam the pull request's own author listed as unfinished: "missing is
   proper communication between the openvfs fuse daemon and the desktop files
   client".
 * *It stays out of your way.* No tray icon and no window of its own. Wusel runs
-  in the background and interrupts you only when it must — a conflicted copy, or
-  an upload that cannot complete — never with the "sync finished" noise a
+  in the background and interrupts you only when it must — a conflicted copy, an
+  upload that cannot complete, a lost connection — never with the "sync finished" noise a
   tray application tends to produce. Per-file status lives on the files
   themselves, as emblems, not in a panel you have to watch.
 
 None of that changes when the beta label comes off. It follows from how each
-program is built, not from how finished it is: waiting for the proposal gives you
-the sync client with an on-demand layer, not a filesystem.
+program is built, not from how finished it is: waiting for that release gives
+you the sync client with an on-demand layer, not a filesystem.
 
 Every claim below points at something you can read in their source or in ours,
-and it describes the state in early September 2026.
+and it describes the state in late September 2026.
 
 == On-demand files
 
 The released official client has no on-demand mode on Linux — it syncs each
-selected folder in full. On-demand files are a proposal:
-https://github.com/nextcloud/desktop/pull/10635[nextcloud/desktop#10635], open,
-and offered in the setup dialog as *Virtual files (beta)* — an early preview its
-authors recommend against for production and do not make the default.
+selected folder in full. On-demand files were added by
+https://github.com/nextcloud/desktop/pull/10635[nextcloud/desktop#10635], merged
+into the development branch for a future release and not in any release yet.
+They are offered in the setup dialog as *Virtual files (beta)* — an opt-in,
+experimental preview its authors recommend against for production and do not
+make the default.
 
-In that proposal the virtual filesystem is not part of the client. It is
+In that design the virtual filesystem is not part of the client. It is
 https://github.com/opencloud-eu/openvfs[openvfs] — a separate FUSE daemon from
 the OpenCloud project, derived from LoggedFS and called experimental in its own
 README. Like Wusel, it shows files as placeholders and fetches their content only
@@ -109,7 +111,7 @@ The official client's file-manager extension is older and reaches more managers
 today: Nautilus, Nemo, Caja and Dolphin, against our Nautilus, with the rest
 xref:project/roadmap.adoc[on the roadmap]. But it talks to the running client
 over a socket — close the client and the emblems and menus go with it. And the
-new on-demand proposal adds none of this, only a choice of sync type in the setup
+new on-demand mode adds none of this, only a choice of sync type in the setup
 dialog.
 
 == Footprint
@@ -118,10 +120,12 @@ The official client is a Qt application: it links the Qt libraries — base,
 widgets, QML, Quick — and a KDE framework or two, and its file-manager extension
 is written in Python, so the distribution pulls a Python binding in with it.
 
-Wusel is a single binary. It links four system libraries; TLS, SQLite and D-Bus
-are built in, and the only thing it asks the distribution for is FUSE. Nothing
-needs an interpreter or a widget toolkit — which is what lets it run on a server
-or in a container. (This is about what gets installed, not memory use, which is
+Wusel is a single binary. It links only libc, libm and libgcc_s; TLS, SQLite
+and D-Bus are built in, and the only thing it asks the distribution for is FUSE
+— about four packages in all. Nothing needs an interpreter or a widget toolkit —
+which is what lets it run on a server or in a container. Its GNOME Files
+extension is native C in a package of its own, `wusel-nautilus`, which brings
+only what Nautilus itself uses. (This is about what gets installed, not memory use, which is
 not measured here.)
 
 == Where the official client is ahead

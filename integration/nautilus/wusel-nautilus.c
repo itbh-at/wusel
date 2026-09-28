@@ -21,6 +21,7 @@
 
 #include <gio/gio.h>
 #include <glib-object.h>
+#include <gtk/gtk.h> // GDK clipboard, for "copy internal link"
 #include <string.h>
 #include <sys/types.h>
 
@@ -370,22 +371,6 @@ wusel_ext_info_provider_iface_init(NautilusInfoProviderInterface *iface)
 // phrase from another product and describes a side effect, while what the entry
 // actually does is withdraw the promise. The space follows.
 
-// Read one file's sync state into `out` (NUL-terminated). FALSE if the file is
-// not a local file, not on one of our mounts, or has no state of its own — a
-// plain directory has none, and must not get the file actions.
-static gboolean file_state(NautilusFileInfo *file, char *out, size_t out_len)
-{
-    char *path = local_path(file);
-    if (!path)
-    {
-        return FALSE;
-    }
-    WuselStatus status;
-    gboolean ok = wusel_status_get(path, &status) && status.state[0] != '\0';
-    g_free(path);
-    return ok && g_strlcpy(out, status.state, out_len) < out_len;
-}
-
 // Locate the wusel binary: PATH first, then the usual install locations. The
 // menu spawns it, and Nautilus's PATH is not always the user's shell PATH.
 static char *find_wusel(void)
@@ -549,6 +534,151 @@ static NautilusMenuItem *make_item(const char *name, const char *label,
     return item;
 }
 
+// --- Web actions: open in Nextcloud / copy the internal link ----------------
+//
+// The URL is built by the engine (`wusel web url`), not here — one definition of
+// the link format for every frontend, and this side needs no knowledge of the
+// server address or the file-id mapping. Building a link is a local, instant
+// operation in the engine (no network), so the synchronous spawn below cannot
+// stall the window.
+
+// Run `wusel web url [--reveal] <path>` and return its printed URL, newline
+// stripped, or NULL on any failure.
+static char *wusel_web_url(const char *path, gboolean reveal)
+{
+    char *exe = find_wusel();
+    if (!exe)
+    {
+        g_warning("wusel not found (PATH, /usr/local/bin, /usr/bin, ~/.local/bin)");
+        return NULL;
+    }
+    char *argv[6];
+    int i = 0;
+    argv[i++] = exe;
+    argv[i++] = "web";
+    argv[i++] = "url";
+    if (reveal)
+    {
+        argv[i++] = "--reveal";
+    }
+    argv[i++] = (char *)path;
+    argv[i] = NULL;
+
+    char *out = NULL;
+    gint status = 0;
+    GError *err = NULL;
+    gboolean ok =
+        g_spawn_sync(NULL, argv, NULL, G_SPAWN_DEFAULT, NULL, NULL, &out, NULL, &status, &err);
+    g_free(exe);
+    if (!ok || !g_spawn_check_wait_status(status, NULL))
+    {
+        g_warning("wusel web url failed: %s", err ? err->message : "non-zero exit");
+        g_clear_error(&err);
+        g_free(out);
+        return NULL;
+    }
+    g_strstrip(out); // drop the trailing newline the CLI prints
+    return out;
+}
+
+// Open a URL with the desktop's default handler (the browser). The GIO way, so
+// no `xdg-open` and no per-OS special-casing — and it respects the user's
+// chosen default browser.
+static void open_uri(const char *uri)
+{
+    GError *err = NULL;
+    if (!g_app_info_launch_default_for_uri(uri, NULL, &err))
+    {
+        g_warning("could not open %s: %s", uri, err ? err->message : "?");
+        g_clear_error(&err);
+    }
+}
+
+// Put text on the clipboard. Nautilus is a GTK app, so its display's own
+// clipboard is the native, session-agnostic way — no wl-copy/xclip dependency,
+// and it works the same under Wayland and X11.
+static void copy_to_clipboard(const char *text)
+{
+#if GTK_CHECK_VERSION(4, 0, 0)
+    GdkDisplay *display = gdk_display_get_default();
+    if (!display)
+    {
+        g_warning("no display for the clipboard");
+        return;
+    }
+    gdk_clipboard_set_text(gdk_display_get_clipboard(display), text);
+#else
+    gtk_clipboard_set_text(gtk_clipboard_get(GDK_SELECTION_CLIPBOARD), text, -1);
+#endif
+}
+
+// The one selected file's local path. The web actions are single-selection only
+// (see the menu builder), so the first entry is the only entry.
+static char *single_path(NautilusMenuItem *item)
+{
+    GList *files = g_object_get_data(G_OBJECT(item), "wusel-files");
+    return files ? local_path(NAUTILUS_FILE_INFO(files->data)) : NULL;
+}
+
+static void on_web_open_activate(NautilusMenuItem *item, gpointer user_data)
+{
+    (void)user_data;
+    char *path = single_path(item);
+    if (!path)
+    {
+        return;
+    }
+    char *url = wusel_web_url(path, FALSE);
+    g_free(path);
+    if (url)
+    {
+        open_uri(url);
+        g_free(url);
+    }
+}
+
+static void on_web_reveal_activate(NautilusMenuItem *item, gpointer user_data)
+{
+    (void)user_data;
+    char *path = single_path(item);
+    if (!path)
+    {
+        return;
+    }
+    char *url = wusel_web_url(path, TRUE);
+    g_free(path);
+    if (url)
+    {
+        open_uri(url);
+        g_free(url);
+    }
+}
+
+static void on_web_copy_activate(NautilusMenuItem *item, gpointer user_data)
+{
+    (void)user_data;
+    char *path = single_path(item);
+    if (!path)
+    {
+        return;
+    }
+    char *url = wusel_web_url(path, FALSE);
+    g_free(path);
+    if (url)
+    {
+        copy_to_clipboard(url);
+        g_free(url);
+    }
+}
+
+// Append an item to the submenu and drop our creating reference: the menu takes
+// its own, so keeping ours would leak the item.
+static void submenu_add(NautilusMenu *menu, NautilusMenuItem *item)
+{
+    nautilus_menu_append_item(menu, item);
+    g_object_unref(item);
+}
+
 static GList *
 wusel_ext_get_file_items(NautilusMenuProvider *provider, GList *files)
 {
@@ -560,33 +690,55 @@ wusel_ext_get_file_items(NautilusMenuProvider *provider, GList *files)
     gboolean any_stale = FALSE, any_missing = FALSE;
     for (GList *l = files; l != NULL; l = l->next)
     {
-        char state[32];
-        if (!file_state(NAUTILUS_FILE_INFO(l->data), state, sizeof(state)))
+        char *path = local_path(NAUTILUS_FILE_INFO(l->data));
+        if (!path)
         {
             continue;
         }
+        WuselStatus st;
+        gboolean ours = wusel_status_get(path, &st);
+        g_free(path);
+        if (!ours)
+        {
+            continue; // not on one of our mounts, or no daemon answered
+        }
         any_ours = TRUE;
-        if (strcmp(state, "pinned") == 0)
+        if (st.state[0] != '\0')
         {
-            any_unpinnable = TRUE;
+            // A file with a content state of its own — the per-state affordances.
+            if (strcmp(st.state, "pinned") == 0)
+            {
+                any_unpinnable = TRUE;
+            }
+            else if (strcmp(st.state, "pinned-stale") == 0)
+            {
+                // Still pinned, so freeing space is still on offer — and now
+                // there is something to bring up to date.
+                any_unpinnable = TRUE;
+                any_stale = TRUE;
+            }
+            else if (strcmp(st.state, "pinned-pending") == 0)
+            {
+                // Pinned with nothing here yet. Unpinning applies (the pin is
+                // real), and so does fetching — the same action that mends a
+                // stale copy mends a missing one.
+                any_unpinnable = TRUE;
+                any_missing = TRUE;
+            }
+            else if (strcmp(st.state, "online-only") == 0 || strcmp(st.state, "cached") == 0)
+            {
+                any_pinnable = TRUE;
+            }
         }
-        else if (strcmp(state, "pinned-stale") == 0)
+        else
         {
-            // Still pinned, so freeing space is still on offer — and now there
-            // is something to bring up to date.
-            any_unpinnable = TRUE;
-            any_stale = TRUE;
-        }
-        else if (strcmp(state, "pinned-pending") == 0)
-        {
-            // Pinned with nothing here yet. Unpinning applies (the pin is
-            // real), and so does fetching — the same action that mends a stale
-            // copy mends a missing one.
-            any_unpinnable = TRUE;
-            any_missing = TRUE;
-        }
-        else if (strcmp(state, "online-only") == 0 || strcmp(state, "cached") == 0)
-        {
+            // Ours, but with no content state of its own: a directory. The
+            // daemon reports a kept-offline directory as "pinned" (handled
+            // above, exactly like a file — that is where a folder's unpin and
+            // its green check already come from), so a *stateless* directory is
+            // one that is not kept offline yet. Offer to keep the whole folder,
+            // and its subtree, offline — the whole-folder pin the CLI and the
+            // macOS integration already provide, which Nautilus was missing.
             any_pinnable = TRUE;
         }
     }
@@ -595,16 +747,28 @@ wusel_ext_get_file_items(NautilusMenuProvider *provider, GList *files)
         return NULL;
     }
 
-    GList *items = NULL;
+    // A single object gets the web actions too; a multi-selection gets only the
+    // pin/unpin verbs (aggregated above) — "open" or "copy link" of five files
+    // would mean five tabs or an ambiguous clipboard.
+    gboolean single = files && files->next == NULL;
+
+    // Nothing to offer: a multi-selection of ours where none can be pinned or
+    // unpinned (e.g. all mid-edit). Draw no "Wusel" entry rather than an empty
+    // one. A single object always has at least the web actions, so it is exempt.
+    if (!any_pinnable && !any_unpinnable && !single)
+    {
+        return NULL;
+    }
+
+    NautilusMenu *menu = nautilus_menu_new();
     if (any_stale || any_missing)
     {
-        // First in the list: it is the only entry that answers a problem the
-        // emblem is already showing. One entry for both defects, because it is
-        // one action — `wusel update` fetches whatever the pin promised and did
-        // not deliver, whether the copy here is old or absent.
-        items = g_list_append(
-            items,
-            make_item("Wusel::update", tr("Wusel - Update Now", "Wusel - Jetzt aktualisieren"),
+        // First: the only entry that answers a problem the emblem already shows.
+        // One entry for both defects — `wusel update` fetches whatever the pin
+        // promised and did not deliver, whether the copy is old or absent.
+        submenu_add(
+            menu,
+            make_item("Wusel::update", tr("Update Now", "Jetzt aktualisieren"),
                       tr("Fetch the current version; the offline copy is missing or out of date",
                          "Aktuelle Fassung holen; die Offline-Kopie fehlt oder ist veraltet"),
                       any_stale ? "wusel-emblem-pinned-stale" : "wusel-emblem-pinned-pending",
@@ -612,25 +776,61 @@ wusel_ext_get_file_items(NautilusMenuProvider *provider, GList *files)
     }
     if (any_pinnable)
     {
-        items = g_list_append(
-            items, make_item("Wusel::pin",
-                             tr("Wusel - Make Available Offline",
-                                "Wusel - Offline verfügbar machen"),
-                             tr("Download and keep this available offline",
-                                "Herunterladen und offline verfügbar halten"),
-                             "wusel-emblem-pinned", G_CALLBACK(on_pin_activate), files));
+        submenu_add(menu, make_item("Wusel::pin",
+                                    tr("Make Available Offline", "Offline verfügbar machen"),
+                                    tr("Download and keep this available offline",
+                                       "Herunterladen und offline verfügbar halten"),
+                                    "wusel-emblem-pinned", G_CALLBACK(on_pin_activate), files));
     }
     if (any_unpinnable)
     {
-        items = g_list_append(
-            items, make_item("Wusel::unpin",
-                             tr("Wusel - Stop Keeping Offline",
-                                "Wusel - Offline-Verfügbarkeit aufheben"),
-                             tr("Remove the local copy; keep it online-only",
-                                "Lokale Kopie entfernen; nur online behalten"),
-                             "wusel-emblem-cloud", G_CALLBACK(on_unpin_activate), files));
+        submenu_add(menu, make_item("Wusel::unpin",
+                                    tr("Stop Keeping Offline", "Offline-Verfügbarkeit aufheben"),
+                                    tr("Remove the local copy; keep it online-only",
+                                       "Lokale Kopie entfernen; nur online behalten"),
+                                    "wusel-emblem-cloud", G_CALLBACK(on_unpin_activate), files));
     }
-    return items;
+
+    if (single)
+    {
+        // "Open in Nextcloud" opens a file in the web viewer and navigates into a
+        // folder; the separate "reveal in its folder" only makes sense for a
+        // file, since on a folder it would mean the same as opening it.
+        gboolean is_dir = nautilus_file_info_is_directory(NAUTILUS_FILE_INFO(files->data));
+        submenu_add(menu, make_item("Wusel::web-open",
+                                    tr("Open in Nextcloud", "In Nextcloud öffnen"),
+                                    tr("Open this in the Nextcloud web interface",
+                                       "Dies in der Nextcloud-Weboberfläche öffnen"),
+                                    NULL, G_CALLBACK(on_web_open_activate), files));
+        if (!is_dir)
+        {
+            submenu_add(
+                menu,
+                make_item("Wusel::web-reveal",
+                          tr("Open Folder in Nextcloud", "Ordner in Nextcloud öffnen"),
+                          tr("Open the containing folder in Nextcloud, with this file highlighted",
+                             "Den enthaltenden Ordner in Nextcloud öffnen, diese Datei markiert"),
+                          NULL, G_CALLBACK(on_web_reveal_activate), files));
+        }
+        submenu_add(menu, make_item("Wusel::web-copy",
+                                    tr("Copy Internal Link", "Internen Link kopieren"),
+                                    tr("Copy a permanent Nextcloud link to this to the clipboard",
+                                       "Einen dauerhaften Nextcloud-Link hierauf in die Zwischenablage"
+                                       " kopieren"),
+                                    NULL, G_CALLBACK(on_web_copy_activate), files));
+    }
+
+    // One "Wusel" entry holds everything: a single line in a crowded context
+    // menu instead of several, and the per-item "Wusel - " prefix the old flat
+    // list needed is gone — the submenu already says whose commands these are.
+    NautilusMenuItem *root =
+        nautilus_menu_item_new("Wusel", "Wusel",
+                               tr("Keep offline, open in Nextcloud, copy the link",
+                                  "Offline halten, in Nextcloud öffnen, Link kopieren"),
+                               NULL);
+    nautilus_menu_item_set_submenu(root, menu);
+    g_object_unref(menu);
+    return g_list_append(NULL, root);
 }
 
 static void

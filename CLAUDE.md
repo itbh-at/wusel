@@ -92,6 +92,15 @@ XDG paths by hand instead of adding the `dirs` crate.)
   an essay. Durable explanation belongs in code comments and the docs, which are
   read; a commit body is read once, if ever.
 
+## Releases
+
+- A release is prepared with `mise run release <version>`, never by hand: it
+  branches `release/<version>`, sets the version in `Cargo.toml` and
+  `Cargo.lock`, and opens the entry in the RPM spec, `debian/changelog` and the
+  docs changelog. Version, date and author are never typed, by a human or an
+  agent — only the release notes replacing the `TODO` lines are. Steps:
+  [Cut a release](documentation/modules/ROOT/pages/how-to/cut-a-release.adoc).
+
 ## Architecture & crates
 
 - `wusel-fsm` — the decision core: occupancy and flow steps as decisions over
@@ -117,13 +126,14 @@ XDG paths by hand instead of adding the `dirs` crate.)
   the podman VM sees the repo (`scripts/podman-lib.sh`): directly, via a
   `/Volumes/<disk>` → `/var/mnt/<disk>` disk share, or — as the fallback — an
   rsync mirror under `/private/tmp` (see the development docs). Native macOS
-  support (a File Provider frontend, not FUSE) is far-future, experimental work.
+  support is a File Provider frontend (Swift, under `macos/`, talking to
+  `wusel serve` over `wusel-ipc`), not FUSE — in `main`, experimental.
 - **Keep `main` green:** the full CI gate is `fmt-check`, `headers-check`,
   `shellcheck`, `clippy`, `check`, `test`, `build-fuse` — all of them, before
-  merging. The `.githooks/pre-push` hook (`mise run setup-hooks`) runs that same
-  gate — including `fuse-test`, which lints wusel-fuse in the container the host
-  checks cannot — before a feature branch is pushed, so a break is caught before
-  review rather than after.
+  merging. The `.githooks/pre-push` hook (`mise run setup-hooks`) runs that gate
+  except `build-fuse`, plus `fuse-test`, which builds, tests and lints wusel-fuse
+  in the container the host checks cannot — before a feature branch is pushed, so
+  a break is caught before review rather than after.
 
 ## Project plans & decisions
 
@@ -135,6 +145,16 @@ settled: Apache-2.0, headers applied by `mise run headers` (see
 
 ## Documentation
 
+- **Project knowledge goes into the docs, never into an agent's private
+  memory.** Work happens from several machines and sessions; a fact that lives
+  only in one agent's memory is missing everywhere else and goes stale unseen.
+  Pitfalls, workarounds and settled decisions belong on a page (or in this file,
+  if they are standing rules).
+- **When docs and code disagree, decide which one is wrong.** A capability the
+  docs promise and users reasonably expect (example: HTTP/2) that the code lacks
+  is an implementation bug — fix the code, then align the docs. Never document a
+  gap away to make the docs "correct". Only genuinely planned or deliberately
+  disabled behaviour is written up as not implemented.
 - Antora component under **`documentation/`** (not `docs/`).
 - Build: `mise exec -- ./documentation/build.sh` (official) or
   `mise exec -- ./documentation/build.sh watch` (live). `mise exec` puts `antora`

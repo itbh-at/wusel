@@ -3,8 +3,10 @@
 # Copyright 2026 IT Beratung Hermann GmbH
 #
 # Run the full gate before a push, so a feature branch is verified locally
-# before it is opened for review. The checks below are exactly the ones CI runs;
-# running them here catches a break at push time rather than later.
+# before it is opened for review. The checks below are CI's gate minus
+# `build-fuse` (the FUSE build of the wusel binary, which the macOS host cannot
+# do and fuse-test does not do), plus the container's `fuse-test`; running them
+# here catches a break at push time rather than later.
 #
 # It exists because of a whole class of bug the host checks miss: on macOS
 # `mise run clippy` and `check` exclude wusel-fuse (it needs the Linux FUSE
@@ -49,8 +51,8 @@ done
 echo ">> pre-push gate: running the full local gate (host + container) ..." >&2
 echo "   skip with 'WUSEL_SKIP_PREPUSH=1 git push' for WIP you will not merge" >&2
 
-# The same checks CI runs, in the same order, through the same mise tasks — so
-# the two cannot drift. The container task (fuse-test) is last because it is the
+# CI's checks, in the same order, through the same mise tasks — so the two
+# cannot drift — except `build-fuse`, which is not run here. The container task (fuse-test) is last because it is the
 # slowest and the most likely to be the one that catches a wusel-fuse regression
 # the host tasks structurally cannot see.
 mise run fmt-check

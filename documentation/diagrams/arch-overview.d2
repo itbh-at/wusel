@@ -9,21 +9,35 @@
 
 direction: down
 
-fm: "File manager  (Nautilus / Dolphin / Nemo / Thunar)\nemblems · sidebar · context menu (\"keep online\")" {
+fm: "File manager  (Linux)\nNautilus extension: emblems · \"Wusel\" context menu\nsidebar entry via libcloudproviders" {
   shape: rectangle
   style: {fill: "#EAF1FB"; stroke: "#B7BECC"}
 }
 
-daemon: "wusel daemon" {
+finder: "Finder  (macOS, experimental)\nFile Provider extension" {
+  shape: rectangle
+  style: {fill: "#EAF1FB"; stroke: "#B7BECC"}
+}
+
+daemon: "wusel daemon  (wusel mount · wusel serve)" {
   style: {fill: "#FBFBFD"; stroke: "#C6CBD6"}
 
-  fuse: "FUSE layer\n(wusel-fuse)" {
+  fuse: "FUSE frontend\n(wusel-fuse, Linux)" {
     style: {fill: "#EAF1FB"; stroke: "#B7BECC"}
+  }
+  ipc: "Socket frontend\n(wusel-ipc)" {
+    style: {fill: "#EAF1FB"; stroke: "#B7BECC"}
+  }
+  desktop: "Desktop integration\n(wusel-desktop, Linux)\nnotifications · D-Bus" {
+    style: {fill: "#EAF1FB"; stroke: "#B7BECC"}
+  }
+  fsm: "Decider\n(wusel-fsm)\nno I/O" {
+    style: {fill: "#E9F6EE"; stroke: "#B7CBBE"}
   }
   core: "wusel-core" {
     style: {fill: "#F4F5F9"; stroke: "#C6CBD6"}
 
-    sync: "Sync engine\nstate machine" {
+    runtime: "Substrate\nDB readers · writer · net · file pools" {
       style: {fill: "#E9F6EE"; stroke: "#B7CBBE"}
     }
     client: "Nextcloud client\nWebDAV · OCS · notify_push (WS)" {
@@ -36,10 +50,16 @@ daemon: "wusel daemon" {
       style: {fill: "#FBEAF0"; stroke: "#D8B6C4"}
     }
   }
-  fuse <-> core.sync
-  core.sync <-> core.client
-  fuse -> core.db
+  fuse -> fsm: "intents"
+  ipc -> fsm: "intents"
+  fsm <-> core.runtime: "jobs · completions"
+  core.runtime -> core.db
+  core.runtime -> core.client
   core.client -> core.cache
+  core -> desktop: "notices · changes"
 }
 
-fm -> daemon: "libcloudproviders (D-Bus) · file-manager plugin"
+fm -> daemon.fuse: "file access (kernel)"
+fm -> daemon.ipc: "status per file"
+daemon.desktop -> fm: "sidebar · FileChanged"
+finder -> daemon.ipc: "Unix socket"

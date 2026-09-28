@@ -15,18 +15,32 @@ mirroring engine has already synced, and is driven over a socket
 interchangeable, thin frontends, with the virtual filesystem as the starting
 point instead of a layer on top.
 
-. `wusel-core` — engine, no kernel. Tests natively on Linux and macOS.
+. `wusel-fsm` — the decider: occupancy, collision policy and operation scripts
+  as plain data. No I/O and no dependencies at all.
+. `wusel-core` — engine, no kernel: WebDAV, state, pins, content cache, syncer,
+  and the substrate that carries the machine's steps out. Tests natively on
+  Linux and macOS.
 . `wusel-fuse` — thin FUSE frontend (library), Linux (libfuse3).
+. `wusel-ipc` — socket frontend: serves the engine's intent protocol and the
+  per-file status over a Unix-domain socket, for frontends that run out of
+  process. Platform-independent.
 . `wusel-desktop` — Linux/GNOME integration behind `desktop::Desktop`: localized
-  freedesktop notifications, the Nautilus cloud-provider sidebar plus per-file
-  emblems and a pin/unpin menu (`libcloudproviders` + a native
-  `libnautilus-extension` module), and a GNOME Shell search provider. A no-op
-  elsewhere; macOS/Windows would be their own crates.
+  freedesktop notifications, the cloud-provider sidebar entry
+  (`libcloudproviders` over D-Bus), the `FileChanged` D-Bus signal for emblem
+  refreshes, a GNOME Shell search provider and the opt-in notify hook. A no-op
+  elsewhere.
 . `wusel` — daemon/CLI binary, ties engine + frontends together (the product).
+. `wusel-mock` — a mock Nextcloud server for the tests.
+
+Outside the Rust workspace: the Nautilus extension under `integration/nautilus/`
+(C, a `libnautilus-extension` module) draws the per-file emblems and the
+"Wusel" context menu from the socket's status; the macOS frontend under
+`macos/` (Swift, experimental) is an agent app that runs `wusel serve` and a
+File Provider extension that drives it over the socket.
 
 Each OS gets its matching frontend (Linux → FUSE + libcloudproviders;
-macOS → later File Provider Extension), while the engine stays unchanged.
-That is the strategic advantage over the monolith.
+macOS → File Provider extension, experimental), while the engine stays
+unchanged. That is the strategic advantage over the monolith.
 
 // Rendered from documentation/diagrams/arch-overview.d2 (mise run docs-diagrams).
 // Explicit width: d2's outer <svg> carries only a viewBox (no width/height), so
@@ -41,14 +55,16 @@ by naming an **intent** and letting the machine decide what that costs.
 ....
 wusel-fsm                    the decider: occupancy, collision policy, scripts
    Fetch · Write · Stat · Lookup · Enumerate · Materialise
-   Publish · Remove · Move · SetAttr · State · Refresh · Relist
+   Publish · Remove · Move · SetAttr · State
+   (internal: Relocate · Delete; modelled, not yet submitted: Refresh · Relist)
 
 wusel-core::runtime          the substrate that carries the steps out
    N database readers · 1 writer · network pool · file pool
 
 wusel-fuse          (Linux)   — FUSE callbacks       → intents   [exists]
-wusel-fileprovider  (macOS)   — File Provider ext.   → intents   [experimental]
-wusel-cfapi         (Windows) — Cloud Filter API     → intents   [planned]
+wusel-ipc           (any)     — socket requests      → intents   [exists]
+WuselFileProvider   (macOS)   — File Provider ext.   → socket    [experimental]
+Cloud Filter host   (Windows) — Cloud Filter API     → socket    [planned]
 ....
 
 Two words carry this, so they are worth stating plainly. An **intent** is what a
@@ -71,28 +87,32 @@ xref:reference/operation-scripts.adoc[the operation scripts].
 
 `wusel-core` keeps what was never per-request: the WebDAV client, the SQLite
 state, pins, the background syncer, and the conflict and reconcile logic the
-substrate calls. The macOS and Windows frontends remain separate, additive
-projects with their own OS glue (Swift + a C ABI on macOS; `windows-rs` on
-Windows) — neither changes the engine, which is the whole point of the split.
+substrate calls. The macOS frontend is a separate, additive project in Swift that
+does not link the engine: it drives a `wusel serve` process over the `wusel-ipc`
+socket. A Windows frontend would do the same. Neither changes the engine, which
+is the whole point of the split.
 
 == FUSE ↔ async bridge
 
 FUSE callbacks are synchronous/blocking, network I/O is async (tokio). The
-`fuser` session loop processes one request at a time on a single thread, so any
-call that blocks it — a PROPFIND, a content fetch — stalls *every* other
+`fuser` session loop reads one request at a time on a single thread, so any
+call that blocks it — a PROPFIND, a content fetch — would stall *every* other
 operation queued behind it (tab-completion, `stat`). Two rules keep that from
 happening:
 
 * *Reads serve only their range* (see xref:explanation/vfs-first.adoc[VFS-first]) — never a whole multi-second download on
   the FUSE thread.
-* *Revalidation is off-thread.* A stale-but-listed directory is refreshed by a
-  **background revalidator**: a dedicated thread does only the slow PROPFIND and
-  hands the listing back through a channel; the provider applies it (a fast local
-  SQLite reconcile) on the FUSE thread at the next call. So a directory listing —
-  or a background indexer walking the tree — never blocks interactive work. All
-  SQLite access stays on the one thread (single connection, no locks); the worker
-  touches only the network. A pending revalidation per directory is de-duplicated,
-  so a burst of accesses collapses to one PROPFIND.
+* *Revalidation is off-thread.* A stale-but-listed directory is served from the
+  cache at once, and the machine asks for a background re-list
+  (`Action::Refresh`). It runs beside the machine as a detached `ListRemote`
+  job in the network pool's background tier, served after the work somebody is
+  waiting for — the PROPFIND and a reconcile of the rows in one transaction —
+  with nobody waiting for it. So a directory listing — or a
+  background indexer walking the tree — never blocks interactive work. At most
+  one refresh per directory runs at a time, none while that directory has other
+  work running, and the backlog is capped, so a burst of accesses collapses to
+  one PROPFIND. A listing is dropped if the machine started work on that
+  directory while it was being taken — see xref:explanation/concurrency.adoc[Concurrency].
 
 Only the *first* listing of a directory is synchronous, because there is nothing
 cached to serve yet.
@@ -109,8 +129,8 @@ That ceiling is gone as of 0.2.0. Every callback is now an intent handed to a
 state machine that decides and performs no I/O, with database readers, a writer,
 and network and file pools underneath it: see xref:explanation/concurrency.adoc[Concurrency]
 for the design and xref:reference/operation-scripts.adoc[the operation scripts] for what each
-operation does. The paragraph above describes 0.1.0, the mitigated
-single-threaded loop.
+operation does. In 0.1.0 the background revalidator handed its listing back to
+the FUSE thread, which applied it over the one SQLite connection.
 
 === Directory streams see a stable listing
 
@@ -157,8 +177,8 @@ under an `accounts/<name>/` subdirectory:
 
 The CLI carries an optional `--account <name>` (default `default`, so the
 single-account case is unchanged); `wusel accounts` lists them and `wusel
-account remove <name>` deletes a named profile (credentials, state, cache — the
-server is untouched). Named accounts map directly onto a **templated** systemd
+account remove <name>` deletes a named profile (configuration, credentials
+including the keyring entry, pins, state, cache — the server is untouched). Named accounts map directly onto a **templated** systemd
 unit so N instances run side by side:
 
 [source,ini]

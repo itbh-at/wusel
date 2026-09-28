@@ -144,6 +144,31 @@ final class SocketClient {
         return reachable
     }
 
+    /// Bring a pinned path's offline copy back in step with the server, in place
+    /// (`wusel update`). Returns how many files were re-fetched. Backs the
+    /// "Update now" Finder action.
+    @discardableResult
+    func update(path: String) throws -> UInt64 {
+        let (response, _) = try call(Request(op: "update", path: path))
+        switch response {
+        case .updated(let count): return count
+        case .error(let error): throw error
+        default: throw SocketError.unexpectedResponse
+        }
+    }
+
+    /// The Nextcloud web link for `path` — the object link, or the "reveal in its
+    /// folder" link when `reveal` is set. Built by the engine from the file id, so
+    /// this carries no credentials.
+    func webURL(path: String, reveal: Bool) throws -> String {
+        let (response, _) = try call(Request(op: "weburl", path: path, reveal: reveal))
+        switch response {
+        case .webURL(let url): return url
+        case .error(let error): throw error
+        default: throw SocketError.unexpectedResponse
+        }
+    }
+
     /// Block for the next pushed frame on a `watch` or `notices` connection; `nil`
     /// at a clean end of stream (the peer closed, e.g. `wusel serve` restarted).
     func nextPush() throws -> Response? {

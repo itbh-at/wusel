@@ -211,6 +211,25 @@ pub fn load_with(path: &Path, key: &str, secrets: &dyn keyring::Secrets) -> Resu
     }
 }
 
+/// Drop the secret kept for account `key` in the OS keyring — for removing an
+/// account, where the `0600` file goes with its directory but a keyring entry
+/// would otherwise outlive it.
+///
+/// Unconditional rather than guided by the file's `in_keyring`: an earlier
+/// keyring login followed by a file-only one leaves exactly such an orphan, and
+/// the key is the account's name, which nothing else uses. Best-effort like
+/// [`keyring::Secrets::delete`]: no keyring, or no entry, is not an error.
+pub fn forget(key: &str) {
+    forget_with(key, &keyring::Os);
+}
+
+/// [`forget`], with the keyring supplied instead of taken from the OS.
+pub fn forget_with(key: &str, secrets: &dyn keyring::Secrets) {
+    if secrets.available() {
+        secrets.delete(key);
+    }
+}
+
 /// Non-secret metadata (server + login name), always straight from the file. Used
 /// by the duplicate-instance check, which must not touch the keyring.
 pub fn load_metadata(path: &Path) -> Result<(String, String)> {
@@ -240,6 +259,26 @@ mod tests {
 
     /// Every test names its own keyring; nothing here ever reaches the machine's.
     const KEY: &str = "default";
+
+    #[test]
+    fn forgetting_an_account_removes_its_keyring_entry() {
+        // `account remove` deletes the directory holding the file; the secret in
+        // the keyring has to be dropped explicitly or it outlives the account.
+        let path = tmp("forget");
+        let kr = Fake::new(Mode::Works);
+        store_with(&path, KEY, &creds(), true, &kr).unwrap();
+        assert!(kr.retrieve(KEY).unwrap().is_some());
+
+        forget_with(KEY, &kr);
+        assert!(kr.retrieve(KEY).unwrap().is_none(), "the entry is gone");
+        assert_eq!(kr.deleted(), vec![KEY.to_string()]);
+
+        // Without a keyring there is nothing to ask, and nothing fails.
+        let absent = Fake::new(Mode::Absent);
+        forget_with(KEY, &absent);
+        assert!(absent.deleted().is_empty());
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
 
     #[test]
     fn file_store_roundtrips_and_is_0600() {

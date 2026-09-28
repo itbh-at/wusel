@@ -21,6 +21,10 @@ final class WuselItem: NSObject, NSFileProviderItem, NSFileProviderItemDecoratin
     static let staleDecoration = NSFileProviderItemDecorationIdentifier(
         rawValue: "at.itbh.wusel.decoration.stale")
 
+    /// Version of the `userInfo` layout the Finder actions read; folded into the
+    /// metadata version (see `itemVersion`). Bump it when `userInfo` changes.
+    static let userInfoSchema: UInt8 = 1
+
     // No Team/Group-folder emblem: a File Provider decoration badge needs a UTI
     // conforming to `com.apple.icon-decoration.badge`, Apple ships no team glyph,
     // and a custom-UTI badge does not render as a clean overlay and degrades
@@ -49,6 +53,9 @@ final class WuselItem: NSObject, NSFileProviderItem, NSFileProviderItemDecoratin
     /// is folded into the metadata version, so becoming (or ceasing to be) one
     /// re-renders.
     private let folderKind: FolderKind
+    /// Whether the file is executable. The engine keeps the bit locally (WebDAV
+    /// has no mode bits); it reaches Finder and Terminal as `userExecutable`.
+    private let exec: Bool
 
     init(
         itemIdentifier: NSFileProviderItemIdentifier,
@@ -61,7 +68,8 @@ final class WuselItem: NSObject, NSFileProviderItem, NSFileProviderItemDecoratin
         pinned: Bool = false,
         stale: Bool = false,
         state: SyncState? = nil,
-        folderKind: FolderKind = .plain
+        folderKind: FolderKind = .plain,
+        exec: Bool = false
     ) {
         self.itemIdentifier = itemIdentifier
         self.parentItemIdentifier = parentItemIdentifier
@@ -77,6 +85,7 @@ final class WuselItem: NSObject, NSFileProviderItem, NSFileProviderItemDecoratin
         self.stale = stale
         self.state = state
         self.folderKind = folderKind
+        self.exec = exec
         super.init()
     }
 
@@ -92,7 +101,8 @@ final class WuselItem: NSObject, NSFileProviderItem, NSFileProviderItemDecoratin
             pinned: node.pinned,
             stale: node.stale,
             state: node.state,
-            folderKind: node.folderKind)
+            folderKind: node.folderKind,
+            exec: node.exec)
     }
 
     convenience init(entry: Entry, parentPath: String) {
@@ -111,7 +121,8 @@ final class WuselItem: NSObject, NSFileProviderItem, NSFileProviderItemDecoratin
             pinned: entry.pinned,
             stale: entry.stale,
             state: entry.state,
-            folderKind: entry.folderKind)
+            folderKind: entry.folderKind,
+            exec: entry.exec)
     }
 
     /// The account root, which the File Provider addresses as `.rootContainer`.
@@ -138,6 +149,15 @@ final class WuselItem: NSObject, NSFileProviderItem, NSFileProviderItemDecoratin
 
     var documentSize: NSNumber? { isDirectory ? nil : NSNumber(value: size) }
 
+    /// The POSIX-ish mode the system gives the item's local copy. A folder has
+    /// to be enterable, so it is always executable; a file only when it was
+    /// marked so (`chmod +x`, or created with the bit).
+    var fileSystemFlags: NSFileProviderFileSystemFlags {
+        var flags: NSFileProviderFileSystemFlags = [.userReadable, .userWritable]
+        if isDirectory || exec { flags.insert(.userExecutable) }
+        return flags
+    }
+
     var contentModificationDate: Date? { Date(timeIntervalSince1970: TimeInterval(mtime)) }
 
     var itemVersion: NSFileProviderItemVersion {
@@ -155,6 +175,15 @@ final class WuselItem: NSObject, NSFileProviderItem, NSFileProviderItemDecoratin
         // bytes is not a metadata change and the emblem does not appear.
         metadata.append(offlineCopyIsHere ? 0x01 : 0x00)
         metadata.append(folderKind == .groupFolder ? 0x01 : 0x00)
+        // A `chmod` changes nothing else, so without this byte it would not
+        // count as a change and the local copy would keep its old mode.
+        metadata.append(exec ? 0x01 : 0x00)
+        // The system stores an item's metadata only when its metadata version
+        // changes, so an item it already holds keeps the `userInfo` it was stored
+        // with — none, from before the Finder actions read it — and their
+        // activation rules then see missing keys. This byte re-reads every item
+        // whenever the `userInfo` layout changes.
+        metadata.append(Self.userInfoSchema)
         return NSFileProviderItemVersion(contentVersion: versionToken, metadataVersion: metadata)
     }
 
@@ -183,6 +212,20 @@ final class WuselItem: NSObject, NSFileProviderItem, NSFileProviderItemDecoratin
         if stale { return [Self.staleDecoration] }
         if pinned && offlineCopyIsHere { return [Self.offlineDecoration] }
         return nil
+    }
+
+    /// Read by the Finder actions' activation rules (project.yml), which evaluate
+    /// `SUBQUERY(fileproviderItems, $i, $i.userInfo.<key> == YES)` over the
+    /// selection — so the menu offers pin *or* unpin, "Update Now" only where a
+    /// pin is not kept, and "Open Folder" only on a file. Every key is derived
+    /// from state already folded into `itemVersion`, so a change here is always a
+    /// metadata change the system re-reads.
+    var userInfo: [AnyHashable: Any]? {
+        [
+            "pinned": NSNumber(value: pinned),
+            "updatable": NSNumber(value: stale || (pinned && !offlineCopyIsHere)),
+            "folder": NSNumber(value: isDirectory),
+        ]
     }
 
     /// A pinned item is downloaded eagerly and kept downloaded; everything else

@@ -9,7 +9,7 @@
 # dpkg-buildpackage. The result lands in ./dist/.
 #
 # Run this ON Debian/Ubuntu (needs: build-essential, debhelper, cargo,
-# rustc >= 1.85, libnautilus-extension-dev, libglib2.0-dev, libfuse3-dev,
+# rustc >= 1.85, libnautilus-extension-dev, libglib2.0-dev, libgtk-4-dev, libfuse3-dev,
 # pkgconf — mise is used for cargo/rustc if present, else the system ones).
 # To build from a macOS host, use scripts/podman-deb.sh, which runs this
 # inside a Debian container.

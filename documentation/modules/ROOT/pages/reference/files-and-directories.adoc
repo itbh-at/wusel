@@ -7,8 +7,10 @@
 :description: Every path Wusel reads or writes — configuration, credentials, state database, cache, mountpoint, unit file and desktop registrations.
 
 Wusel follows the XDG base directory specification, so `XDG_CONFIG_HOME`,
-`XDG_STATE_HOME`, `XDG_CACHE_HOME` and `XDG_DATA_DIRS` are honoured where they
-are set. The paths below assume the usual defaults.
+`XDG_STATE_HOME`, `XDG_CACHE_HOME` and `XDG_RUNTIME_DIR` are honoured where they
+are set. The paths below assume the usual defaults. The Files sidebar
+registration is the exception: it always goes to `/usr/share/applications`,
+whatever `XDG_DATA_DIRS` says.
 
 == Per user
 
@@ -43,7 +45,26 @@ single-account user never sees the profile machinery at all.
 | `~/.cache/wusel/blobs/`
 | `~/.cache/wusel/accounts/work/blobs/`
 | Cached file contents, one blob per file, each with an ETag sidecar and — when
-  pinned — a `.pin` marker that exempts it from eviction.
+  pinned — a `.pin` marker that exempts it from eviction. Also transient files
+  in progress: `.dl` (a download), `.part` (a write not yet published), `.ra`
+  (a sequential-read spill). Leftovers are swept at the next start.
+
+| `~/.local/state/wusel/mountpoint`
+| `~/.local/state/wusel/accounts/work/mountpoint`
+| Where the running daemon actually mounted, so `wusel cache clear` and
+  `wusel serve` can tell the account is mounted even when the mount was given a
+  path of its own.
+
+| `$XDG_RUNTIME_DIR/wusel/ipc-default.sock`
+| `$XDG_RUNTIME_DIR/wusel/ipc-work.sock`
+| The IPC socket a running mount or `wusel serve` answers on — file states for
+  the file manager, and the client end of `wusel ipc`. Without
+  `XDG_RUNTIME_DIR`, it goes into `~/.local/state/wusel` instead.
+
+| `$XDG_RUNTIME_DIR/wusel/diag-<hash>.sock`
+| (same, one per mountpoint)
+| The diagnostics socket `wusel doctor` and `wusel status` read. The hash is of
+  the mountpoint. Without `XDG_RUNTIME_DIR`, it goes into `/tmp/wusel`.
 
 | `~/Wusel`
 | `~/Wusel-work`
@@ -52,8 +73,9 @@ single-account user never sees the profile machinery at all.
 |===
 
 The state database is relocated automatically if its default location turns out
-to be on a network filesystem, where SQLite locking is unreliable. An explicit
-`[state] db_path` is always honoured instead.
+to be on a network filesystem, where SQLite locking is unreliable: to
+`/var/tmp/wusel-<uid>/<account>/state.sqlite`. An explicit `[state] db_path` is
+always honoured instead.
 
 == The keyring
 
@@ -77,7 +99,7 @@ what each one is for, is in xref:reference/packages.adoc[Packages].
 
 * `/usr/bin/wusel`
 * `/usr/lib/systemd/user/wusel@.service`
-* the Nautilus extension and its emblem icons
+* the Nautilus extension and its emblem icons (package `wusel-nautilus`)
 * the GNOME Shell search provider registration
 * the Files sidebar registration for the default account
 
@@ -86,6 +108,11 @@ what each one is for, is in xref:reference/packages.adoc[Packages].
 [cols="2,3",options="header"]
 |===
 | Path | What it is
+
+| `~/.config/systemd/user/wusel@.service`
+| The unit template `wusel service enable` writes when the system has no
+  packaged one. Written by Wusel, not by systemd; listed here because it sits
+  beside the link below.
 
 | `~/.config/systemd/user/default.target.wants/wusel@<account>.service`
 | The enable symlink `systemctl --user enable` creates. `disable` removes it.

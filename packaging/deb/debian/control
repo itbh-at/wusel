@@ -7,6 +7,7 @@ Build-Depends: debhelper-compat (= 13),
                rustc (>= 1.85~),
                libnautilus-extension-dev,
                libglib2.0-dev,
+               libgtk-4-dev,
                libfuse3-dev,
                pkgconf
 Standards-Version: 4.6.2
@@ -16,12 +17,26 @@ Rules-Requires-Root: no
 Package: wusel
 Architecture: any
 Depends: ${shlibs:Depends}, ${misc:Depends}, fuse3
-Suggests: nautilus, gnome-shell
+Suggests: wusel-nautilus, gnome-shell
 Description: Virtual Nextcloud filesystem — Nextcloud, woven into your desktop
  Wusel makes a Nextcloud appear as an ordinary folder on Linux — VFS-first:
  files are online-only by default and are fetched on access (on-demand
  hydration), instead of mirroring everything locally.
  .
- This package also ships the GNOME/Nautilus integration (per-file emblems, a
- pin/unpin context menu, sidebar cloud-provider status) and a GNOME Shell
- search provider backed by Nextcloud Unified Search.
+ It needs no desktop. Where there is one, it adds notifications, a
+ cloud-provider entry in the file manager's sidebar and a GNOME Shell search
+ provider backed by Nextcloud Unified Search — all over D-Bus, with no
+ library dependency. Emblems and the context menu in GNOME Files come with
+ wusel-nautilus.
+
+Package: wusel-nautilus
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, wusel (= ${binary:Version})
+Enhances: nautilus
+Description: GNOME Files (Nautilus) integration for Wusel
+ Per-file emblems for the offline and sync state, and a "Wusel" context menu
+ in GNOME Files: keep files or folders offline, update them, open them in
+ Nextcloud and copy their internal link.
+ .
+ A separate package so that a server or a desktop without GNOME Files gets
+ the mount without the file-manager libraries this extension needs.

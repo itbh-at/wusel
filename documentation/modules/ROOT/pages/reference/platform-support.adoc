@@ -23,8 +23,9 @@ it links here rather than restating it.
 | macOS
 | experimental
 | A native File Provider extension (not FUSE): files appear in Finder, macOS's
-  own indicators show downloaded vs online-only, an extra emblem marks items kept
-  offline, and pin / unpin run from the Finder context menu. It is a macOS app
+  own indicators show downloaded vs online-only, extra badges mark items kept
+  offline and kept copies that are out of date, and pin / unpin, Update Now and
+  the Nextcloud web links run from the Finder context menu. It is a macOS app
   bundle with a sandboxed File Provider extension, bridged to the same engine
   Linux uses over the xref:explanation/status-protocol.adoc[wusel-ipc socket].
   Treat it as experimental: there is no packaged build yet — to try it you build
@@ -66,8 +67,11 @@ none of the rest.
 | GNOME / Nautilus
 | supported
 | Everything: the *Wusel (Nextcloud)* sidebar entry with live sync status,
-  per-file emblems, the *Make Available Offline* / *Free Up Space* menu,
-  Nextcloud results in the Activities search, and native notifications.
+  per-file emblems, the *Wusel* context submenu (*Make Available Offline* /
+  *Stop Keeping Offline*, *Update Now*, the Nextcloud web links),
+  Nextcloud results in the Activities search, and native notifications. The
+  emblems and the context submenu come with the `wusel-nautilus` package; the
+  rest is in `wusel` itself.
 
 | KDE Plasma / Dolphin
 | partial
@@ -78,7 +82,7 @@ none of the rest.
 | Nemo, Thunar, others
 | partial
 | As KDE: notifications only. Each would need its own extension reading the same
-  xref:reference/file-states.adoc[file-state attribute].
+  xref:reference/file-states.adoc[file states] from the status socket.
 
 | No desktop (server, SSH)
 | supported

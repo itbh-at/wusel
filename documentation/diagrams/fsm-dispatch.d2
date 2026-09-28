@@ -21,18 +21,22 @@ kernel: "Linux kernel — FUSE\nrequests carry a unique id, replies may come bac
 daemon: "wusel daemon" {
   style: {fill: "#FBFBFD"; stroke: "#C6CBD6"}
 
-  dispatch: "Dispatch threads  (fuser, Config::n_threads)\ntranslate callback → Job · hand over the reply object · return at once" {
+  dispatch: "Dispatch threads  (fuser, Config::n_threads)\ntranslate callback → intent · keep the reply object · return at once" {
     style: {fill: "#EAF1FB"; stroke: "#B7BECC"}
   }
 
-  fsm: "FSM thread — decides, never waits\n\nper object a clipboard:  Idle  |  Busy { flow, FIFO queue }\n(an opaque identity — the inode under FUSE, a file id or\nan opaque string on the platforms that may follow)\ncollision(running, arriving) → Queue | Join | Abort\nadvance(flow, completion) → next step\n\nno disk · no database · no network" {
+  fsm: "FSM thread — decides, never waits\n\nper object a clipboard:  Idle  |  Busy { flow, FIFO queue }\n(an opaque identity — the inode under FUSE, a file id or\nan opaque string on the platforms that may follow)\ncollision(running, arriving) → Queue | Join | Abort | Skip\nadvance(flow, completion) → next step\n\nno disk · no database · no network" {
     style: {fill: "#E9F6EE"; stroke: "#B7CBBE"}
+  }
+
+  pump: "Reply pump  (wusel-fuse-replies)\ncompletes the reply objects — the only thread that answers the kernel" {
+    style: {fill: "#EAF1FB"; stroke: "#B7BECC"}
   }
 
   db: "DB threads  (each owns its own connection)" {
     style: {fill: "#FBF3E3"; stroke: "#D8CBA9"}
 
-    writer: "1 writer\nserialises every write — ours, and the syncer's" {
+    writer: "1 writer\nserialises the machine's writes" {
       style: {fill: "#FBF3E3"; stroke: "#D8CBA9"}
     }
     readers: "N readers\nWAL: metadata reads never queue behind a write" {
@@ -43,31 +47,36 @@ daemon: "wusel daemon" {
   workers: "I/O workers  (here it may block — that is their job)" {
     style: {fill: "#F0EBFA"; stroke: "#C4B9D8"}
 
-    net: "Network\nWebDAV · OCS" {
+    net: "Network\nWebDAV · OCS\ntwo tiers: waited-for work first,\nbackground re-lists after" {
       style: {fill: "#F0EBFA"; stroke: "#C4B9D8"}
     }
     file: "File I/O\nscratch · blobs" {
       style: {fill: "#F0EBFA"; stroke: "#C4B9D8"}
     }
-    stream: "Streaming hydration\nasync GET → bounded channel → blocking writer\n(backpressure, and drop = real cancellation)" {
-      style: {fill: "#F0EBFA"; stroke: "#C4B9D8"}
-    }
   }
 
-  syncer: "Syncer thread\nETag walk · notify_push" {
+  uploader: "Uploader thread\nresumes owed uploads · retries transient failures" {
     style: {fill: "#E9F6EE"; stroke: "#B7CBBE"}
   }
 
-  dispatch -> fsm: "Job\n(mpsc)"
+  syncer: "Syncer thread  (wusel-walk)\nETag walk on notify_push, catch-up and poll\nown state connection" {
+    style: {fill: "#E9F6EE"; stroke: "#B7CBBE"}
+  }
+
+  inval: "Invalidation thread  (wusel-fuse-inval)\nemblem refresh via D-Bus FileChanged\n(kernel cache invalidation disabled)" {
+    style: {fill: "#EAF1FB"; stroke: "#B7BECC"}
+  }
+
+  dispatch -> fsm: "Request\n(mpsc)"
   fsm -> db.readers: "DbRead job"
   fsm -> db.writer: "DbWrite job"
   fsm -> workers.net: "Net job"
   fsm -> workers.file: "FileIo job"
-  fsm -> workers.stream: "Hydrate job\n+ AbortHandle"
   db -> fsm: "Completion"
   workers -> fsm: "Completion"
-  syncer -> db.writer: "reconcile\n(no second connection —\nno write-lock contention)"
-  syncer -> fsm: "invalidations"
+  fsm -> pump: "Answer"
+  uploader -> fsm: "ResumeUpload"
+  syncer -> inval: "changed entries"
 }
 
 storage: "Local storage — never on the network home" {
@@ -81,7 +90,7 @@ storage: "Local storage — never on the network home" {
   }
 }
 
-config: "The user's home  (may be NFS/CIFS)\nconfig.toml · credentials.json · pins.toml\nsmall, rarely read — user intent lives here, not in the DB" {
+config: "The user's home  (may be NFS/CIFS)\nconfig.toml · credentials.json · pins.json\nsmall, rarely read — user intent lives here, not in the DB" {
   shape: rectangle
   style: {fill: "#F4F5F9"; stroke: "#C6CBD6"}
 }
@@ -92,11 +101,11 @@ server: "Nextcloud" {
 }
 
 kernel -> daemon.dispatch: "read/write/lookup/…"
-daemon.workers -> kernel: "reply — sent by whoever finishes,\nnever by the FSM thread"
+daemon.pump -> kernel: "reply — never from the FSM thread"
 daemon.db -> storage.sqlite
+daemon.syncer -> storage.sqlite: "reconcile\n(busy timeout)"
 daemon.workers.file -> storage.blobs
-daemon.workers.stream -> storage.blobs
+daemon.workers.net -> storage.blobs: "streamed hydration"
 daemon.workers.net -> server
 daemon.syncer -> server
-daemon.fsm -> config: "read at start,\nwritten on pin/unpin"
-daemon -> kernel: "notify_inval_entry\n(kernel cache coherence)"
+daemon -> config: "read at start ·\npins.json re-read when it changes"

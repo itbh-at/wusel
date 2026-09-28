@@ -68,6 +68,17 @@ fn background_hydration_meets_a_remove_and_aborts() {
     assert_eq!(collision(&flow, &arriving, &clean()), Collision::Abort);
 }
 
+#[test]
+fn background_hydration_meets_the_delete_a_remove_hands_it_and_aborts() {
+    // How the row above is actually reached: the refresh runs on the file, and a
+    // remove meets it only once it has been handed to the file itself.
+    let flow = running(Intent::Refresh, Step::RefHydrate);
+    let arriving = Intent::Delete {
+        from_parent: ObjectId(1),
+    };
+    assert_eq!(collision(&flow, &arriving, &clean()), Collision::Abort);
+}
+
 // --- Row 3 -----------------------------------------------------------------
 
 #[test]
@@ -114,6 +125,16 @@ fn an_upload_meets_a_remove_and_queues_before_deleting() {
     assert_eq!(collision(&flow, &arriving, &clean()), Collision::Queue);
 }
 
+#[test]
+fn an_upload_meets_the_delete_a_remove_hands_it_and_queues() {
+    // The form in which a remove actually meets the file's upload.
+    let flow = running(Intent::Publish, Step::PubUpload);
+    let arriving = Intent::Delete {
+        from_parent: ObjectId(1),
+    };
+    assert_eq!(collision(&flow, &arriving, &clean()), Collision::Queue);
+}
+
 // --- Row 6 -----------------------------------------------------------------
 
 #[test]
@@ -123,6 +144,19 @@ fn an_upload_meets_a_rename_and_queues() {
     let flow = running(Intent::Publish, Step::PubUpload);
     let arriving = Intent::Move {
         from_name: "doc.odt.tmp".into(),
+        to_parent: ObjectId(1),
+        to_name: "doc.odt".into(),
+    };
+    assert_eq!(collision(&flow, &arriving, &clean()), Collision::Queue);
+}
+
+#[test]
+fn an_upload_meets_the_relocation_a_rename_hands_it_and_queues() {
+    // How the row above is actually reached: a rename arrives on the parent and
+    // meets the file's upload only once it has been handed to the file itself.
+    let flow = running(Intent::Publish, Step::PubUpload);
+    let arriving = Intent::Relocate {
+        from_parent: ObjectId(1),
         to_parent: ObjectId(1),
         to_name: "doc.odt".into(),
     };

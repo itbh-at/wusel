@@ -28,8 +28,16 @@ wusel ipc stat /Photos/Birdie.jpg
 |`pinned`      |Kept offline on purpose (pinned, or under a pinned dir/root), and the copy is here.
 |`pinned-pending`|Pinned, but nothing is here yet: opening it still costs the network.
 |`pinned-stale`|Pinned, but the copy we keep is out of date: the server has moved on.
-|`modified`    |A local edit not yet uploaded.
+|`modified`    |Open with a local edit that has not been flushed yet.
+|`uploading`   |A flushed change on its way to the server — queued or in transfer.
+|`sync-error`  |A flushed change whose upload failed for good. The bytes are safe locally; it will not retry on its own.
 |===
+
+`uploading` and `sync-error` take precedence over every other value, including
+`modified` for a file that is still open.
+
+Separately from the state, the answer says whether the entry is the root of a
+Team or Group folder.
 
 A pin is a promise, and these three values report how it stands: kept, not yet
 delivered, no longer current. The distinction is not academic — a directory pin
@@ -68,12 +76,12 @@ than stored on the file. A copy made outside `~/Wusel` is an ordinary file and
 carries nothing: there is no attribute to travel with it, and the socket answers
 for paths under a mount it serves and no others.
 
-== The emblems
+== The emblems on Linux
 
-Every state gets a distinct, always-visible emblem — the OneDrive model, rather
-than marking only the exceptions. Current Adwaita has pruned its stock emblem
-set, so the Nautilus extension ships its own icons, installed into the hicolor
-theme:
+On Linux file managers every state gets a distinct, always-visible emblem — the
+OneDrive model, rather than marking only the exceptions. Current Adwaita has
+pruned its stock emblem set, so the Nautilus extension ships its own icons,
+installed into the hicolor theme:
 
 .Three states side by side in GNOME Files: online-only, cached, and pinned offline
 image::wusel-nautilus.png[Nautilus showing a Wusel mount in the sidebar and three files, each with a state emblem — a cloud for online-only, a cloud with a check for cached, and a green check for pinned]
@@ -87,5 +95,65 @@ image::wusel-nautilus.png[Nautilus showing a Wusel mount in the sidebar and thre
 |`pinned`      |A green check — kept offline, always available.
 |`pinned-pending`|A cloud with a green down-arrow — kept offline, still to be fetched.
 |`pinned-stale`|A green check with a warning — kept offline, but out of date.
-|`modified`    |An up-arrow — a local edit awaiting upload.
+|`modified`    |A white up-arrow on amber — a local edit not yet flushed.
+|`uploading`   |A white up-arrow over a baseline, on blue — on its way to the server.
+|`sync-error`  |A white exclamation mark on red — the upload failed and needs attention.
 |===
+
+A Team or Group folder root additionally carries a blue emblem with two people,
+next to its state emblem.
+
+== The emblems on macOS
+
+macOS mounts through Apple's File Provider, and there **the system draws the
+emblems, not Wusel**. The always-visible scheme above does not apply: the Finder
+distinguishes only four cases, and one of them is *no icon at all*.
+
+[cols="1,3"]
+|===
+|Finder shows |Meaning
+
+|A cloud with a down-arrow |Not downloaded — online-only. Opening it fetches from the server.
+|A filled checkmark badge |Pinned "`keep downloaded`" — always available offline.
+|A warning badge |Pinned, but the kept copy is out of date ("`Offline Copy Outdated`").
+|**No icon** |Downloaded and present on this Mac. Nothing is wrong.
+|===
+
+The last row is the one that surprises people, so it is worth stating plainly: a
+file with **no icon is not broken and is not "`missing its cloud symbol`"** — it
+means the file's contents are already on this Mac. That happens as soon as you
+create the file here, open it, or the Finder reaches into it to build a thumbnail
+or let Spotlight index it. Apple shows the cloud only while a file is still
+_dataless_ (no local bytes); once the bytes are here the icon disappears. Every
+File Provider works this way — iCloud Drive, OneDrive, Dropbox — and an app may
+not paint its own persistent overlay on a downloaded item, so Wusel cannot make
+macOS match the Linux scheme above. There is no Team or Group folder badge on
+macOS.
+
+To send a file back to online-only — free the space and bring the cloud icon
+back — right-click it and choose **Remove Download**. macOS also evicts on its
+own when the disk runs low. The engine's own view is always exact regardless of
+what the Finder draws: `wusel ipc stat "/OpenProject/…/file.pdf"` reports the
+values listed above (see xref:how-to/diagnose-a-problem.adoc[Diagnose a problem]).
+
+=== The Finder actions
+
+Right-clicking an item in the mount offers Wusel's own actions, the same set the
+Linux file-manager menu carries. macOS gives an extension no way to group them
+under an app-named submenu, so they land in Finder's shared **Quick Actions** and
+each name is prefixed with `Wusel:` to tell them apart:
+
+* **Make Available Offline** / **Remove Offline Availability** — the pin toggle
+  (`wusel pin`/`unpin`).
+* **Update Now** — fetch what a pin promised and the disk does not have (a
+  `pinned-stale`/`pinned-pending` item; `wusel update`).
+* **Open in Nextcloud** / **Open Folder in Nextcloud** — open the item in the web
+  interface, or its parent folder with the item highlighted.
+* **Copy Internal Link** — copy the item's permanent Nextcloud link.
+
+The menu offers only what fits the selection: **Make Available Offline** or
+**Remove Offline Availability** according to the item's state, **Update Now** only
+where a kept copy is out of date or missing, the web actions for a single item,
+and **Open Folder in Nextcloud** only for a file. Because a File Provider
+extension is sandboxed away from the browser and the clipboard, the web actions
+are carried out by the Wusel agent, not the extension.

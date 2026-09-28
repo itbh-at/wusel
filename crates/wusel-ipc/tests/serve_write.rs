@@ -245,6 +245,49 @@ fn creates_writes_publishes_moves_and_removes_over_the_socket() {
         other => panic!("expected entries, got {other:?}"),
     }
 
+    // create("/run.sh", exec) — a file created executable reports so.
+    match one(
+        &mut client,
+        Request {
+            op: "create".into(),
+            path: "/run.sh".into(),
+            exec: Some(true),
+            ..Default::default()
+        },
+    ) {
+        Response::Node { ok, exec, .. } => assert!(ok && exec, "run.sh is executable"),
+        other => panic!("expected a node from create, got {other:?}"),
+    }
+
+    // setattr("/folder/moved.txt", exec) — the File Provider's `chmod +x`: the
+    // answer carries the new bit, and so does the listing.
+    match one(
+        &mut client,
+        Request {
+            op: "setattr".into(),
+            path: "/folder/moved.txt".into(),
+            exec: Some(true),
+            ..Default::default()
+        },
+    ) {
+        Response::Node { ok, exec, .. } => assert!(ok && exec, "setattr set the bit"),
+        other => panic!("expected a node from setattr, got {other:?}"),
+    }
+    match one(
+        &mut client,
+        Request {
+            op: "enumerate".into(),
+            path: "/folder".into(),
+            ..Default::default()
+        },
+    ) {
+        Response::Entries { entries, .. } => assert!(
+            entries.iter().any(|e| e.name == "moved.txt" && e.exec),
+            "the listing reports moved.txt executable"
+        ),
+        other => panic!("expected entries, got {other:?}"),
+    }
+
     // remove("/folder/moved.txt") — the file is deleted and stops resolving.
     assert!(
         matches!(

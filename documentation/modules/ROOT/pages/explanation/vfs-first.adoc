@@ -30,12 +30,15 @@ items, Windows Cloud Filter placeholders + hydration callbacks):
 | `pinned`      | Kept offline on purpose (the file, an ancestor directory, or the root is pinned), *and* the copy is here; exempt from eviction. The pin list lives in `<config>/pins.json`, not in the cache database — it is intent, and survives `cache clear`.
 | `pinned-pending`| Pinned, with nothing here yet. A directory pin covers files the server grows afterwards, so the promise routinely runs ahead of the bytes; reporting those as `pinned` claims an offline copy the user does not have.
 | `pinned-stale`| Pinned, but the copy we keep no longer matches the server's. Still served when the server is unreachable — an outdated copy beats an error.
-| `modified`    | A local edit not yet uploaded (an open write buffer, or a deferred create).
+| `modified`    | A local edit not yet committed (an open write buffer, or a deferred create).
+| `uploading`   | A committed change on its way to the server: the upload is queued or in flight.
+| `sync-error`  | A committed change whose upload failed for good (permissions, a conflict, no quota). The bytes are kept locally; it is not retried on its own.
 |===
 
-This is the *only* per-file state model, and it is **derived, not stored**:
-`Provider::file_state` answers from the write buffers, the `pins` table and the
-blob cache's ETag sidecars — SQLite holds no state column. The same values
+This is the *only* per-file state model, and it is **derived, not stored**: the
+runtime's `sync_state` (`runtime.rs`) answers from the upload queue, the write
+buffers, `pins.json` and the blob cache's ETag sidecars — the node table holds
+no state column. The same values
 are what the OS integrations see, asked of the engine over the
 xref:explanation/status-protocol.adoc[status socket]
 (xref:reference/file-states.adoc[File states] documents the contract).
@@ -51,11 +54,12 @@ budget. But the *download* is decoupled from the *read*, on two axes:
 
 * **The read is served live, per range, and never blocks.** A `read(offset, len)`
   returns exactly that range (a WebDAV range GET, escalating to chunked readahead
-  for a sequential run). The FUSE session loop is single-threaded — it processes
-  one request at a time — so a read must never do a whole-file download inline: a
-  4 KiB peek at a 2 GiB file would freeze `stat`/tab-completion for everyone for
-  the length of the transfer. That was a real regression. Reads now cost only the
-  bytes asked for, immediately.
+  for a sequential run). A read must never do a whole-file download inline: it
+  holds a FUSE dispatch thread for as long as it runs. When the session loop was
+  still single-threaded, a 4 KiB peek at a 2 GiB file froze `stat`/tab-completion
+  for everyone for the length of the transfer — a real regression. The pool of
+  dispatch threads (`[mount] dispatch_threads`) now bounds the damage, but the
+  rule stands: reads cost only the bytes asked for, immediately.
 +
 This holds even when the server never answers with `206`. `Range` is only an
 optional optimisation (RFC 9110 §14.2): a reverse proxy or cache sitting between
@@ -64,8 +68,11 @@ us and Nextcloud may strip the header, and the server then returns `200` with th
 the full response locally, and warn once. The OS still sees an ordinary partial
 read succeed — the only cost is bandwidth: until the proxy is fixed, each partial
 read transfers the whole file.
-* **The whole file is hydrated into the cache in the background.** A read of an
-  uncached file also *requests* hydration; a dedicated worker — with its own
+* **The whole file is hydrated into the cache in the background.** Once
+  512 KiB of scattered reads of an uncached file have been served (or the whole
+  file, if it is smaller) — enough to tell opening a file from a MIME sniff — the
+  read also *requests* hydration; a clean sequential run is cached by the
+  readahead spill instead. A dedicated worker — with its own
   client and runtime, so it never contends with the FUSE thread — pulls the rest
   and publishes an evictable blob. The file then reads local and its per-file
   emblem flips online-only → **cached**. Hydration is deduplicated (the storm of
@@ -85,8 +92,10 @@ local-only `.trackerignore`/`.nomedia` markers (never uploaded) that GNOME
 Tracker honours to skip the whole tree. Opt back in with `[desktop]
 exclude_from_indexers = false`. KDE Baloo ignores markers (needs a config
 exclude); the native Cloud Filter / File Provider backends can signal "don't
-hydrate for indexing", FUSE cannot. The long-term answer is a desktop *search
-provider* that queries Nextcloud directly — no local indexing at all.
+hydrate for indexing", FUSE cannot. On GNOME, search goes to Nextcloud directly
+instead: `wusel search-provider` answers the Activities overview from the
+server's Unified Search, with no local indexing at all (see
+xref:explanation/desktop-integration.adoc[Desktop integration]).
 
 == Content delivery: `ContentSource` + cache decorator
 
@@ -104,7 +113,7 @@ FUSE read()  ──►  dyn ContentSource
 
 == Pinning ("always keep offline")
 
-Pins are **path-based** and live in each account's state DB (`pins` table), not
+Pins are **path-based** and live in each account's `<config>/pins.json`, not
 per-inode — so a pin survives reconciliation, a *directory* pin covers its whole
 subtree (including entries not yet listed), and pinning the **root** (`""`) is
 the legacy "download everything" of the old desktop client.
@@ -133,14 +142,22 @@ avoids exactly that:
   whole from the blob cache instead — but the blob is only used while its ETag
   sidecar still matches the ETag in SQLite. Once the sync walk learns the server
   copy changed, the blob counts as stale and the next read goes to the network
-  again (re-hydrating as it goes); proactive re-hydration of *pinned* paths is an
-  open roadmap item, see xref:project/roadmap.adoc[_Refinements_].
+  again (re-hydrating as it goes). For *pinned* paths, `[sync] refresh_pinned`
+  decides what happens when they go stale: show it, ask (the default), or
+  re-fetch them in the background (see
+  xref:reference/configuration.adoc[Configuration]).
 * *Reuse connections.* The `reqwest` client keeps a persistent connection pool
-  with HTTP keep-alive and HTTP/2 multiplexing — no TLS handshake per operation.
+  — no TLS handshake per operation. Over HTTPS it negotiates HTTP/2 where the
+  server offers it, so parallel requests share one multiplexed connection;
+  otherwise HTTP/1.1 keep-alive with a pooled connection per request in flight.
+  The notify_push WebSocket always uses HTTP/1.1, because an upgrade needs it.
 * *Stream and prefetch.* Range GET for partial/streaming reads; read-ahead for
   sequential access.
 * *Push over poll.* `notify_push` (WebSocket) drives change detection instead of
-  repeated PROPFIND polling.
+  repeated PROPFIND polling. Only while push is absent or not connected does a
+  periodic sync walk (`[sync] poll_secs`, default five minutes) stand in; since
+  Nextcloud propagates ETags up the tree, an unchanged tree costs it one
+  PROPFIND.
 
 The bottleneck isn't the bytes of a single GET (which saturates the link); it is
 round-trip latency on metadata. The cache-first VFS removes it.

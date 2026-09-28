@@ -71,7 +71,7 @@ jobs:
           dnf -y install
           git rust cargo
           gcc make pkgconf-pkg-config
-          nautilus-devel glib2-devel fuse3-devel
+          nautilus-devel glib2-devel gtk4-devel fuse3-devel
           rpm-build curl ca-certificates
       # Pinned to a commit SHA — see the note in ci.yml.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -138,7 +138,7 @@ jobs:
           git ca-certificates
           build-essential debhelper
           cargo rustc
-          libnautilus-extension-dev libglib2.0-dev libfuse3-dev pkgconf
+          libnautilus-extension-dev libglib2.0-dev libgtk-4-dev libfuse3-dev pkgconf
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -167,7 +167,7 @@ jobs:
       # package is untouched, and this cannot be misread as one.
       - name: Name the target in the file
         run: |
-          for f in dist/wusel_*.deb; do
+          for f in dist/wusel_*.deb dist/wusel-nautilus_*.deb; do
             case "$f" in *_debian13.deb) continue ;; esac
             mv "$f" "${f%.deb}_debian13.deb"
           done
@@ -176,9 +176,12 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: deb-${{ matrix.arch }}
-          # Not *.deb: dh_strip's automatic dbgsym package would double the
-          # upload for no benefit here (see packaging/deb/README.md).
-          path: dist/wusel_*.deb
+          # Every binary package from debian/control, by name. Not *.deb:
+          # dh_strip's automatic dbgsym packages would double the upload for
+          # no benefit here (see packaging/deb/README.md).
+          path: |
+            dist/wusel_*.deb
+            dist/wusel-nautilus_*.deb
           if-no-files-found: error
 
   release:

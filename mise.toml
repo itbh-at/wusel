@@ -60,8 +60,12 @@ description = "Apply the Apache-2.0 SPDX license headers (hawkeye)"
 run = "hawkeye format"
 
 [tasks.headers-check]
-description = "Check that all files carry the license header (for CI)"
-run = "hawkeye check"
+description = "Check that all files carry the license header; warn about bad changelog entries (for CI)"
+run = ["hawkeye check", "./scripts/changelog-check.sh"]
+
+[tasks.release]
+description = "Prepare a release: mise run release <version> — branch, version bump, dated changelog entries"
+run = "./scripts/release.sh"
 
 [tasks.clippy]
 description = "Linter — every crate this OS can build, tests included"
@@ -107,7 +111,7 @@ description = "Debug build of wusel with FUSE (Linux) — used by CI and the E2E
 run = "cargo build -p wusel --features fuse --locked"
 
 # The mount is Linux-only. On macOS, test it via podman (see the fuse-* tasks
-# below and documentation/.../trying-it-out.adoc).
+# below and documentation/modules/ROOT/pages/how-to/develop-on-macos.adoc).
 
 # --- Linux container (podman) -----------------------------------------------
 [tasks.fuse-build]

@@ -19,25 +19,38 @@ never allowed is losing an edit.
 * *Primary (implemented):* `notify_push` (Nextcloud high-performance backend) via
   WebSocket — the endpoint is discovered through OCS capabilities, the client
   authenticates with login + app password, and each `notify_file` stamps a shared
-  invalidation timestamp. Affected directories are re-listed (and their content
-  cache re-validated) on next access. Runs on its own thread; see `wusel_core::push`.
+  invalidation timestamp and kicks the background sync walk. Affected
+  directories are re-listed (and their content cache re-validated) on next
+  access. Every successful authentication — at start and after each reconnect —
+  also kicks the walk, to catch up on events sent while no connection existed.
+  Runs on its own thread; see `wusel_core::push`.
 * *Fallback (implemented):* TTL revalidation — PROPFIND + ETag reconciliation when
-  a listing is older than `sync.revalidate_secs`, and whenever `notify_push` is
-  unavailable. Used automatically if the server lacks the app.
+  a listing is older than `sync.revalidate_secs`. Used automatically if the
+  server lacks the app.
+* *Polling (implemented):* while `notify_push` is absent or not connected
+  (discovering, reconnecting, endpoint unreachable), the sync walk runs every
+  `sync.poll_secs` (default 300, `0` turns it off) on the `wusel-sync-poll`
+  thread. While connected, events drive the walk and the poller stays idle.
 
 == Sync state model (ETag-based)
 
 There is **one ETag per node** — the `etag` column in SQLite, holding the last
 ETag the server reported for it. There is no separate "local" or "last known"
-ETag, and no stored sync-state enum: each of the three questions is answered
-where it is actually cheap to answer.
+ETag on the node, and no stored sync-state enum on it: each of the three
+questions is answered where it is actually cheap to answer. The one exception is
+a committed change on its way to the server: its row in `pending_uploads`
+records the ETag the upload is conditioned on (`base_etag`), its `state`
+(`pending`, `uploading`, `error`), the number of `attempts` and the
+`last_error`.
 
 [cols="1,2",options="header"]
 |===
 | Question | How it is answered
 | Do we have a local edit?
-| By the presence of a write buffer for that inode (`Provider::file_state` →
-  `modified`), not by comparing ETags. The buffer *is* the pending change.
+| By the presence of a write buffer for that inode (`Runtime::sync_state` →
+  `modified`), or of a `pending_uploads` row once the change is committed
+  (`uploading`, or `sync-error` after a permanent failure) — not by comparing
+  ETags. The buffer *is* the pending change.
 | Did the server copy change?
 | The reconcile walk compares the stored `etag` against the fresh one from
   PROPFIND (see _Cache coherence_). A difference updates the metadata and makes
@@ -69,35 +82,41 @@ eventually consistent, not strongly consistent.
 In Nextcloud a directory's ETag changes whenever *anything beneath it* changes —
 the change propagates up the tree. This makes "is anything stale?" cheap:
 
-. One PROPFIND `Depth: 0` on a directory → compare its ETag.
-. Unchanged → the entire subtree is guaranteed unchanged. Done, no further requests.
-. Changed → descend one level (`Depth: 1`), compare child ETags, and recurse only
-  into the changed subtrees.
+. One PROPFIND `Depth: 0` on the root → compare its ETag with the one from the
+  last complete walk. Unchanged → the whole tree is unchanged, and this one small
+  request is all an unchanged tree costs.
+. Otherwise one PROPFIND `Depth: 1` on the root → compare each child's ETag with
+  the stored one. Unchanged children → their subtrees are guaranteed unchanged.
+. Changed child directories → list them the same way and recurse only into the
+  changed subtrees.
 
 This turns cache validation from O(all files) into O(changed paths).
 
-This is implemented by the **background syncer** (`provider::sync_loop`): on a
-push it walks the cached tree from the root, and at each level descends only into
-the child directories whose stored ETag differs from the fresh listing —
+This is implemented by the **background syncer** (`provider::sync_loop`, thread
+`wusel-walk`): on a trigger it walks the cached tree from the root, and at each
+level descends only into the loaded child directories whose stored ETag differs
+from the fresh listing —
 reaching the directory that actually changed in O(changed paths) and reconciling
 it. Crucially, `notify_push` is **path-less** (it says *something* changed, not
 what), so this ETag walk is how we find *where* without re-listing everything and
 without the event telling us. The syncer owns its own state connection and HTTP
 client, so it runs entirely off the FUSE thread; changed entries it finds are
-pushed to the kernel (see _Invalidating the kernel's FUSE cache_).
+passed to the frontend (see _Invalidating the kernel's FUSE cache_).
 
 === Reconcile triggers
 
 * *Push:* `notify_push` fires → the syncer walks the tree by propagated ETags and
   reconciles whatever moved (a delete/add nobody happened to re-list).
-* *Poll fallback:* periodically check the root ETag (`Depth: 0`) — cheap thanks to
-  propagation — when `notify_push` is unavailable.
+* *Catch-up:* every `notify_push` authentication — at start and after each
+  reconnect — triggers the same walk, since events sent while no connection
+  existed are lost.
+* *Poll fallback:* while `notify_push` is absent or not connected, the same walk
+  runs every `sync.poll_secs` (default 300 s) — cheap thanks to propagation.
 * *On access:* if an already-listed directory's cache entry is stale, revalidate
   it **in the background** (see xref:explanation/architecture.adoc[Architecture]) and serve the cached
   listing immediately — the slow PROPFIND never blocks the access. Only a
   directory that was *never* listed is loaded synchronously (there is nothing to
   serve yet).
-* *On reconnect/startup:* one root ETag check to catch anything missed while offline.
 
 === Reconcile algorithm (per directory)
 
@@ -107,24 +126,34 @@ PROPFIND `Depth: 1`, then per child compare local vs. server ETag:
 * *different + file* → update the stored metadata (ETag, size, mtime). A cached
   blob thereby stops matching its ETag sidecar, so it is ignored from then on and
   the next read re-hydrates from the server.
-* *different + directory* → mark the subtree for a lazy re-check.
-* *local but gone on the server* → deleted remotely → remove from SQLite + blob cache.
+* *different + directory* → update its stored ETag; the sync walk descends into
+  it if its children are loaded, otherwise its next access lists it.
+* *local but gone on the server* → deleted remotely → remove the node and its
+  subtree from SQLite. Cached blobs are not deleted there; they fall out of the
+  cache through normal eviction.
 * *on the server but not local* → new → insert.
 
-Keying on Nextcloud's `oc:fileid` (stable across renames) lets us tell a *rename*
-from a *delete + create*, so a rename does not needlessly discard a hydrated blob.
+Rows are keyed on (parent, name). A remote rename therefore reconciles as a
+delete plus a create; it is not detected as a rename.
 
 === Own writes never self-desync
 
-Every PUT/MKCOL/MOVE/DELETE response carries the new ETag (`OC-ETag`/`ETag`).
-We adopt it into SQLite atomically, so our own write never looks "changed" and
-never triggers a needless re-download.
+An upload response (plain PUT or the final chunked-upload MOVE) carries the new
+ETag (`OC-ETag`/`ETag`). We adopt it into SQLite, so our own write never looks
+"changed" and never triggers a needless re-download. MKCOL, MOVE and DELETE
+return no ETag; the local tree is updated directly, and the next listing of the
+parent picks up the server's values.
 
 === Writing: deferred create + write buffer
 
 Writes land in a per-file scratch buffer beside the cache and upload on flush
-(a plain PUT, or chunked upload for large files). Two properties matter for the
-churn a live filesystem otherwise generates:
+(a plain PUT, or chunked upload in 4 MiB chunks for files larger than that). By
+default (`[sync] upload = "async"`) `flush` is answered as soon as the change is
+durable on local disk: a `pending_uploads` row is recorded and the upload runs in
+the background. The `wusel-uploader` thread resumes uploads still owed at start-up
+and retries transient failures on a growing interval. With `upload = "sync"`,
+`flush` waits for the upload and reports its real result. A few properties matter
+for the churn a live filesystem otherwise generates:
 
 * *Deferred create.* `create` contacts the server for **nothing** — no `PUT`
   empty, no PROPFIND. It adds a local node (no `oc:fileid` yet) and an empty,
@@ -145,8 +174,10 @@ churn a live filesystem otherwise generates:
   renamed onto a real name is *promoted*: its buffer uploads under the new name —
   exactly the atomic-save pattern of office suites.
 
-A failed upload keeps the buffer for a later retry (never silent data loss), and
-our own writes adopt the returned ETag so they never look "changed" (above).
+A failed upload keeps the buffer for a later retry (never silent data loss); a
+permanent failure (permissions, conflict, quota) parks the upload in the `error`
+state and the file shows `sync-error`. Our own writes adopt the returned ETag so
+they never look "changed" (above).
 
 === Invalidating the kernel's FUSE cache
 
@@ -155,12 +186,30 @@ FUSE caches our `getattr`/`readdir` answers for the attribute/entry TTL we retur
 in a directory does not re-`readdir` on its own, so a server-side change would
 linger in its view until the user refreshes.
 
-So the syncer, when its ETag walk finds an added or removed entry, sends it to
-the frontend, which calls the `fuser` notify API (`Notifier::inval_entry`,
-enabled via the `abi-7-12` feature) to drop that entry from the kernel's cache.
-The file then appears/disappears in the file manager **live**, without a manual
-refresh. The notification runs on its own thread (the `Notifier` is obtained from
-`Session::notifier()`), so it never blocks the FUSE request loop.
+The syncer, when its ETag walk finds an added or removed entry or a changed
+file, sends it to the frontend on a channel, read by the `wusel-fuse-inval`
+thread so it never blocks the FUSE request loop. That thread refreshes the file
+manager's emblem for the path through the D-Bus `FileChanged` signal, and passes
+the change on to an IPC `watch` subscriber.
+
+What it does not do is make the change appear in an open window, and the kernel
+cache is not the way to get there. A file manager does not poll a folder it
+shows; it waits for inotify events on the directory. A server-side change never
+passes through the local VFS, so the kernel has no event of its own to send, and
+none of FUSE's reverse notifications produces one: `notify_inval_entry` and
+`notify_inval_inode` only drop cached state, and `notify_delete` raises
+`IN_DELETE_SELF` on a watch of the *file*, never `IN_DELETE` on its directory.
+The Nautilus extension cannot fill the gap either — its API can re-read a file
+the window already shows, not add or remove one. A file added or removed on the
+server therefore shows in an open window only when the view is reloaded. That is
+a defect, not a design choice; it is tracked on the
+xref:project/roadmap.adoc[roadmap].
+
+The kernel calls themselves are **disabled** in `wusel-fuse`: they are the
+suspected cause of a reported freeze in which Nautilus shows a blank view after
+navigating back into a directory. What they would buy is small — a `stat` or a
+re-read sees the server's state at once rather than after the kernel's
+entry/attribute TTL — so they stay off until that freeze is settled.
 
 All tree updates run inside a SQLite transaction (WAL), so the FUSE layer never
 sees a half-updated tree.
@@ -205,10 +254,16 @@ on what we know about the target (`webdav::Precondition`):
 ==== The three-way merge
 
 Because a merge needs the *content* of the common ancestor and not just its ETag,
-the cached blob of the version the edit started from serves as the base — and
-when `text_merge` is on, a write seeds that base into the cache even if the read
-would not otherwise have cached it. The merge then runs base (last known) vs.
-ours (the write buffer) vs. theirs (the current server copy):
+the base is the cached blob of the version the edit started from — not of
+whatever version Wusel has recorded since, which with `notify_push` is often
+already the server's. Opening a file for writing leaves that blob: the write
+buffer is filled through the cache, so the version the edit starts from stays
+on disk. A file larger than the whole cache
+budget is not staged there, and a blob that eviction dropped before the conflict is
+gone — in both cases there is no base, and the conflict becomes a conflicted
+copy. The merge
+runs base (last known) vs. ours (the write buffer) vs. theirs (the current
+server copy):
 
 * All three must decode as UTF-8; binary content is never merged. Line-based text
   is the whole scope — Markdown, source, config, CSV and the like — with no
@@ -247,14 +302,11 @@ kernel's inotify API. Wusel supports this, with one honest distinction:
 
 * *Local changes (through the mount)* work natively: a write through the mount
   goes through the VFS, so the kernel generates the inotify events itself.
-* *Remote changes (another client on the server)* are the known FUSE limit: cache
-  invalidation alone does not emit an inotify event. What we do keep coherent is
-  the *kernel's* cache — the syncer pushes added and removed entries through the
-  one notify call we use, `Notifier::inval_entry` (the kernel's
-  `notify_inval_entry`; see _Invalidating the kernel's FUSE cache_), and the short
-  attribute/entry TTL makes the kernel re-ask for everything else. A re-stat or
-  re-read therefore reflects reality immediately, but a watcher blocked on an
-  inotify event is not woken by it.
-
-We do not promise perfect remote inotify delivery — local watches are
-first-class, remote coherence is immediate.
+* *Remote changes (another client on the server)* raise no inotify event: they
+  never pass through the local VFS, and no FUSE notification makes the kernel
+  send one to a directory watch (see _Invalidating the kernel's FUSE cache_).
+  What keeps the *kernel's* cache coherent is the short attribute/entry TTL: a
+  re-stat or re-read reflects the last reconciled state once it has run out, but
+  a watcher blocked on an inotify event is not woken. For a file manager showing
+  the folder that is the defect described there; for editors and build watchers
+  it is the same gap.

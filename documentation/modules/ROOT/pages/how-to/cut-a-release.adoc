@@ -1,0 +1,63 @@
+////
+  // SPDX-License-Identifier: Apache-2.0
+  // Copyright 2026 IT Beratung Hermann GmbH
+////
+
+= Cut a release
+:description: Prepare, write up and publish a new Wusel version.
+
+The version, the date and the author of a release are never typed — not by a
+person and not by a coding agent. One command sets them; what you write is the
+release notes.
+
+== 1. Prepare
+
+On a clean, up-to-date `main`:
+
+[source,sh]
+----
+mise run release 0.4.2
+----
+
+This switches to a new branch `release/0.4.2`, sets the version in `Cargo.toml`
+and `Cargo.lock`, and opens a dated entry in the three changelogs:
+
+* `packaging/rpm/wusel.spec` (`%changelog`)
+* `packaging/deb/debian/changelog`
+* `documentation/modules/ROOT/pages/project/changelog.adoc`
+
+It refuses a version that is not above the current one, or that already has a
+branch, tag or changelog entry.
+
+== 2. Write the release notes
+
+Replace the `TODO: describe the release` line in each of the three files. The
+RPM entry is terse, the Debian entry a little fuller, the documentation page
+says why. Leave the header lines as they are.
+
+`mise run headers-check` warns about a `TODO` left behind and about a weekday
+that does not match its date.
+
+== 3. Merge
+
+[source,sh]
+----
+git commit -am 'chore(release): 0.4.2'
+git push -u origin release/0.4.2
+----
+
+Merge the branch into `main` like any other change.
+
+== 4. Publish
+
+Tag the merged `main` and push the tag to the public repository:
+
+[source,sh]
+----
+git tag v0.4.2
+git push github v0.4.2
+----
+
+The tag starts the release workflow, which builds the RPM and the Debian
+package and attaches them to the release. It stops before building anything if
+the tag and the version in `Cargo.toml` disagree.

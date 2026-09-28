@@ -95,6 +95,7 @@ fn a_metadata_read_is_served_while_a_write_transaction_is_held() {
             intent: Intent::Materialise {
                 name: "new.txt".into(),
                 dir: false,
+                exec: false,
             },
         })
         .expect("submit the write");

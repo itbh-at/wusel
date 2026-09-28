@@ -61,8 +61,9 @@ design would have stalled everyone else with it.
 
 == Which callback becomes which intent
 
-All twenty implemented FUSE callbacks appear below. Four of them never reach the
-machine at all, which is not an omission: they have no work to do.
+All nineteen implemented FUSE callbacks appear below. Five of them never reach
+the machine at all, which is not an omission: they have no work to do, or, for
+`mknod`, nothing to do but refuse.
 
 [cols="2,2,2"]
 |===
@@ -70,7 +71,7 @@ machine at all, which is not an omission: they have no work to do.
 
 |`getattr` |`Stat` |<<metadata>>
 |`lookup` |`Lookup` |<<directories>>
-|status socket `stat` |`State` |<<metadata>>
+|status socket `stat` |`Stat`, then `State` |<<metadata>>
 |`readdir` |`Enumerate` |<<directories>>
 |`read` |`Fetch` |<<reading>>
 |`write` |`Write` |<<writing>>
@@ -80,12 +81,17 @@ machine at all, which is not an omission: they have no work to do.
 |`unlink`, `rmdir` |`Remove` |<<namespace>>
 |`rename` |`Move` |<<renaming>>
 |`open`, `opendir`, `releasedir`, `statfs` |— |never reach the machine
+|`mknod` |— |refused with `EPERM`; never reaches the machine
 |===
 
-Three intents have no callback at all. `Refresh` and `Relist` come from the
-syncer or from the machine itself — a listing served past its revalidation
-interval schedules its own refresh — and the `412` sub-script (<<conflict>>) is
-reached only from inside a publish.
+Four intents have no callback at all. `Relocate` and `Delete` are hand-overs:
+`Move` and `Remove` resolve the child, then pass the actual work on as one of
+these, keyed on the child, so it waits behind that object's own upload in
+flight. `Refresh` and `Relist` are modelled in the machine, with their collision
+rules, but nothing submits them yet. A listing served past its revalidation
+interval is refreshed without them: the machine emits a background re-list
+that runs beside it, outside any object's queue. The `412` sub-script
+(<<conflict>>) is not an intent; it is reached only from inside a publish.
 
 [#metadata]
 == Metadata: getattr, open, and the status query
@@ -97,7 +103,7 @@ These are the requests a file manager fires in storms — one status query per
 visible entry while drawing a folder. None of them may touch the network, and
 none does.
 
-The one step that can block is the cache probe in `file_state`: it stats the
+The one step that can block is the cache probe in `sync_state`: it stats the
 blob on disk. Microseconds on a healthy machine, and unbounded on a machine
 where something is holding the file. That is exactly the kind of step this
 design refuses to run on the deciding thread — not because it is slow, but
@@ -137,6 +143,9 @@ The cancellation note on the diagram is measured, not assumed
 (`crates/wusel-fuse/tests/interrupt_probe.rs`): the kernel reports a dead reader
 through `flush` immediately, and holds `release` back until every outstanding
 read has been answered. A design that hooked `release` could not cancel anything.
+What happens on that signal today is limited: the abandoned flow stops at its
+next step boundary, but a transfer already running completes. Cancelling the
+transfer itself is planned, not implemented.
 
 [#writing]
 == Writing: write and setattr
@@ -145,9 +154,10 @@ read has been answered. A design that hooked `release` could not cancel anything
 image::fsm-op-write.svg[The write and setattr scripts,900]
 
 Nothing here reaches the server; that is what `flush` is for. The one network
-step is inbound — fetching the base that a later three-way merge will need — and
-it is the reason a write may not abort a running hydration: it would destroy the
-very thing it depends on.
+step is inbound — filling the buffer with the file's current content, so that a
+write into an existing file lands on the right bytes — and it is the reason a
+write may not abort a running hydration: it would destroy the very thing it
+depends on.
 
 `setattr`'s truncate-to-zero shortcut deserves its box. It is the common
 overwrite path (`cp` onto an existing file, every `O_TRUNC` editor), and
@@ -160,8 +170,8 @@ bytes we throw away.
 // Rendered from documentation/diagrams/fsm-op-flush.d2.
 image::fsm-op-flush.svg[The flush script,900]
 
-The longest script, and the reason the shape pays off: today this is seven
-nested blocking calls inside one callback, any of which can stand for minutes.
+The longest script, and the reason the shape pays off: in 0.1.0 this was seven
+nested blocking calls inside one callback, any of which could stand for minutes.
 
 One rule governs every exit — **the buffer is dropped only on success**. A
 failed upload keeps it, so the next `flush` retries instead of silently losing
@@ -215,8 +225,9 @@ right, including the rule that a failed upload must not fail the rename.
 * **The collision table in full.** It lives in
   xref:explanation/concurrency.adoc#_the_collision_policy[Concurrency]; only the rows that
   matter for a given script appear beside it here.
-* **The syncer.** Server-side changes arrive as invalidations and start the same
-  scripts from a different trigger.
+* **The syncer.** It applies server-side changes to the state database on its
+  own connection, beside the machine, and submits no intent. The next operation
+  on an affected object runs its ordinary script against the updated state.
 * **That the scripts are spelled in FUSE.** They are, and deliberately so — this
   is the platform we ship. What that costs a second frontend, and which two
   changes keep it from becoming a rewrite, is

@@ -92,17 +92,25 @@ pub enum Intent {
     Lookup { name: String },
     /// The per-object state an OS integration draws an emblem from.
     State,
-    /// Change attributes: resize the buffer, set the modification time, or
-    /// both. One intent rather than two because the kernel sends them in one
-    /// callback, and splitting them would mean chaining two flows to answer it.
+    /// Change attributes: resize the buffer, set the modification time, set
+    /// the executable bit, or any combination. One intent rather than several
+    /// because the kernel sends them in one callback, and splitting them would
+    /// mean chaining flows to answer it.
+    ///
+    /// `exec` is local only: WebDAV has no mode bits, so it is kept in the
+    /// state and never reaches the server — nothing arrives executable from
+    /// another device.
     SetAttr {
         size: Option<u64>,
         mtime: Option<i64>,
+        exec: Option<bool>,
     },
     /// List a directory, filling it from the server if it has never been listed.
     Enumerate,
     /// Create a local object; nothing reaches the server until it is published.
-    Materialise { name: String, dir: bool },
+    /// `exec` is the executable bit a file is created with (`cp`, `install`,
+    /// `tar`); a directory ignores it.
+    Materialise { name: String, dir: bool, exec: bool },
     /// Send the write buffer to the server (`flush`, `fsync`, `release`).
     Publish,
     /// Delete an object and its subtree.
@@ -117,6 +125,27 @@ pub enum Intent {
         to_parent: ObjectId,
         to_name: String,
     },
+    /// Move **this** object to `to_parent`/`to_name`. Never sent by a frontend.
+    ///
+    /// [`Intent::Move`] is keyed on the parent, so on its own it never meets a
+    /// flow of the file it renames — in particular not that file's upload still
+    /// in flight, which the collision policy says a rename has to wait for.
+    /// Once `Move` has resolved the child it hands the actual move over as this
+    /// intent, keyed on the child, and it enters that object's own queue like
+    /// any other request. `from_parent` is the directory that stays parked for
+    /// the duration and is released when this flow ends.
+    Relocate {
+        from_parent: ObjectId,
+        to_parent: ObjectId,
+        to_name: String,
+    },
+    /// Delete **this** object and its subtree. Never sent by a frontend.
+    ///
+    /// The same hand-over as [`Intent::Relocate`], for [`Intent::Remove`]: keyed
+    /// on the object, a delete waits behind that object's own upload in flight
+    /// and then removes what really landed on the server, instead of dropping
+    /// the rows underneath the upload and letting it bring the file back.
+    Delete { from_parent: ObjectId },
     /// Re-fetch an object because the server said it changed.
     Refresh,
     /// Re-list a directory in the background, because what we served was past
@@ -144,8 +173,35 @@ impl Intent {
             Intent::Publish => "publish",
             Intent::Remove { .. } => "remove",
             Intent::Move { .. } => "move",
+            Intent::Relocate { .. } => "relocate",
+            Intent::Delete { .. } => "delete",
             Intent::Refresh => "refresh",
             Intent::Relist => "relist",
+        }
+    }
+
+    /// Whether a flow of this intent changes rows or the server — as opposed
+    /// to reading them, or re-reading the server. A listing taken beside such
+    /// a flow may catch it halfway; one taken beside a `stat` cannot. Spelled
+    /// out per variant, so a new intent has to be classified to compile.
+    #[must_use]
+    pub fn changes_state(&self) -> bool {
+        match self {
+            Intent::Write { .. }
+            | Intent::SetAttr { .. }
+            | Intent::Materialise { .. }
+            | Intent::Publish
+            | Intent::Remove { .. }
+            | Intent::Move { .. }
+            | Intent::Relocate { .. }
+            | Intent::Delete { .. } => true,
+            Intent::Fetch { .. }
+            | Intent::Stat
+            | Intent::Lookup { .. }
+            | Intent::State
+            | Intent::Enumerate
+            | Intent::Refresh
+            | Intent::Relist => false,
         }
     }
 }
@@ -197,6 +253,8 @@ pub enum Job {
     TruncateBuffer { object: ObjectId, size: u64 },
     /// Record a modification time in the state.
     RecordMtime { object: ObjectId, mtime: i64 },
+    /// Record the executable bit in the state. Local only, never uploaded.
+    RecordExec { object: ObjectId, exec: bool },
     /// Read a range out of the object's write buffer.
     ReadBuffer {
         object: ObjectId,
@@ -230,7 +288,15 @@ pub enum Job {
         mtime: Option<i64>,
     },
     /// Resolve a rejected upload: merge if possible, otherwise a second copy.
-    ResolveConflict { object: ObjectId },
+    ResolveConflict {
+        object: ObjectId,
+        /// The version the buffer was started from — the merge's base. Carried
+        /// rather than read from the state database at resolve time: by then
+        /// the syncer may already have recorded the server's newer version, and
+        /// a base looked up by *that* is either missing or, worse, identical to
+        /// theirs, which merges into a silent overwrite of the server's edit.
+        base_etag: String,
+    },
     /// Record a new version in the state database.
     RecordVersion {
         object: ObjectId,
@@ -275,6 +341,7 @@ pub enum Job {
         parent: ObjectId,
         name: String,
         dir: bool,
+        exec: bool,
     },
     /// Create a directory on the server.
     CreateRemoteDir { parent: ObjectId, name: String },
@@ -314,7 +381,8 @@ impl Job {
             | Job::MarkPending { .. }
             | Job::ClearPending { .. }
             | Job::SetUploadError { .. }
-            | Job::RecordMtime { .. } => Executor::DbWrite,
+            | Job::RecordMtime { .. }
+            | Job::RecordExec { .. } => Executor::DbWrite,
             Job::FetchRange { .. }
             | Job::ListRemote { .. }
             | Job::Upload { .. }
@@ -375,7 +443,8 @@ impl Job {
             | Job::ClearPending { .. }
             | Job::SetUploadError { .. }
             | Job::TruncateBuffer { .. }
-            | Job::RecordMtime { .. } => false,
+            | Job::RecordMtime { .. }
+            | Job::RecordExec { .. } => false,
         }
     }
 }
@@ -453,9 +522,16 @@ pub struct NodeFacts {
     /// on what the user configured, and both are I/O. What arrives here is the
     /// answer: use it, or go to the server.
     pub stale_copy_ok: bool,
-    /// The object exists on the server. False for a local creation that has
-    /// never been published — there is nothing to delete or overwrite there.
+    /// The object exists on the server: it has a server id, or an upload of ours
+    /// landed and recorded the version it created. False for a local creation
+    /// that has never been published — there is nothing to delete or overwrite
+    /// there.
     pub materialised: bool,
+    /// The server's id for this object is known. Not the same as
+    /// `materialised`: an upload of ours makes the object exist on the server the
+    /// moment it lands, but its id only arrives with the next listing of its
+    /// directory — and that listing can fail, or the answer to the upload can.
+    pub identified: bool,
     /// This directory has been listed at least once, so something can be served
     /// without waiting for the server.
     pub children_loaded: bool,

@@ -31,8 +31,9 @@ login. For a named account, substitute its name: `wusel@work`.
 wusel service enable
 ----
 
-This writes the unit and enables it, so nobody has to touch `systemctl`. It does
-the same thing as the command above.
+This writes the unit to `~/.config/systemd/user/wusel@.service` (pointing at the
+binary you ran) and enables it, so nobody has to touch `systemctl`. It does the
+same thing as the command above; add `--account NAME` for a named account.
 
 == Check on it
 

@@ -20,11 +20,12 @@ platform turns out to cost a rewrite of the first, nobody can justify the money,
 and the port is quietly abandoned — leaving a codebase shaped around assumptions
 nobody dares to touch any more.
 
-The defence is not to build all three now. It is to decide, **while the state
-machine is still on paper**, which knowledge is allowed to live where — and to
-write that decision down so a later contributor can tell a port from a
-violation. This is the last cheap moment: after the FSM is implemented, every
-one of these cuts costs a refactor of working code.
+The defence is not to build all three at once. It is to decide, **while the
+state machine was still on paper**, which knowledge is allowed to live where —
+and to write that decision down so a later contributor can tell a port from a
+violation. That was the last cheap moment: once the FSM is implemented, every
+one of these cuts costs a refactor of working code. The cuts below were made
+before it was.
 
 The goal is deliberately modest and testable:
 
@@ -98,7 +99,9 @@ one object can collide, a step may be abandoned
 |What an inode is; whether writes are buffered by us or by the OS; how a reply
 reaches the caller
 
-|`wusel-fuse`, `wusel-cfapi`, `wusel-fileprovider`
+|The frontends: `wusel-fuse` (Linux); `wusel-ipc` with the Swift File Provider
+extension and agent under `macos/`; a Windows frontend (none yet). Beside them,
+`wusel-desktop` for Linux desktop integration
 |Its own platform: callbacks, identifiers, completion objects, error codes, and
 whatever local-file ownership the platform imposes
 |Anything about Nextcloud. A frontend that needs an ETag is a layering bug
@@ -118,19 +121,21 @@ layering.** That makes the rule reviewable rather than aspirational.
 reason: a module boundary is a convention, and a crate boundary is enforced by
 the compiler. Inside the engine, the machine would inevitably reach for
 `NodeRow`, the state database and the WebDAV types, because they are within
-arm's reach and nothing objects. As a crate it may depend on the engine — its
-alphabet is engine intents, which are the same on all three platforms — but it
-cannot depend on a frontend, and no frontend can quietly grow into it.
+arm's reach and nothing objects. As a crate it depends on nothing at all — not
+even the engine. Its alphabet is engine intents, which are the same on all three
+platforms, and it defines them itself; it cannot depend on a frontend, and no
+frontend can quietly grow into it.
 
 This is a small decision now and an expensive one later, which is the whole
 argument of this page in miniature.
 
 == The alphabet: intents, not callbacks
 
-Today the scripts in xref:reference/operation-scripts.adoc[the operation scripts] *are* the FUSE
-callbacks. That is the coupling to break, and it is the single change with the
-most leverage: the machine's vocabulary should be what the **engine** does, not
-what one kernel interface happens to call it.
+The scripts in xref:reference/operation-scripts.adoc[the operation scripts] were
+first written as the FUSE callbacks. That was the coupling to break, and the
+single change with the most leverage: the machine's vocabulary is what the
+**engine** does, not what one kernel interface happens to call it. The scripts
+are now keyed on intents, and each frontend maps its callbacks onto them.
 
 [cols="1,1,1,1"]
 |===
@@ -143,7 +148,8 @@ what one kernel interface happens to call it.
 |Publish |`flush`, `fsync`, `release` |`NOTIFY_*`, USN journal |`modifyItem(contents:)`
 |Remove |`unlink`, `rmdir` |`NOTIFY_DELETE` |`deleteItem`
 |Move |`rename` |`NOTIFY_RENAME` |`modifyItem` (parent/name)
-|Refresh |syncer invalidation |same |same
+|Refresh |— modelled in the machine, not submitted yet; background revalidation
+runs outside it |same |same
 |Abandon |`flush` with reads outstanding |`CANCEL_FETCH_DATA` |progress cancellation
 |Attributes |`getattr`, … |— the OS answers |partly `item(for:)`
 |===
@@ -176,12 +182,13 @@ pub trait Desktop {
 The three methods do not port the same way, and that split is the point.
 
 **Per-file status is native, and does not travel this trait at all on macOS.**
-On Linux `set_status`/`file_changed` drive libcloudproviders so Nautilus paints
-an emblem. On macOS the File Provider *is* the store: an item's
-downloaded/uploading/error state is a first-class property the extension already
-reports (the `Publish`/`Fetch` intents above), and Finder renders it. So the
-macOS backend leaves `file_changed` a no-op and `set_status` all but empty — the
-aggregate progress Finder shows for the domain is the system's, not ours. This
+On Linux `set_status` drives the libcloudproviders account status (the sidebar
+entry), and `file_changed` emits the D-Bus `FileChanged` signal the Nautilus
+extension turns into an emblem re-read. On macOS the File Provider *is* the
+store: whether an item is downloaded is tracked by the system itself, and Finder
+renders it. So the macOS backend leaves both `file_changed` and `set_status`
+no-ops — the aggregate progress Finder shows for the domain is the system's, not
+ours. This
 is precisely where the reference client goes wrong by re-inventing a tray icon;
 the native path is the whole reason to sit *behind* the File Provider.
 
@@ -196,7 +203,9 @@ packaged: **only an application may post to Notification Center.**
 authorization; a bare `launchd` binary has neither, and its notifications are
 dropped in silence. So the daemon runs as a **background agent app** — an `.app`
 bundle with `LSUIElement = true` (no Dock icon, no menu bar), launched by
-launchd, signed with the notification entitlement. With an app identity it asks
+launchd. Posting needs no entitlement of its own — the agent's only one is the
+App Group it shares with the extension; the bundle identity is what counts. With
+an app identity it asks
 for authorization once and posts directly — and the notices come from the
 **daemon**, never from the File Provider extension, which macOS suspends and
 kills at will and which therefore must own no state.
@@ -205,7 +214,8 @@ kills at will and which therefore must own no state.
 
 On Linux the backend is a Rust `Desktop` impl that links the engine directly. On
 macOS it cannot: the agent is a Swift app that drives the engine over the
-`wusel serve` Unix socket and never links it (see _The socket frontend_ above).
+`wusel serve` Unix socket and never links it (the socket is the one described in
+xref:explanation/status-protocol.adoc[One status protocol for every file manager]).
 So the notice takes the same road as a change signal — a **second push channel
 on the socket**, alongside `watch`:
 
@@ -222,7 +232,7 @@ The pieces, and why each sits where it does:
 * **`wusel_ipc::IpcDesktop`** is the `Desktop` the engine is handed in
   `cmd_serve` (via `Provider::set_desktop`). Its `notify` calls
   `Notice::localize` **once** — still the single place we speak the user's
-  language — and pushes the rendered `{severity, title, body}` to a fan-out. This
+  language — and pushes the rendered `{kind, severity, title, body}` to a fan-out. This
   is deliberately *platform-independent* Rust: it compiles on Linux too, adds no
   `cfg(target_os)` to `wusel-core`, and keeps the whole notice path testable
   natively (`crates/wusel-ipc/tests/serve_notices.rs`). Localization stays in
@@ -238,8 +248,8 @@ The pieces, and why each sits where it does:
   the notices.
 * **`NoticeWatcher`** (in the agent, never the extension — only an app may post,
   and the extension is ephemeral) reads the stream and posts each notice through
-  `UNUserNotificationCenter`, mapping `severity` to the banner's interruption
-  level and sound. It reconnects with a short backoff if `serve` restarts, the
+  `UNUserNotificationCenter`, mapping `severity` to the banner's sound (every
+  banner uses the `.active` interruption level). It reconnects with a short backoff if `serve` restarts, the
   mirror of `ChangeWatcher`.
 
 **The self-test rides the same path too.** `wusel desktop notify [severity]`
@@ -277,13 +287,17 @@ socket; the engine core is untouched.
 
 The mechanism, end to end:
 
-* **The action.** The extension declares two `NSExtensionFileProviderActions`
-  ("Make Available Offline" / "Remove Offline Availability", localized via
+* **The actions.** The extension declares six `NSExtensionFileProviderActions`
+  ("Make Available Offline", "Remove Offline Availability", "Update Now", "Open
+  in Nextcloud", "Open Folder in Nextcloud", "Copy Internal Link", localized via
   `Localizable.strings`) and implements `NSFileProviderCustomAction`;
-  `performAction` sends the socket `pin`/`unpin` op per item. A File Provider
-  activation predicate cannot read our pinned state, so both actions always show
-  — pin/unpin are idempotent, so that is harmless. A truly state-dependent menu
-  would need a separate FinderSync extension.
+  `performAction` sends the socket `pin`/`unpin`/`update` op per item, or asks
+  for the item's web link and hands it to the agent to open or copy (the
+  sandboxed extension cannot reach the browser or the pasteboard). The menu is
+  state-aware: each activation rule reads keys the item publishes in its
+  `userInfo` (`pinned`, `updatable`, `folder`), so pin *or* unpin is offered,
+  "Update Now" only where a pin's copy is outdated or missing, and the web
+  actions only on a single item.
 * **The state on the wire.** `stat`/`enumerate` carry a `pinned` flag
   (`Pins::is_pinned`) and a `stale` flag (`content.is_stale` — the cached copy's
   etag no longer matches the server's, i.e. `PinnedStale`). The item folds both
@@ -300,11 +314,10 @@ The mechanism, end to end:
   is precisely what the system's own not-downloaded indicator already says. The
   item still declares `downloadEagerlyAndKeepDownloaded`, so the check appears
   when the copy lands, and the state is folded into the metadata version so that
-  moment re-renders. A Team/Group folder root carries its own badge beside the
-  offline one — the two say unrelated things, so they are not exclusive. Apple's
-  built-in decoration images have nothing that reads as "shared with a team", so
-  that badge names an SF Symbol instead; both are system images, neither ships an
-  asset.
+  moment re-renders. A Team/Group folder root gets no badge: a decoration badge
+  must be a UTI conforming to `com.apple.icon-decoration.badge`, Apple ships
+  none that reads as "shared with a team", and a custom one does not render
+  cleanly. Both badges that exist are system images; neither ships an asset.
 * **Immediate feedback.** A local pin/unpin emits no server change, so the
   working-set change channel would never see the acted item. `performAction`
   records the acted paths (and, for a folder, its descendants — a folder pin
@@ -363,7 +376,7 @@ objects by opaque identifiers that are neither numbers nor paths.
 
 Two changes followed, and both are done:
 
-. **`inode: u64` becomes an opaque object identity.** It appears sixteen times
+. **`inode: u64` becomes an opaque object identity.** It appeared sixteen times
   in `provider.rs` alone. Windows uses file identifiers, macOS uses
   `NSFileProviderItemIdentifier` strings. The identity must also be stable
   across a rename — which we already guarantee, because `move_subtree` keeps the
@@ -387,8 +400,8 @@ have found.
 
 * the machine is keyed by an opaque `ObjectId`, never an inode;
 * its alphabet is engine intents — `Fetch`, `Write`, `Stat`, `Lookup`,
-  `Enumerate`, `Materialise`, `Publish`, `Remove`, `Move`, `SetAttr`, `State`,
-  `Refresh`, `Relist` — so a frontend maps its callbacks onto them and the
+  `Enumerate`, `Materialise`, `Publish`, `Remove`, `Move`, `Relocate`, `Delete`,
+  `SetAttr`, `State`, `Refresh`, `Relist` — so a frontend maps its callbacks onto them and the
   machine never learns their names;
 * `wusel-fsm` depends on nothing, so no platform type can reach it by accident.
 
@@ -396,12 +409,17 @@ Adding four of those intents late made the argument better than the argument
 did: with no catch-all arm anywhere, the compiler named all eleven places that
 had to decide what they meant.
 
-**Still deferred**, on purpose, until a second frontend actually exists:
+(`Refresh` and `Relist` are modelled, with their collision rules and tests, but
+no production code submits them yet; background directory revalidation runs
+outside the machine's occupancy.)
 
-* the concrete trait shapes for completions and error mapping. A trait with
-  exactly one implementor is a guess, not a design. We know *where* the seam
-  goes; we do not yet know its exact form, and pretending otherwise produces the
-  wrong abstraction with more confidence than a missing one.
+**Still deferred**, on purpose:
+
+* a shared trait for completions and error mapping. The second frontend exists
+  now, and it did not need one: `wusel-fuse` and `wusel-ipc` both consume the
+  engine's answer stream (`Outcome`, `Failure`) directly and map it themselves —
+  to an errno, to a wire error. A trait with an unclear shape is a guess, not a
+  design; a third caller is what would show whether one earns its place.
 
 That distinction is the difference between planning ahead and over-engineering:
 we remove coupling now, and we invent interfaces only when we have two callers
@@ -414,22 +432,21 @@ layering has to be mechanically verifiable, or it will erode:
 
 . **`wusel-fsm` builds and its tests pass with no frontend present**, and the
   collision-policy tests read identically no matter which platform is imagined.
-  It holds: 42 tests, none of which needs a mount, a server, a database or a
+  It holds: 65 tests, none of which needs a mount, a server, a database or a
   thread, and `cargo tree -p wusel-fsm` is one line.
 . **`wusel-core` gains no further `cfg(target_os)`** beyond the handful in
-  `keyring.rs` and `credentials.rs` — the only places where secret storage is
-  genuinely an OS matter.
+  `keyring.rs` — the one place where secret storage is genuinely an OS matter.
+  (`credentials.rs` and `storage.rs` gate only on `cfg(unix)`, for file
+  permissions.)
 
 Both fail loudly the moment platform knowledge is pushed into a shared layer.
 
 == The order, and which platform comes second
 
-FUSE is finished first, completely, on its own merits. It is the platform we
-can test end to end today, and a half-finished frontend proves nothing about
-portability.
+FUSE came first, completely, on its own merits. It is the platform we can test
+end to end, and a half-finished frontend proves nothing about portability.
 
-For the second, **Windows is the easier candidate**, on structure rather than
-taste:
+On structure rather than taste, **Windows is the easier candidate**:
 
 * it is **range-based** (`FETCH_DATA`), which is the shape our content path
   already has;
@@ -438,22 +455,24 @@ taste:
 * its callback set maps almost one-to-one onto the intents above.
 
 macOS asks for more that is structural rather than incidental: a File Provider
-extension must be an **app extension inside a signed, notarized application
-bundle**, sandboxed, with the Rust engine bridged into Swift or Objective-C. Its
-replicated model wants stable opaque identifiers and enumeration with sync
-anchors, and content transfer is whole-file — partial fetching exists only in
-recent releases and under conditions that would need checking before anything is
-built on it. None of that is prohibitive; all of it is packaging and lifecycle
-work that Windows simply does not ask for.
+extension must be an **app extension inside a signed application bundle**,
+sandboxed. Its replicated model wants stable opaque identifiers and enumeration
+with sync anchors, and content transfer is whole-file — partial fetching exists
+only in recent releases and under conditions that would need checking before
+anything is built on it. None of that is prohibitive; all of it is packaging and
+lifecycle work that Windows simply does not ask for.
 
-The honest counterweight: development happens on macOS, so macOS is the platform
-we can *try* most easily and Windows the one we can *implement* most easily.
-That tension is worth naming rather than resolving in advance — the decision
-belongs to whoever picks the work up, with this trade-off visible.
+The counterweight decided it: development happens on macOS, so macOS is the
+platform we can *try* most easily. It came second, and it is experimental. The
+engine is not bridged into Swift: `wusel serve` runs it as its own process, and
+the Swift extension and agent speak to it over a Unix socket (`wusel-ipc`).
+That kept the language boundary out of the engine entirely. Windows remains the
+one we could *implement* most easily; nothing of it exists yet.
 
 == What this page does not commit us to
 
-* **Building either frontend.** It commits us to not making them impossible.
+* **Building a Windows frontend, or taking the macOS one past experimental.** It
+  commits us to not making them impossible.
 * **A FUSE-compatible shim elsewhere.** If Wusel ships on another platform, it
   rides the native framework; that decision stands unchanged.
 * **A timeline.** This sits behind everything in xref:project/roadmap.adoc[Roadmap].

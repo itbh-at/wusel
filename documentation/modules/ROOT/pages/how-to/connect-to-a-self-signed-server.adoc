@@ -48,6 +48,19 @@ ca_cert = "/home/you/certs/my-ca.pem"
 The file may hold the CA certificate or the server's own self-signed
 certificate. Restart the mount for it to take effect.
 
+A self-signed server certificate works here only if it is *not* marked as a CA.
+One that carries `basicConstraints CA:TRUE` — which is what a plain
+`openssl req -x509` produces by default — is rejected even when listed in
+`ca_cert`; the error reads `invalid peer certificate: ... CaUsedAsEndEntity`.
+There are two ways out:
+
+* Trust the CA that issued the server certificate instead, and put *its*
+  certificate into `ca_cert` (or the system store).
+* Re-issue the server certificate as an end-entity certificate: extensions
+  `basicConstraints=critical,CA:FALSE`,
+  `keyUsage=digitalSignature,keyEncipherment`, `extendedKeyUsage=serverAuth`,
+  and a `subjectAltName` naming the host Wusel connects to.
+
 == The escape hatch
 
 [source,toml]
@@ -71,6 +84,7 @@ that TLS *is* the problem, then fix the certificate and take it out again.
 wusel login https://cloud.example.org
 ----
 
-A certificate problem surfaces here, before anything is mounted. If it still
-fails, the journal names the full cause chain; see
+A certificate problem surfaces here, before anything is mounted, and `login`
+prints the full cause chain in the terminal. A running mount writes the same
+chain to the journal; see
 xref:how-to/diagnose-a-problem.adoc[Diagnose a problem].
