@@ -26,6 +26,10 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
     private enum Action {
         static let pin = "at.itbh.wusel.action.makeAvailableOffline"
         static let unpin = "at.itbh.wusel.action.removeOfflineAvailability"
+        static let update = "at.itbh.wusel.action.updateNow"
+        static let open = "at.itbh.wusel.action.openInNextcloud"
+        static let reveal = "at.itbh.wusel.action.revealInNextcloud"
+        static let copy = "at.itbh.wusel.action.copyInternalLink"
     }
 
     required init(domain: NSFileProviderDomain) {
@@ -132,9 +136,13 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
             let parent = ItemMapping.path(for: itemTemplate.parentItemIdentifier)
             let path = ItemMapping.childPath(parent: parent, name: itemTemplate.filename)
             let isDir = itemTemplate.contentType == .folder
+            // A file copied in executable (a script, a tool) keeps the bit.
+            let exec = !isDir && Self.isExecutable(itemTemplate)
             do {
                 let client = try Engine.connect()
-                guard case .node = try client.call(Request(op: "create", path: path, dir: isDir)).0 else {
+                guard case .node = try client.call(
+                    Request(op: "create", path: path, dir: isDir, exec: exec)).0
+                else {
                     completionHandler(nil, [], false, Engine.nsError(WireError.io))
                     return
                 }
@@ -176,6 +184,14 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
                 // A content change: overwrite the buffer and publish it.
                 if changedFields.contains(.contents), let url = newContents {
                     try Self.upload(client, path: path, from: url)
+                }
+                // `chmod +x`/`-x` on the local copy. The engine keeps only the
+                // executable bit, and only for a file.
+                if changedFields.contains(.fileSystemFlags), item.contentType != .folder {
+                    let request = Request(op: "setattr", path: path, exec: Self.isExecutable(item))
+                    if case .error(let e) = try client.call(request).0 {
+                        throw e
+                    }
                 }
                 completionHandler(try Self.statItem(client, path: path), [], false, nil)
             } catch {
@@ -245,53 +261,142 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
     ) -> Progress {
         let progress = Progress(totalUnitCount: Int64(max(itemIdentifiers.count, 1)))
         queue.async { [self] in
-            let pinning: Bool
             switch actionIdentifier.rawValue {
-            case Action.pin: pinning = true
-            case Action.unpin: pinning = false
+            case Action.pin:
+                performOffline(pinning: true, itemIdentifiers, progress, completionHandler)
+            case Action.unpin:
+                performOffline(pinning: false, itemIdentifiers, progress, completionHandler)
+            case Action.update:
+                performUpdate(itemIdentifiers, progress, completionHandler)
+            case Action.open:
+                performWeb(.open, reveal: false, itemIdentifiers, progress, completionHandler)
+            case Action.reveal:
+                performWeb(.open, reveal: true, itemIdentifiers, progress, completionHandler)
+            case Action.copy:
+                performWeb(.copy, reveal: false, itemIdentifiers, progress, completionHandler)
             default:
                 completionHandler(Engine.nsError(WireError.badRequest))
-                return
             }
-            var firstError: Error?
-            var acted: [String] = []
-            do {
-                let client = try Engine.connect()
-                for identifier in itemIdentifiers {
-                    let path = ItemMapping.path(for: identifier)
-                    do {
-                        if pinning {
-                            try client.pin(path)
-                        } else {
-                            try client.unpin(path)
-                        }
-                        // Refresh the acted item and, for a folder, its contents:
-                        // pinning/unpinning a folder flips every descendant's
-                        // offline state (the engine covers a subtree by the folder
-                        // pin), so their emblems must update too, not just the
-                        // folder's.
-                        acted.append(path)
-                        acted.append(contentsOf: Self.descendantPaths(client, of: path))
-                    } catch {
-                        if firstError == nil { firstError = Engine.nsError(error) }
-                    }
-                    progress.completedUnitCount += 1
-                }
-            } catch {
-                firstError = Engine.nsError(error)
-            }
-            // Make Finder re-read the acted items' state (the offline emblem and
-            // the keep-downloaded policy). A local pin emits no engine change, so
-            // the working-set change enumerator would not otherwise see them:
-            // record the paths for it to report, then signal the working set.
-            PinRefresh.add(acted)
-            NSFileProviderManager(for: domain)?.signalEnumerator(for: .workingSet) { _ in }
-            completionHandler(firstError)
         }
         return progress
     }
 
+    /// "Make available offline" / "Remove download": map each item to the engine's
+    /// pin store, then signal the working set so Finder re-reads the new state.
+    private func performOffline(
+        pinning: Bool,
+        _ itemIdentifiers: [NSFileProviderItemIdentifier],
+        _ progress: Progress,
+        _ completionHandler: @escaping (Error?) -> Void
+    ) {
+        var firstError: Error?
+        var acted: [String] = []
+        do {
+            let client = try Engine.connect()
+            for identifier in itemIdentifiers {
+                let path = ItemMapping.path(for: identifier)
+                do {
+                    if pinning { try client.pin(path) } else { try client.unpin(path) }
+                    // Refresh the acted item and, for a folder, its contents:
+                    // pinning/unpinning a folder flips every descendant's offline
+                    // state (the engine covers a subtree by the folder pin), so
+                    // their emblems must update too, not just the folder's.
+                    acted.append(path)
+                    acted.append(contentsOf: Self.descendantPaths(client, of: path))
+                } catch {
+                    if firstError == nil { firstError = Engine.nsError(error) }
+                }
+                progress.completedUnitCount += 1
+            }
+        } catch {
+            firstError = Engine.nsError(error)
+        }
+        // A local pin emits no engine change, so the working-set change enumerator
+        // would not otherwise see it: record the paths for it to report, then
+        // signal the working set.
+        PinRefresh.add(acted)
+        NSFileProviderManager(for: domain)?.signalEnumerator(for: .workingSet) { _ in }
+        completionHandler(firstError)
+    }
+
+    /// "Update Now": fetch what a pin promised and the disk does not have
+    /// (pinned-stale/pending). Offered when any selected item is updatable (see
+    /// the activation rule in project.yml); items in a mixed selection that are
+    /// not due are a no-op in the engine.
+    private func performUpdate(
+        _ itemIdentifiers: [NSFileProviderItemIdentifier],
+        _ progress: Progress,
+        _ completionHandler: @escaping (Error?) -> Void
+    ) {
+        var firstError: Error?
+        var acted: [String] = []
+        do {
+            let client = try Engine.connect()
+            for identifier in itemIdentifiers {
+                let path = ItemMapping.path(for: identifier)
+                do {
+                    try client.update(path: path)
+                    acted.append(path)
+                    acted.append(contentsOf: Self.descendantPaths(client, of: path))
+                } catch {
+                    if firstError == nil { firstError = Engine.nsError(error) }
+                }
+                progress.completedUnitCount += 1
+            }
+        } catch {
+            firstError = Engine.nsError(error)
+        }
+        PinRefresh.add(acted)
+        NSFileProviderManager(for: domain)?.signalEnumerator(for: .workingSet) { _ in }
+        completionHandler(firstError)
+    }
+
+    /// "Open in Nextcloud" / "Open Folder in Nextcloud" / "Copy Internal Link":
+    /// ask the engine for each item's web link, then hand it to the agent to open
+    /// or copy — a File Provider extension is sandboxed away from the browser and
+    /// the pasteboard (see `WebActionBridge`). The activation rule limits these to
+    /// a single item; the handler still takes whatever it is given — opening each
+    /// item's link, copying all of them newline-joined — so it stays correct if
+    /// Finder ever passes more.
+    private func performWeb(
+        _ kind: WebActionKind,
+        reveal: Bool,
+        _ itemIdentifiers: [NSFileProviderItemIdentifier],
+        _ progress: Progress,
+        _ completionHandler: @escaping (Error?) -> Void
+    ) {
+        defer { progress.completedUnitCount = progress.totalUnitCount }
+        do {
+            let client = try Engine.connect()
+            let urls = try itemIdentifiers.map {
+                try client.webURL(path: ItemMapping.path(for: $0), reveal: reveal)
+            }
+            guard !urls.isEmpty else {
+                completionHandler(nil)
+                return
+            }
+            switch kind {
+            case .open:
+                // One request per link: the agent opens each in the browser.
+                for url in urls { WebActionBridge.post(WebAction(kind: .open, url: url)) }
+            case .copy:
+                // One clipboard entry holding every link.
+                WebActionBridge.post(WebAction(kind: .copy, url: urls.joined(separator: "\n")))
+            }
+            completionHandler(nil)
+        } catch {
+            completionHandler(Engine.nsError(error))
+        }
+    }
+
     // MARK: - Helpers
+
+    /// Whether the system's item carries the executable bit. `fileSystemFlags`
+    /// is an optional requirement, so an item that does not report it is not
+    /// executable.
+    private static func isExecutable(_ item: NSFileProviderItem) -> Bool {
+        item.fileSystemFlags?.contains(.userExecutable) ?? false
+    }
 
     /// Every path under `path` (recursively), so a folder pin/unpin can refresh
     /// its contents' emblems. Empty for a file (enumerating one errors). Bounded

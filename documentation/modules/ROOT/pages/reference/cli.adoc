@@ -66,7 +66,32 @@ feature; the distribution packages are.
 |===
 
 Two accounts may not share or nest a mountpoint; `mount` refuses to start where
-its target equals, contains, or sits inside another active mount.
+its target equals or contains any active mount, or sits inside another wusel
+mount. Linux only.
+
+While mounted, the daemon also serves the account's IPC socket (see
+<<serve,`wusel serve`>>), which the file manager queries for per-file
+state.
+
+[[serve]]
+=== `wusel serve`
+
+Run the engine without a FUSE mount and serve its intent protocol over a
+Unix-domain socket — how the macOS File Provider agent drives the engine, and a
+way to exercise it for diagnostics and tests. Not behind the `fuse` feature.
+
+[cols="1,3",options="header"]
+|===
+| Option | Meaning
+
+| `--socket PATH`
+| The socket to bind. Default: `ipc-<account>.sock` in `$XDG_RUNTIME_DIR/wusel`,
+  or in the state directory when `XDG_RUNTIME_DIR` is unset.
+|===
+
+Refuses to start while the account is mounted: the mount already serves the
+socket, and two engines must not share one state database. Exits when the
+process that started it goes away.
 
 === `wusel service <enable|disable|status>`
 
@@ -101,7 +126,9 @@ recursively — and exempts it from cache eviction.
 | Argument | Meaning
 
 | `<PATH>`
-| The remote path to pin, for example `Photos`. Required.
+| The path to pin: relative to the account root, for example `Photos`, or an
+  absolute path inside a wusel mount (the account is then taken from the mount).
+  Required.
 
 | `--all`
 | The *whole account*: the old desktop client's "download everything". The only
@@ -119,14 +146,20 @@ Needs no running mount.
 === `wusel unpin [PATH]`
 
 Remove a pin. The files become ordinary, evictable cache again; nothing is
-deleted from the server. Omitting `PATH` removes the whole-account pin.
+deleted from the server. Omitting `PATH` removes the whole-account pin. `PATH`
+takes the same two forms as for `pin`.
 
 === `wusel update [PATH]`
 
 Fetch what a pin promised and the disk does not have: a copy that has gone out
 of date, and one that was never fetched at all (a directory pin covers files the
-server grows afterwards). In place, and omitting `PATH` covers every pin in the
-account.
+server grows afterwards). In place. `PATH` takes the same two forms as for
+`pin`.
+
+Omitting `PATH` covers every pin in the account: the whole-account pin if there
+is one, otherwise each pin in turn (a pin inside a pinned folder is left to that
+folder). A pin that fails does not stop the others; the failures are reported
+together at the end. With nothing pinned at all, it refuses.
 
 Deliberately not the same as unpinning and pinning again, which would drop the
 eviction marker first — a re-download that then failed would leave the file both
@@ -152,8 +185,10 @@ List the configured accounts. Identical to `wusel account list`.
 | List the configured accounts.
 
 | `remove NAME` (alias `rm`)
-| Delete a named account: its credentials, state database and cache. The
-  Nextcloud server is untouched.
+| Delete a named account: its configuration directory (`config.toml`,
+  `credentials.json`, `pins.json`), its app password in the OS keyring, its
+  state directory and its cache. The Nextcloud server is untouched. Refuses the
+  `default` account. Does not unmount a running instance — stop it first.
 |===
 
 == Finding out what is going on
@@ -211,8 +246,9 @@ mount first.
 
 | `[PATH]`
 | A remote path, for example `Photos`, clearing that subtree. Omitted, the whole
-  account is cleared — metadata, content *and* pins, like a fresh connection.
-  Credentials and configuration are kept.
+  account is cleared — metadata and content, like a fresh connection.
+  Credentials, configuration and pins are kept; pinned files download again on
+  first use.
 |===
 
 Separates a stale-cache problem from a server-side one. It refuses to run while
@@ -221,17 +257,46 @@ for why.
 
 == Desktop integration
 
-=== `wusel desktop notify [SEVERITY]`
+=== `wusel web url <PATH>`
 
-Send a test notification through the real backend, to verify the desktop's
-notification channel works independently of any sync event.
+Print the Nextcloud web URL for a file or folder — what the file manager's
+"Open in Nextcloud" and "Copy Internal Link" actions use. Built from local
+metadata only, with no network request; the caller opens or copies it.
 
 [cols="1,3",options="header"]
 |===
-| Argument | Meaning
+| Argument / option | Meaning
+
+| `<PATH>`
+| Relative to the account root, or absolute inside a wusel mount.
+
+| `--reveal`
+| Print the link that opens the *parent* folder with the object highlighted.
+  Without it, the object link (`…/f/<id>`) is printed: it opens a file in the
+  web viewer or navigates into a folder, and survives a rename.
+|===
+
+Fails for a path not yet in the local metadata, and for an object that exists
+only locally (created but not yet uploaded).
+
+=== `wusel desktop notify [SEVERITY]`
+
+Send a test notification through the real backend, to verify the desktop's
+notification channel works independently of any sync event. On Linux it posts
+to the notification bus directly. On macOS only the agent app may post, so the
+command hands each notification to the running agent over its socket; the agent
+must be running.
+
+[cols="1,3",options="header"]
+|===
+| Argument / option | Meaning
 
 | `[SEVERITY]`
 | `info`, `warning`, `error`, or `all`. Default `all`.
+
+| `--socket PATH`
+| macOS only: the agent's socket. Default: discovered — the App Group container
+  first, then the fallback under Application Support.
 |===
 
 === `wusel desktop install-provider`
@@ -257,6 +322,44 @@ run once each.
 Remove this account's registration. Takes the same `--dir DIR`.
 
 == Services
+
+=== `wusel ipc <OP> [PATH]`
+
+A client for the IPC socket of a running `wusel serve` or `wusel mount`, for
+diagnostics and tests. `PATH` is account-relative, default `/`.
+
+[cols="1,3",options="header"]
+|===
+| Argument / option | Meaning
+
+| `<OP>`
+| Read: `stat`, `enumerate`, `fetch`. Write: `create`, `write`, `publish`,
+  `remove`, `move`, `setattr`. Pins: `pin`, `unpin`. Streams: `watch` (one JSON
+  change per line until the daemon closes the stream; ignores `PATH`) and
+  `notices` (one JSON notice per line).
+
+| `--socket PATH`
+| The socket to connect to. Default: the account's socket, as for `wusel serve`.
+
+| `--offset N`, `--len N`
+| `fetch` and `write`: byte offset (default 0) and length (`fetch` default
+  1 MiB). `write` reads its bytes from stdin.
+
+| `--to PATH`
+| `move`: the destination.
+
+| `--dir`
+| `create`: make a directory rather than a file.
+
+| `--size N`, `--mtime SECS`
+| `setattr`: the new size and modification time (Unix seconds).
+
+| `--exec true\|false`
+| `create` and `setattr`: the executable bit, kept locally and never synced.
+|===
+
+Responses are printed as JSON on stdout. `fetch` writes the content to stdout and
+the response header to stderr, so it pipes cleanly.
 
 === `wusel search-provider`
 

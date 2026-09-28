@@ -73,14 +73,15 @@ xref:explanation/vfs-first.adoc[Why nothing is downloaded up front]
 Wusel is written in Rust and is *VFS-first*: files are online-only by default
 and are fetched on access. No released version of the official Nextcloud client
 offers that on Linux, where it mirrors everything to disk; an opt-in beta mode
-built on a separate FUSE process is in review
+built on a separate FUSE process is merged for a future release but not yet
+released
 (xref:explanation/compared-to-the-official-client.adoc[Compared to the official Nextcloud client]).
 
 It is also deliberately *more than a FUSE mount*. FUSE only makes the files
 appear; on top of it Wusel behaves like a part of the desktop rather than a
 mounted drive — a *Wusel (Nextcloud)* entry in the Files sidebar, an emblem on
 every file saying whether it is online-only, cached or pinned, a right-click
-*Make Available Offline*, your Nextcloud in the Activities search, and native
+*Wusel* menu with *Make Available Offline*, your Nextcloud in the Activities search, and native
 notifications when something needs your attention.
 
 That is a stance, not an accident. Wusel prefers what the desktop already

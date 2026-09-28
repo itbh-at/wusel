@@ -22,12 +22,18 @@ correctness).
 [cols="2,2,1",options="header"]
 |===
 | Touchpoint | Origin | Stability
-| PROPFIND + multistatus, GET + `Range`, ETag compare, Basic auth | WebDAV / HTTP standard | very stable
+| PROPFIND + multistatus, GET + `Range`, PUT with `If-Match`/`If-None-Match`, MKCOL, MOVE, DELETE, Basic auth | WebDAV / HTTP standard | very stable
 | Standard props (`getcontentlength`, `getlastmodified`, `getetag`, `resourcetype`) | WebDAV standard | very stable
+| Quota props (`quota-used-bytes`, `quota-available-bytes`, RFC 4331) | WebDAV standard | very stable
 | DAV path `+/remote.php/dav/files/{user}+` | Nextcloud / ownCloud | stable (long-standing)
+| `X-OC-Mtime` header on upload | ownCloud / Nextcloud extension | stable convention
+| Chunked upload v2 (`+/remote.php/dav/uploads/{user}/…+`, `OC-Total-Length`) | Nextcloud extension | stable, used by the official clients
 | Login Flow v2 (`/index.php/login/v2`) | Nextcloud API | stable, but not WebDAV
 | `oc:fileid`, `oc:permissions` (`owncloud.org/ns`) | ownCloud / Nextcloud extension | stable convention
-| OCS capabilities (`/ocs/v2.php/cloud/capabilities`) | Nextcloud API | stable
+| `nc:mount-type`, `nc:is-mount-root` (`nextcloud.org/ns`) | Nextcloud extension | stable convention
+| OCS capabilities (`/ocs/v2.php/cloud/capabilities`) and user (`/ocs/v2.php/cloud/user`) | Nextcloud API | stable
+| Unified Search (`/ocs/v2.php/search/providers/files/search`) — desktop search only | Nextcloud API | stable
+| Web links (`+/index.php/f/{fileid}+`, the Files app URL) — web actions only | Nextcloud web UI | stable convention
 | notify_push WebSocket | Nextcloud app | most fluid; optional
 |===
 
@@ -37,7 +43,11 @@ Graceful degradation, by design:
 * no `oc:permissions` → assumed writable, so the mount does not lock the user out
   of a file the server would in fact accept; a write the server does not allow is
   still rejected by the server itself;
-* no notify_push / no OCS answer → TTL revalidation;
+* no `nc:mount-type` → no group-folder emblem, nothing else changes;
+* no usable quota figure (unlimited, or not yet computed) → `statfs` keeps a
+  placeholder size;
+* no notify_push / no OCS answer → TTL revalidation plus a periodic sync walk
+  (`[sync] poll_secs`);
 * an unparsable date → `mtime` 0.
 
 Diagnostics: `login` probes the OCS capabilities and reports the server version
@@ -46,5 +56,10 @@ connect (`wusel_core::capabilities::fetch`). The PROPFIND parser matches on the
 **local** element name, so namespace-prefix changes do not break it.
 
 The *write* path adds the most Nextcloud-specific and change-prone surface —
-chunked upload NG (`/remote.php/dav/uploads/…`) — so it is
+chunked upload v2 (`/remote.php/dav/uploads/…`) — so it is
 inherently less "standard" than reading.
+
+Which Nextcloud versions this covers is checked, not asserted: the nightly
+end-to-end test asks Docker Hub for the three newest Nextcloud majors and runs
+against each. The newest must pass; the two older ones are reported but do not
+fail the run.

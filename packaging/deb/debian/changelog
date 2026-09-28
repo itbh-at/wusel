@@ -1,3 +1,17 @@
+wusel (0.5.0) unstable; urgency=medium
+
+  * HTTP/2 over TLS; periodic sync polling and a catch-up after every
+    notify_push reconnect.
+  * The GNOME Files integration is now its own package, wusel-nautilus, with a
+    Wusel submenu; after upgrading, install it with `apt install wusel-nautilus`.
+  * `wusel web url`; the executable bit is kept locally (FUSE and macOS Finder).
+  * Upload correctness: no conflicted copy of your own upload; rename and remove
+    wait for the upload; the text merge starts from the base version.
+  * SQLite immediate transactions and safer listings under concurrent changes.
+  * Experimental macOS: Finder web actions, shown only where they fit.
+
+ -- Christoph D. Hermann <christoph.hermann@itbh.at>  Mon, 28 Sep 2026 10:51:29 +0200
+
 wusel (0.4.1) unstable; urgency=medium
 
   * Judge the server's reachability by HTTP, not by the notify_push WebSocket:
@@ -12,7 +26,7 @@ wusel (0.4.1) unstable; urgency=medium
     when the change watch reconnects; bound the engine-connect retry; bind the
     socket before engine start-up so the extension never meets a refused connect.
 
- -- Christoph D. Hermann <christoph.hermann@itbh.at>  Sun, 14 Sep 2026 12:00:00 +0200
+ -- Christoph D. Hermann <christoph.hermann@itbh.at>  Mon, 14 Sep 2026 12:00:00 +0200
 
 wusel (0.4.0) unstable; urgency=medium
 
@@ -30,7 +44,7 @@ wusel (0.3.2) unstable; urgency=medium
     silence; heal phantom "waiting" uploads left by a delete or rename; and
     let notify_push recover on its own after a transient discovery error.
 
- -- Christoph D. Hermann <christoph.hermann@itbh.at>  Thu, 27 Aug 2026 17:00:00 +0200
+ -- Christoph D. Hermann <christoph.hermann@itbh.at>  Wed, 02 Sep 2026 09:30:00 +0200
 
 wusel (0.3.1) unstable; urgency=medium
 
@@ -45,11 +59,11 @@ wusel (0.3.0) unstable; urgency=medium
     the same recipes and published through the Open Build Service.
   * Documentation restructured onto the Diátaxis framework.
 
- -- Christoph D. Hermann <christoph.hermann@itbh.at>  Tue, 25 Aug 2026 21:40:00 +0200
+ -- Christoph D. Hermann <christoph.hermann@itbh.at>  Wed, 26 Aug 2026 11:30:00 +0200
 
 wusel (0.2.2) unstable; urgency=medium
 
   * Debian/Ubuntu packaging: from-source build via debhelper, offline
     (vendored dependencies), mirroring the Fedora RPM's approach.
 
- -- Christoph D. Hermann <christoph.hermann@itbh.at>  Tue, 25 Aug 2026 11:52:20 +0200
+ -- Christoph D. Hermann <christoph.hermann@itbh.at>  Mon, 24 Aug 2026 16:15:00 +0200

@@ -9,17 +9,28 @@
 #   make uninstall
 #
 # Requires the Nautilus and GLib development packages:
-#   Fedora:        sudo dnf install nautilus-devel glib2-devel gcc make
-#   Debian/Ubuntu: sudo apt install libnautilus-extension-dev libglib2.0-dev gcc make
+#   Fedora:        sudo dnf install nautilus-devel glib2-devel gtk4-devel gcc make
+#   Debian/Ubuntu: sudo apt install libnautilus-extension-dev libglib2.0-dev libgtk-4-dev gcc make
 
 # Nautilus 4 (GTK4) ships libnautilus-extension-4; fall back to the unversioned
 # name on older setups.
 PKG := $(shell pkg-config --exists libnautilus-extension-4 \
          && echo libnautilus-extension-4 || echo libnautilus-extension)
 
+# The clipboard ("copy internal link") uses GDK, which the nautilus-extension
+# .pc does not pull in on its own — so add the matching GTK explicitly (GTK4 for
+# Nautilus 4, GTK3 for the unversioned fallback).
+GTK := $(shell pkg-config --exists libnautilus-extension-4 \
+         && echo gtk4 || echo gtk+-3.0)
+
 CC      ?= cc
 CFLAGS  ?= -O2 -Wall -Wextra
-CFLAGS  += -fPIC $(shell pkg-config --cflags $(PKG) gio-2.0)
+CFLAGS  += -fPIC $(shell pkg-config --cflags $(PKG) $(GTK) gio-2.0)
+# GTK is compiled against but deliberately not linked: the extension only ever
+# runs inside Nautilus, which has GTK loaded already, so the few `gdk_*` calls
+# resolve there when the module is loaded. Linking it would add a hard runtime
+# dependency on the GTK stack to the package — well over a hundred packages on
+# a minimal system — for a clipboard call.
 LDLIBS  := $(shell pkg-config --libs $(PKG) gio-2.0)
 
 # Nautilus advertises its extension dir in the .pc file (e.g.

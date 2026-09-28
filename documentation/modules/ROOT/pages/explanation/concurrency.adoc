@@ -9,7 +9,7 @@
 
 NOTE: Wusel 0.1.0 served FUSE requests one at a time. This page is how that
 changed in 0.2.0, why it is shaped the way it is, and how each step is proven.
-See <<_status>> for what is in and what is not, and the xref:project/roadmap.adoc[Roadmap]
+See <<_what_this_does_not_solve>> for what it leaves open, and the xref:project/roadmap.adoc[Roadmap]
 for where the whole sits.
 
 == The ceiling
@@ -74,12 +74,29 @@ image::fsm-dispatch.svg[Event-driven dispatch architecture,900]
 Two consequences the picture makes explicit:
 
 **Nobody replies from the FSM thread.** `reply.data()` writes to `/dev/fuse`,
-which is I/O. The reply object travels with the work and is sent by whoever
-finishes it.
+which is I/O. The frontend keeps the reply objects, and a thread of its own — the
+reply pump, `wusel-fuse-replies` — drains the substrate's answers and completes
+the replies they belong to.
 
-**The syncer hands its writes to the DB writer** instead of holding a second
-connection. That removes write-lock contention between the syncer and the
-mount — the problem disappears rather than being managed with a busy timeout.
+**The syncer is outside the machine.** It holds a second state connection of
+its own and reconciles on its own thread (`wusel-walk`); write-lock contention
+between it and the DB writer is managed with SQLite's busy timeout (5 s) rather
+than designed away. That timeout only helps a transaction that asks for the
+write lock before it reads: one that reads first and upgrades later is refused
+at once if another connection committed in between. Every write transaction
+therefore begins `IMMEDIATE`.
+
+Being outside the machine also means the syncer does not wait for a flow — and
+a listing taken halfway through one is wrong. An atomic save renames on the
+server first and moves the rows after; a listing taken in between shows the
+temporary gone and would delete the row the rename still has to move. So the
+decider publishes which objects have a state-changing flow running
+(`wusel_core::activity`; reads do not count). Every listing — the sync walk,
+the background refresh, and a flow's own relist such as the one after a file's
+first upload — is applied only if its directory was not changing from before
+the PROPFIND until the reconcile, and a child that was changing keeps its row.
+The flow that asked for a listing does not count against it. A dropped listing
+costs nothing: the next walk or refresh lists again.
 
 Readers are separate from the writer because WAL allows many readers alongside
 one writer, and the common operations — `getattr`, `lookup`, `readdir` — are
@@ -104,7 +121,11 @@ an unreadable graph:
   graph.
 
 Operations that address no object at all (`statfs`, under FUSE) bypass the
-machine entirely.
+machine entirely. Two kinds of work run *beside* occupancy on purpose:
+`Action::ReadBeside`, a read-only metadata job (`getattr`, an xattr) answered
+directly instead of queueing behind an upload, and `Action::Refresh`, the
+background re-listing of a stale directory, dispatched detached as a
+`ListRemote` job that nobody waits for.
 
 The machine says *object*, not *inode*, on purpose: an inode is what one kernel
 interface happens to call an identity, and the machine may not depend on that.
@@ -129,19 +150,24 @@ elsewhere. `read` is short:
 `flush` is the longest, and the reason the shape pays off:
 
 ....
-1  DbRead   node row + scratch metadata
-2  FileIo   size of the scratch
-3  Net      PUT or chunked upload, with its precondition
-4  on 412 → sub-script: conflict resolution
-           (Net: fetch theirs → FileIo: merge → Net: PUT)
-5  DbWrite  record the new ETag and size
-6  FileIo   copy the scratch into the blob cache
-7  Reply    the object is idle again
+1  DbRead   node row
+2  DbWrite  record the upload as owed (MarkPending)
+   → flush is answered here (async, the default); the flow runs on
+3  FileIo   size of the scratch
+4  Net      PUT or chunked upload, with its precondition
+5  on 412 → Net: conflict resolution, one job
+           (fetch theirs, merge or conflicted copy, upload)
+6  DbWrite  record the new ETag and size
+7  FileIo   copy the scratch into the blob cache
+8  Net      re-list the parent, if the file has no server id yet
+9  DbWrite  clear the pending record
+10 FileIo   discard the scratch; the object is idle again
 ....
 
-Today that sequence is seven nested blocking calls inside `flush`, any of which
-can stand for minutes. As a script it is seven named steps, each one separately
-readable and testable.
+Before 0.2.0 that sequence was nested blocking calls inside `flush`, any of
+which could stand for minutes. As a script it is named steps, each one
+separately readable and testable. With `[sync] upload = "sync"` the answer waits
+until the flow ends.
 
 Every implemented callback is drawn this way — step by step, with the executing
 thread colour-coded — in xref:reference/operation-scripts.adoc[the operation scripts]. That page
@@ -180,9 +206,11 @@ fn advance(flow: Flow, completion: Completion, facts: &Facts) -> (Flow, Next);
 
 enum Next {
     Do(Job),          // hand to a database thread or an I/O worker
+    AnswerThen(Job),  // answer everyone now, then run on with nobody waiting
     Done,             // answer everyone waiting; release the object
     Fail(Failure),    // the same, with an error the frontend maps to its own
-    Abandoned,        // given up; nobody is waiting, so nobody is told
+    Abandoned,        // given up; anyone still waiting is answered `Interrupted`
+    Handoff { object: ObjectId, intent: Intent }, // continue on another object
 }
 ----
 
@@ -214,8 +242,8 @@ row** — so it is demonstrated rather than asserted.
 |Hydration |`write` |**Wait** |preparing the buffer needs the base for a later
 3-way merge; aborting destroys it
 
-|Hydration (background, pin) |`unlink`, `unpin` |**Abort** |the file or the
-intent is gone; the rest of the download is waste
+|Background refresh |`unlink` |**Abort** |the file is gone; the rest of the
+download is waste
 
 |Hydration |second `read`, same range |**Join** |one transfer, two answers
 
@@ -230,9 +258,22 @@ once) |aborting mid-chunked-upload leaves half an object on the server
 
 |Listing |second listing |**Join** |one PROPFIND answers both
 
-|Anything |pin refresh |**Skip** if a local edit is pending |a server-side change
+|Listing |background re-list |**Skip** |redundant while the listing runs
+
+|Background refresh |second refresh |**Skip** |at most one refresh per object
+
+|Anything |refresh |**Skip** if a local edit is pending |a server-side change
 must never overwrite an unsaved local one
 |===
+
+"Wait" is `Collision::Queue` seen from the other end. Everything not named
+queues.
+
+NOTE: The rows for a background refresh and re-list (`Intent::Refresh`,
+`Intent::Relist`) are implemented in `wusel-fsm` and tested, but no production
+code submits either intent yet. Directory revalidation runs beside the machine
+as `Action::Refresh` (see _Two levels_), and the pinned-file refresh runs on the
+syncer thread (see _How it lands in the machine_).
 
 WARNING: "Newest wins" is *not* a valid general rule. An editor saving every two
 seconds would keep aborting the hydration of the merge base, which would then
@@ -257,11 +298,12 @@ then either committed or **compensated** — an in-flight chunked upload is not
 shot down, it finishes and the existing cleanup removes the collection.
 ====
 
-Abort points therefore lie *between* steps, with one exception: the streamed
-hydration, where dropping the future genuinely stops the transfer. For a
-`spawn_blocking` step, `abort()` only discards the result — the transfer keeps
-running. That is the second reason for the bounded-channel design, alongside
-backpressure.
+Abort points therefore lie *between* steps. Stopping a transfer that is already
+running is **not implemented**: a hydration in flight runs to completion, and
+the abandoned flow ends at the next step boundary. `Job::is_droppable` already
+classifies which jobs could be dropped mid-flight, but nothing uses it yet;
+cutting off an in-flight GET (for example through a bounded channel or an
+`AbortHandle` on the transfer) is planned.
 
 `fuser` has no `interrupt` callback — 44 methods on its 0.18 `Filesystem` trait
 and none of them is it, exactly as in 0.14. Ignoring interrupts is explicitly
@@ -301,8 +343,9 @@ than silently lost.
 
 == Keeping pinned files current
 
-A pin promises "keep this offline". Today it delivers hydration at pin time and
-protection from eviction — but not currency, and, worse, not even availability.
+A pin promises "keep this offline". It delivers hydration at pin time and
+protection from eviction. Currency is the subject of this section, and
+availability once was not delivered either.
 
 [NOTE]
 ====
@@ -334,7 +377,7 @@ them, and an indexer walks whole trees. The emblem remains the passive channel;
 this is the active one, and it fires only when the outdated bytes are really
 handed out.
 
-Beside it, the fifth per-file state (`pinned-stale`) makes staleness visible
+Beside it, the per-file state `pinned-stale` makes staleness visible
 before anyone opens the file, and "Update now" gives the user something to do
 about it. What remains of this section is the *policy* below — when a refresh
 should happen without being asked for.
@@ -343,8 +386,8 @@ should happen without being asked for.
 
 It is the one moment with a deadline attached: somebody is waiting for the file.
 A poor connection hurts most precisely there. Every other moment is better,
-because nobody is blocked by it. Today's behaviour — stale blob, live read on
-open — does exactly the wrong thing.
+because nobody is blocked by it. The default for opening (`open_pinned =
+"newest"`, below) — stale blob, live read on open — still does exactly that.
 
 === Make staleness visible, and let the user spend the bandwidth
 
@@ -352,7 +395,7 @@ The engine already surfaces per-file state over the status socket
 (xref:reference/file-states.adoc[File states]), and the design principle
 there is that every state is *always visible*. Staleness gets the same treatment:
 
-* **A fifth state, for pinned files only.** An unpinned cached file that goes
+* **A state of its own, for pinned files only.** An unpinned cached file that goes
   stale needs no marking — "the next read goes live" is ordinary VFS behaviour.
   Only a pin makes a promise that staleness breaks.
 * **An explicit "Update now" action**, shown only while a pinned file is stale.
@@ -361,9 +404,10 @@ there is that every state is *always visible*. Staleness gets the same treatment
   eviction marker first, so a failed re-download would leave the file worse off
   than before.
 * **Notifications aggregated and debounced.** A colleague reorganising a shared
-  folder can change hundreds of pinned files at once; that must be one message
-  ("12 pinned files changed — Update now / Later") with an action, not hundreds.
-  It fits the existing localized `desktop::Notice` enum.
+  folder can change hundreds of pinned files at once; that must be one message,
+  not hundreds. It is one localized `desktop::Notice`. The notification carries
+  no action button; the user updates through the "Update Now" menu entry or
+  `wusel update`.
 
 === The policy, not a boolean
 
@@ -471,9 +515,9 @@ this one, and until it exists, refusing is the honest answer.
 
 Nothing here needs new machinery. Staleness is **derived** — blob present, ETag
 differing, pinned — exactly like `FileState` is derived today, so no new column.
-The syncer already detects the change and emits an invalidation; the FSM resolves
-the object, checks the pin, and starts the same hydration flow a read would start.
-Different trigger, same script.
+The syncer already detects the change and emits an invalidation. The fetch under
+`auto` does not go through the FSM: the syncer thread calls the content source's
+`pin_file` for each stale pinned file itself, the same call a new pin makes.
 
 The policy sits at the one place that already knows: the syncer's tree walk,
 which is where a pinned file is *found* to have moved on. It collects the stale
@@ -481,22 +525,24 @@ pinned rows for the whole walk and settles them once at the end — one decision
 per walk rather than one per file. That is the aggregation, and it falls out of
 where the check runs rather than needing a debounce timer.
 
-Across walks, `ask` speaks only when the backlog has grown. A walk runs every
-`revalidate_secs`; repeating the same message every thirty seconds until the user
-gives in is how notifications get muted for good. So the stale set is remembered
+Across walks, `ask` speaks only when the backlog has grown. A walk runs on every
+`notify_push` event, and without `notify_push` every `poll_secs`; repeating the
+same message on each walk until the user gives in is how notifications get muted
+for good. So the stale set is remembered
 and the message suppressed while it holds nothing new — but when it is announced
 it names the *whole* backlog, not the increment, so someone who ignored the first
 one and looks later sees the real number. An emptied backlog forgets itself,
 which is what lets a file that goes stale a second time be announced a second
 time.
 
-Two rules it contributes to the collision table:
+Two rules it contributes to the collision table, for `Intent::Refresh` (modelled
+and tested; not yet submitted by production code, see above):
 
-* An arriving refresh meets a running upload or a dirty scratch → **skip**, not
-  queue. Until the upload lands, our copy *is* the server copy, and the next
-  invalidation will tell us the truth anyway.
-* At most one running plus one pending refresh per object. A web editor with
-  autosave would otherwise queue one hydration per keystroke.
+* An arriving refresh meets a dirty scratch → **skip**, not queue. Until the
+  upload lands, our copy *is* the server copy, and the next invalidation will
+  tell us the truth anyway.
+* A refresh arriving while one runs is **skipped**: at most one per object. A web
+  editor with autosave would otherwise queue one hydration per keystroke.
 
 === Whole files only
 
@@ -505,7 +551,9 @@ and the official client transfers whole files too. The protocol gives one opaque
 ETag per file, and `OC-Checksum` covers the whole file, so there is no way to
 learn *which* bytes changed without fetching them. What can be optimised is
 fetching only on an actual ETag change, and doing it as a single streamed
-response rather than one range GET per chunk.
+response rather than one range GET per chunk. A whole-file hydration of the read
+cache is one streamed GET, and so is filling a write buffer — which goes through
+the cache and leaves the version it started from there as the merge base.
 
 == Assumptions we refuse to make
 
@@ -635,12 +683,16 @@ the adverse condition rather than hoping for it:
 * *Network:* `tc netem` throttling (about 3 Mbit with added latency). Without it
   the responsiveness test is not reliably red beforehand, and then it proves
   nothing afterwards.
-* *Database:* a helper holding `BEGIN IMMEDIATE` — a deterministic write-lock
+* *Network, without a server:* the mock's response delays
+  (`WUSEL_MOCK_GET_DELAY_MS`, `WUSEL_MOCK_PUT_DELAY_MS`,
+  `WUSEL_MOCK_PROPFIND_DELAY_MS`).
+* *Database:* a helper holding `BEGIN IMMEDIATE`
+  (`crates/wusel-core/tests/db_concurrency.rs`) — a deterministic write-lock
   stall, no timing luck required.
-* *File I/O:* a test-only delay in the blob and scratch paths, to stand in for a
-  virus scanner.
-* *Network home:* a Samba container in the same podman network, mounted as the
-  home directory, to exercise the relocation.
+* *Network home:* a fake `/proc` in a mount namespace
+  (`scripts/check-network-home.sh`, above), to exercise the relocation.
+
+A slow local disk (a virus scanner holding files) has no injection yet.
 
 Every claim above was made to fail before it was made to pass. A gate nobody has
 seen red proves nothing.

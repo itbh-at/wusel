@@ -28,6 +28,10 @@ pub const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
 #[derive(Clone)]
 pub struct WebDavClient {
     http: reqwest::Client,
+    /// The instance base, no trailing slash, e.g. `https://cloud.example.org`.
+    /// Kept beside the derived DAV `base` so a frontend can build an object's
+    /// *web* link (see [`crate::web`]).
+    server_url: String,
     /// e.g. `https://cloud.example.org/remote.php/dav/files/alice`
     base: String,
     login_name: String,
@@ -45,18 +49,23 @@ impl WebDavClient {
         login_name: &str,
         app_password: &str,
     ) -> Self {
-        let base = format!(
-            "{}/remote.php/dav/files/{}",
-            server_url.trim_end_matches('/'),
-            login_name
-        );
+        let server_url = server_url.trim_end_matches('/').to_string();
+        let base = format!("{server_url}/remote.php/dav/files/{login_name}");
         Self {
             http,
+            server_url,
             base,
             login_name: login_name.to_string(),
             app_password: app_password.to_string(),
             health: None,
         }
+    }
+
+    /// The instance base URL (no trailing slash), for building an object's web
+    /// link with [`crate::web`].
+    #[must_use]
+    pub fn server_url(&self) -> &str {
+        &self.server_url
     }
 
     /// Report every request outcome to `health`, so a server that stops
@@ -79,6 +88,7 @@ impl WebDavClient {
     pub fn with_http_client(&self, http: reqwest::Client) -> Self {
         Self {
             http,
+            server_url: self.server_url.clone(),
             base: self.base.clone(),
             login_name: self.login_name.clone(),
             app_password: self.app_password.clone(),
@@ -262,6 +272,38 @@ impl WebDavClient {
             .into_iter()
             .next()
             .map(|e| (e.size, e.etag)))
+    }
+
+    /// The account root's ETag, via a Depth-0 `PROPFIND`, or `None` when the
+    /// server sent none.
+    ///
+    /// Nextcloud propagates a change anywhere in the tree up to the root, and
+    /// folds the ETags of mounts (shares, team folders) into their parent's, so
+    /// an unchanged root means an unchanged tree. That is what lets the sync
+    /// walk stop after this one small request instead of listing the root.
+    ///
+    /// Not [`etag_of`](Self::etag_of): that goes through `parse_multistatus`,
+    /// which drops the requested directory itself — for the root, the only
+    /// entry there is.
+    pub async fn root_etag(&self) -> Result<Option<String>> {
+        const BODY: &str = r#"<?xml version="1.0"?>
+<d:propfind xmlns:d="DAV:"><d:prop><d:getetag/></d:prop></d:propfind>"#;
+        let resp = self
+            .send(
+                self.http
+                    .request(
+                        reqwest::Method::from_bytes(b"PROPFIND").unwrap(),
+                        self.url_for("", true)?,
+                    )
+                    .basic_auth(&self.login_name, Some(&self.app_password))
+                    .header("Depth", "0")
+                    .header("Content-Type", "application/xml")
+                    .body(BODY),
+            )
+            .await?
+            .error_for_status()?;
+        let xml = resp.text().await?;
+        Ok(parse_root_etag(&xml))
     }
 
     /// The account's storage quota, via a Depth-0 `PROPFIND` on the account
@@ -982,6 +1024,27 @@ fn parse_quota(xml: &str) -> Quota {
     Quota { used, available }
 }
 
+/// The first `getetag` in a Depth-0 answer — there is only one resource in it.
+/// Empty counts as absent: an empty ETag compares equal to every other empty
+/// one and would make "unchanged" the answer to a server that sends none.
+fn parse_root_etag(xml: &str) -> Option<String> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+    let mut in_etag = false;
+    loop {
+        match reader.read_event() {
+            Err(_) | Ok(Event::Eof) => return None,
+            Ok(Event::Start(e)) => in_etag = local_name(e.name().as_ref()) == b"getetag",
+            Ok(Event::Text(t)) if in_etag => {
+                let etag = unquote_etag(&t.unescape().ok()?);
+                return (!etag.is_empty()).then_some(etag);
+            }
+            Ok(Event::End(_)) => in_etag = false,
+            _ => {}
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Field {
     Href,
@@ -1355,6 +1418,31 @@ mod tests {
             entries[0].etag, "abc",
             "status text must not leak into the etag"
         );
+    }
+
+    #[test]
+    fn root_etag_is_read_from_the_depth_0_answer() {
+        let xml = r#"<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:">
+  <d:response>
+    <d:href>/remote.php/dav/files/alice/</d:href>
+    <d:propstat><d:prop><d:getetag>&quot;6ab93f65700ab&quot;</d:getetag></d:prop>
+    <d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+  </d:response>
+</d:multistatus>"#;
+        assert_eq!(parse_root_etag(xml).as_deref(), Some("6ab93f65700ab"));
+    }
+
+    #[test]
+    fn a_missing_or_empty_root_etag_is_none() {
+        // `None` makes the syncer walk: "unknown" must never read as "unchanged".
+        let empty = r#"<d:multistatus xmlns:d="DAV:"><d:response><d:propstat><d:prop>
+<d:getetag></d:getetag><d:quota-used-bytes>5</d:quota-used-bytes>
+</d:prop></d:propstat></d:response></d:multistatus>"#;
+        assert_eq!(parse_root_etag(empty), None);
+        let absent = r#"<d:multistatus xmlns:d="DAV:"><d:response><d:propstat><d:prop>
+<d:quota-used-bytes>5</d:quota-used-bytes></d:prop></d:propstat></d:response></d:multistatus>"#;
+        assert_eq!(parse_root_etag(absent), None);
     }
 
     #[test]

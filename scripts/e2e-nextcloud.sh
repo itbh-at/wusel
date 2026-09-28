@@ -10,12 +10,18 @@
 # Env (all have CI defaults):
 #   NC_URL=http://localhost:8080  NC_USER=admin  NC_PASS=adminpass
 #   WUSEL=./target/release/wusel
+#   NC_CA=  (optional: PEM of the CA behind an https:// NC_URL — used by curl
+#            and written to the mount's `[tls] ca_cert`)
+#   NC_HTTP1=1  (optional: write `[tls] http1_only = true`)
 set -euo pipefail
 
 NC_URL="${NC_URL:-http://localhost:8080}"
 NC_USER="${NC_USER:-admin}"
 NC_PASS="${NC_PASS:-adminpass}"
 WUSEL="${WUSEL:-./target/release/wusel}"
+NC_CA="${NC_CA:-}"
+# curl honours this for every call below; the mount gets it via config.toml.
+[ -n "$NC_CA" ] && export CURL_CA_BUNDLE="$NC_CA"
 
 DAV="$NC_URL/remote.php/dav/files/$NC_USER"
 OCS_H=(-H "OCS-APIRequest: true")
@@ -242,6 +248,11 @@ quota_revalidate_secs = 2
 [mount]
 dispatch_threads = 4
 EOF
+if [ -n "$NC_CA" ] || [ "${NC_HTTP1:-0}" = 1 ]; then
+  echo '[tls]' >> "$XDG_CONFIG_HOME/wusel/config.toml"
+  [ -z "$NC_CA" ] || printf 'ca_cert = "%s"\n' "$(esc "$NC_CA")" >> "$XDG_CONFIG_HOME/wusel/config.toml"
+  [ "${NC_HTTP1:-0}" != 1 ] || echo 'http1_only = true' >> "$XDG_CONFIG_HOME/wusel/config.toml"
+fi
 ok "credentials + config written"
 
 # --- 3. Seed files on the server (BEFORE mounting) -------------------------
@@ -437,6 +448,68 @@ copies="$(curl -fsS "${AUTH[@]}" -X PROPFIND -H 'Depth: 1' "$DAV/" 2>/dev/null \
 [ "$copies" = 0 ] || fail "overwriting a large file spawned $copies conflicted copies"
 ok "in-place overwrite of a large file works (no conflict copies)"
 
+# --- 6d. Rename or delete a file whose first upload is still running --------
+# `cp new; mv new other` and `sed -i` both close a fresh file — which starts its
+# upload — and rename it straight away; `cp new; rm new` deletes it. Both used
+# to overtake that upload: after a rename the bytes landed under the old name,
+# so the server kept a stray file (the pre-rename name, or sed's temporary); after
+# a delete the upload landed anyway and the file came back. 16 MiB keeps the
+# upload running long enough for the rename or delete to land inside it, even
+# against a local container.
+server_sha() { # the SHA-256 of $1 on the server, or nothing
+    curl -fsS "${AUTH[@]}" "$DAV/$1" -o "$WORK/sha.down" 2>/dev/null \
+        && sha256sum "$WORK/sha.down" | cut -d' ' -f1
+}
+wait_server_sha() { # wait until $1 on the server hashes to $2
+    for _ in $(seq 1 "$UPLOAD_TIMEOUT_S"); do
+        [ "$(server_sha "$1")" = "$2" ] && return 0
+        sleep 1
+    done
+    return 1
+}
+
+echo ">> renaming a new file while its upload runs (no stray file expected) ..."
+dd if=/dev/urandom of="$WORK/race.bin" bs=1M count=16 status=none
+want_race="$(sha256sum "$WORK/race.bin" | cut -d' ' -f1)"
+cp "$WORK/race.bin" "$MNT/race-new.bin"
+mv "$MNT/race-new.bin" "$MNT/race-moved.bin"
+wait_server_sha race-moved.bin "$want_race" \
+    || fail "a file renamed mid-upload did not land under its new name"
+
+echo ">> sed -i on a file already on the server (no temporary left behind) ..."
+# ~17 MiB of "alpha" lines. Not `yes | head`: under pipefail, `yes` dying of
+# SIGPIPE when `head` has had enough would fail the run.
+seq 1 3000000 | sed 's/.*/alpha/' > "$WORK/sed.txt"
+cp "$WORK/sed.txt" "$MNT/sed-target.txt"
+wait_server_sha sed-target.txt "$(sha256sum "$WORK/sed.txt" | cut -d' ' -f1)" \
+    || fail "the sed target did not upload"
+sed -i 's/alpha/beta/' "$MNT/sed-target.txt"
+sed 's/alpha/beta/' "$WORK/sed.txt" > "$WORK/sed-want.txt"
+wait_server_sha sed-target.txt "$(sha256sum "$WORK/sed-want.txt" | cut -d' ' -f1)" \
+    || fail "sed -i through the mount did not land its new content"
+
+echo ">> deleting a new file while its upload runs (it must stay deleted) ..."
+cp "$WORK/race.bin" "$MNT/rm-new.bin"
+rm "$MNT/rm-new.bin"
+# A negative check: give an upload that wrongly survived the delete ample time
+# to land (16 MiB against a local container takes a second or two).
+sleep 10
+[ ! -e "$MNT/rm-new.bin" ] || fail "a file deleted mid-upload came back in the mount"
+
+listing="$(curl -fsS "${AUTH[@]}" -X PROPFIND -H 'Depth: 1' "$DAV/" 2>/dev/null)"
+if printf '%s' "$listing" | grep -q 'rm-new\.bin'; then
+    fail "a file deleted mid-upload came back on the server"
+fi
+if printf '%s' "$listing" | grep -q 'race-new\.bin'; then
+    fail "the pre-rename name was left on the server"
+fi
+if printf '%s' "$listing" | grep -qE '/sed[[:alnum:]]{6}<'; then
+    fail "sed's temporary was left on the server"
+fi
+copies="$(printf '%s' "$listing" | grep -c 'conflicted copy' || true)"
+[ "$copies" = 0 ] || fail "renaming mid-upload spawned $copies conflicted copies"
+ok "rename and delete wait for the upload they would otherwise overtake (mv, sed -i, rm)"
+
 # --- 7. Pin keeps a file offline -------------------------------------------
 "$WUSEL" pin merge.txt
 "$WUSEL" pins | grep -q 'merge.txt' || fail "pin not listed"
@@ -477,6 +550,42 @@ if curl -fsS "${AUTH[@]}" -X PROPFIND -H 'Depth: 1' "$DAV/" \
   fail "expected a clean merge but a conflicted copy was created"
 fi
 ok "3-way text merge combined both non-overlapping edits, no conflict copy"
+
+# --- 8b. The server already holding our bytes is no conflict ---------------
+# A save refused (412) because the server already holds exactly the bytes being
+# saved — our own earlier attempt whose answer was lost, or the same content
+# written elsewhere — must not park a "conflicted copy" of identical bytes.
+# Binary on purpose, so the text merge of step 8 cannot paper over it. Staged
+# like step 8: the server moves on to B behind the mount's back, and the mount
+# then saves B in place on the version A it still knows.
+echo ">> saving bytes the server already holds (no conflicted copy expected) ..."
+dd if=/dev/urandom of="$WORK/same-a.bin" bs=64k count=1 status=none
+dd if=/dev/urandom of="$WORK/same-b.bin" bs=64k count=1 status=none
+want_a="$(sha256sum "$WORK/same-a.bin" | cut -d' ' -f1)"
+want_b="$(sha256sum "$WORK/same-b.bin" | cut -d' ' -f1)"
+cp "$WORK/same-a.bin" "$MNT/same.bin"
+got=""
+for _ in $(seq 1 "$UPLOAD_TIMEOUT_S"); do
+    if curl -fsS "${AUTH[@]}" "$DAV/same.bin" -o "$WORK/same.down" 2>/dev/null; then
+        got="$(sha256sum "$WORK/same.down" | cut -d' ' -f1)"
+        [ "$got" = "$want_a" ] && break
+    fi
+    sleep 1
+done
+[ "$got" = "$want_a" ] || fail "same.bin did not upload"
+curl -fsS "${AUTH[@]}" -T "$WORK/same-b.bin" "$DAV/same.bin" >/dev/null
+dd if="$WORK/same-b.bin" of="$MNT/same.bin" conv=notrunc status=none
+sync
+# A negative check: give the mount's save — and a copy it must not make — time
+# to happen (the refusal, the look at the server and the settling are quick).
+sleep 10
+curl -fsS "${AUTH[@]}" "$DAV/same.bin" -o "$WORK/same.down"
+[ "$(sha256sum "$WORK/same.down" | cut -d' ' -f1)" = "$want_b" ] \
+    || fail "same.bin does not hold the saved bytes"
+if curl -fsS "${AUTH[@]}" -X PROPFIND -H 'Depth: 1' "$DAV/" | grep -q 'same (conflicted copy'; then
+    fail "saving bytes the server already held spawned a conflicted copy"
+fi
+ok "a refused save of bytes the server already holds makes no conflicted copy"
 
 # --- 9. Responsiveness under a running transfer (throttled 3G link) --------
 # The property under test: an unrelated, purely local operation must be served
@@ -653,6 +762,55 @@ fb_used=$(( fb_total - fb_free ))
 [ "$fb_used" -gt 0 ] \
   || fail "the fallback reported 0 bytes used, though the server still knows the real figure"
 ok "no quota on the account → usable fallback ($fb_used bytes used, $fb_free free)"
+
+# --- 13b. The sync walk finds server changes, also inside a Team folder -----
+# The walk first asks the root's ETag (Depth 0) and stops when it is unchanged.
+# That is only sound if a change anywhere — including inside a mount such as a
+# Team folder — changes the root's ETag. Only a real server settles that.
+# With `revalidate_secs = 3600` nothing but the walk re-lists a directory, so a
+# file uploaded behind the mount's back can only appear through the walk. The
+# walk runs on its poll timer here (this image has no notify_push), so the
+# mount is restarted with a short `poll_secs`.
+echo ">> checking the sync walk finds server-side changes ..."
+fusermount3 -u "$MNT" 2>/dev/null || true
+kill "$WUSEL_PID" 2>/dev/null || true
+wait "$WUSEL_PID" 2>/dev/null || true
+sed -i 's/^\[sync\]$/[sync]\npoll_secs = 2/' "$XDG_CONFIG_HOME/wusel/config.toml"
+
+curl -fsS "${AUTH[@]}" -X MKCOL "$DAV/walk-plain" >/dev/null \
+  || fail "could not create walk-plain on the server"
+walk_dirs=()
+[ -z "${GROUPFOLDER:-}" ] || walk_dirs+=("$GROUPFOLDER")
+walk_dirs+=("walk-plain")
+
+RUST_LOG="${RUST_LOG:-wusel=info,wusel_core=info,wusel_fuse=info}" \
+  "$WUSEL" mount "$MNT" &
+WUSEL_PID=$!
+for _ in $(seq 1 30); do
+  [ -d "$MNT/walk-plain" ] && break
+  sleep 1
+done
+[ -d "$MNT/walk-plain" ] || fail "the remount never showed walk-plain"
+# The walk descends only into directories already listed.
+for d in "${walk_dirs[@]}"; do ls "$MNT/$d" >/dev/null; done
+# Let a few walks pass, so the next one compares against a recorded root ETag
+# — the skip is exactly what is under test.
+sleep 6
+
+# One folder at a time, each change found before the next is made: otherwise a
+# change in the plain folder alone would move the root's ETag and carry the
+# walk into the Team folder, and the Team folder case would not be tested.
+for d in "${walk_dirs[@]}"; do
+    curl -fsS "${AUTH[@]}" -T "$WORK/small.txt" "$DAV/${d// /%20}/walk-probe.txt" >/dev/null \
+      || fail "could not upload walk-probe.txt into $d"
+    found=0
+    for _ in $(seq 1 30); do
+        if [ -e "$MNT/$d/walk-probe.txt" ]; then found=1; break; fi
+        sleep 1
+    done
+    [ "$found" = 1 ] || fail "the sync walk never found a file added on the server in $d"
+done
+ok "the sync walk found server-side changes in: ${walk_dirs[*]}"
 
 # --- 14. The IPC socket: full read+write lifecycle over `wusel serve` -------
 # The macOS File Provider frontend will speak this socket, not FUSE. Prove both

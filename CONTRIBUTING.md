@@ -48,4 +48,4 @@ response times you can expect.
 you are welcome here.
 
 The full version is the **Contributing** page in the documentation
-(`documentation/modules/ROOT/pages/contributing.adoc`).
+(`documentation/modules/ROOT/pages/project/contributing.adoc`).

@@ -19,6 +19,7 @@
 //!
 //! This crate builds and tests natively on Linux and macOS — no FUSE, no kernel module.
 
+pub mod activity;
 pub mod auth;
 pub mod capabilities;
 pub mod config;
@@ -40,6 +41,7 @@ pub mod search;
 pub mod state;
 pub mod storage;
 pub mod tls;
+pub mod web;
 pub mod webdav;
 
 pub use error::{Error, Result};

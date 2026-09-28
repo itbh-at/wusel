@@ -39,7 +39,8 @@ use wusel_fsm::{
 use crate::content::ContentSource;
 use crate::provider::FileState;
 use crate::provider::{
-    child_path, read_range_from_scratch, run_conflict_resolution, run_reload_dir, WriteContext,
+    child_path, read_range_from_scratch, run_conflict_resolution, run_refresh_beside,
+    run_reload_dir, WriteContext,
 };
 
 use crate::state::{NodeRow, StateDb};
@@ -681,6 +682,7 @@ impl Substrate {
             Arc::clone(&net),
             answers_tx,
             ctx.async_upload,
+            ctx.write.as_ref().map(|w| Arc::clone(&w.activity)),
             done_tx.clone(),
         ));
 
@@ -1278,6 +1280,9 @@ enum Deliver {
 /// tree walk cannot turn into a backlog measured in hours.
 const MAX_REFRESH_BACKLOG: usize = 64;
 
+// Each argument is a separate handle the thread takes over at spawn; a struct
+// holding them would exist only to be destructured again on the first line.
+#[allow(clippy::too_many_arguments)]
 fn spawn_decider(
     self_tx: Sender<Event>,
     events: Receiver<Event>,
@@ -1285,6 +1290,7 @@ fn spawn_decider(
     net: Arc<NetQueue>,
     answers: Sender<Answered>,
     async_upload: bool,
+    activity: Option<Arc<crate::activity::Activity>>,
     done: Sender<()>,
 ) -> JoinHandle<()> {
     std::thread::Builder::new()
@@ -1395,6 +1401,13 @@ fn spawn_decider(
                     }
                     Event::Stop => return,
                 };
+
+                // Before anything is dispatched: a flow counts as busy from
+                // before its first server request, so a listing beside the
+                // machine can tell it was running (see `crate::activity`).
+                if let Some(activity) = &activity {
+                    activity.set_busy(machine.changing_objects().map(|o| o.0));
+                }
 
                 for action in actions {
                     match action {
@@ -1509,7 +1522,12 @@ where
             // signal shutdown waits for (see [`SHUTDOWN_GRACE`]).
             let _done = done;
             while let Some(d) = next() {
-                let (completion, payload) = worker.run(&d.job);
+                let (completion, payload) = match (&d.deliver, &d.job) {
+                    (Deliver::Detached, Job::ListRemote { object }) => {
+                        worker.refresh_beside(*object)
+                    }
+                    _ => worker.run(d.object, &d.job),
+                };
                 let event = match d.deliver {
                     Deliver::Detached => {
                         // The work was the point; the answer is nobody's. Report
@@ -1578,6 +1596,7 @@ fn job_name(job: &Job) -> &'static str {
         Job::ReadState { .. } => "read-state",
         Job::RecordVersion { .. } => "record-version",
         Job::RecordMtime { .. } => "record-mtime",
+        Job::RecordExec { .. } => "record-exec",
         Job::InsertNode { .. } => "insert-node",
         Job::RemoveRows { .. } => "remove-rows",
         Job::MoveRows { .. } => "move-rows",
@@ -1713,12 +1732,12 @@ impl Worker {
         Ok(())
     }
 
-    /// Carry out one job.
+    /// Carry out one job for the flow running on `holder`.
     ///
     /// No catch-all arm, deliberately: a job added later must be placed here by
     /// hand, and the compiler names this spot. A silently mishandled step would
     /// surface as a request that never returns.
-    fn run(&mut self, job: &Job) -> (Completion, Payload) {
+    fn run(&mut self, holder: ObjectId, job: &Job) -> (Completion, Payload) {
         match job {
             Job::ReadNode { object } => self.read_node(*object),
             Job::ReadChild { parent, name } => match self.db.child_by_name(parent.0, name) {
@@ -1737,6 +1756,10 @@ impl Worker {
                 Err(e) => failed(job, &e),
             },
             Job::RecordMtime { object, mtime } => match self.db.set_mtime(object.0, *mtime) {
+                Ok(()) => (Completion::Done, Payload::None),
+                Err(e) => failed(job, &e),
+            },
+            Job::RecordExec { object, exec } => match self.db.set_exec(object.0, *exec) {
                 Ok(()) => (Completion::Done, Payload::None),
                 Err(e) => failed(job, &e),
             },
@@ -1772,7 +1795,12 @@ impl Worker {
                     Err(e) => failed(job, &e),
                 }
             }
-            Job::InsertNode { parent, name, dir } => {
+            Job::InsertNode {
+                parent,
+                name,
+                dir,
+                exec,
+            } => {
                 if *dir {
                     // A directory has to exist on the server before anything can
                     // be put in it, so it is never merely local.
@@ -1783,8 +1811,15 @@ impl Worker {
                 } else if self.child_is_trash(*parent, name) {
                     (Completion::Failed(Failure::NotWritable), Payload::None)
                 } else {
-                    match self.db.insert_local_file(parent.0, name) {
-                        Ok(_) => (Completion::Done, Payload::None),
+                    let inserted = self.db.insert_local_file(parent.0, name).and_then(|row| {
+                        if *exec {
+                            self.db.set_exec(row.inode, true)
+                        } else {
+                            Ok(())
+                        }
+                    });
+                    match inserted {
+                        Ok(()) => (Completion::Done, Payload::None),
                         Err(e) => failed(job, &e),
                     }
                 }
@@ -1815,6 +1850,14 @@ impl Worker {
                     if let Err(e) = self.pins.rename(&from, &to) {
                         tracing::error!(%e, %from, %to,
                             "renamed, but the pin did not follow — re-pin the new path");
+                    }
+                    // An upload still owed for this file — one that failed and
+                    // waits for its retry — follows the name as well, so
+                    // `wusel status` shows it under the name it has now. The
+                    // retry itself reads the live row, so this is the record
+                    // only; a failure here is not worth failing the rename for.
+                    if let Err(e) = self.db.move_pending_upload(*object, &to) {
+                        tracing::debug!(%e, %to, "renamed, but the pending-upload record kept its old path");
                     }
                     (Completion::Done, Payload::None)
                 }
@@ -1869,7 +1912,7 @@ impl Worker {
                 precondition,
                 mtime,
             } => self.upload(*object, *size, precondition, *mtime),
-            Job::ResolveConflict { object } => self.resolve_conflict(*object),
+            Job::ResolveConflict { object, base_etag } => self.resolve_conflict(*object, base_etag),
             Job::HydrateBuffer { object } => match self.hydrate_buffer(*object) {
                 Ok(()) => (Completion::Done, Payload::None),
                 Err(e) => failed(job, &e),
@@ -1894,7 +1937,7 @@ impl Worker {
             } => self.fetch(*object, *offset, *len),
             // Steps that later phases wire. Reported as a failure rather than
             // silently succeeding.
-            Job::ListRemote { object } => match self.list_remote(*object) {
+            Job::ListRemote { object } => match self.list_remote(holder, *object) {
                 Ok(()) => (Completion::Listed, Payload::None),
                 Err(e) => failed(job, &e),
             },
@@ -2021,7 +2064,13 @@ impl Worker {
             size: node.size,
             blob_current: self.content.is_cached(node),
             stale_copy_ok: self.stale_copy_ok(node),
-            materialised: node.file_id.is_some(),
+            // On the server by id, or by a version our own upload recorded. A
+            // local-only row has neither (`insert_local_file` leaves both empty),
+            // so a recorded ETag without an id can only mean an upload of ours
+            // landed and the listing that would have named it has not — and the
+            // next save must treat the file as there, not as a stranger's.
+            materialised: node.file_id.is_some() || !node.etag.is_empty(),
+            identified: node.file_id.is_some(),
             ignored: crate::ignore::is_ignored(&node.name, &self.ignore_patterns),
             children_loaded: self.db.children_loaded(node.inode).unwrap_or(false),
             listing_stale: self
@@ -2307,7 +2356,7 @@ impl Worker {
 
     /// The 412 sub-script: merge if we can, otherwise park the bytes beside the
     /// server's version. One implementation, shared with the engine's own path.
-    fn resolve_conflict(&mut self, object: ObjectId) -> (Completion, Payload) {
+    fn resolve_conflict(&mut self, object: ObjectId, base_etag: &str) -> (Completion, Payload) {
         let Some(write) = self.write.clone() else {
             return failed_at("resolve-conflict", &"no write context");
         };
@@ -2321,7 +2370,7 @@ impl Worker {
             Ok(m) => m.len(),
             Err(e) => return failed_at("resolve-conflict", &e),
         };
-        match run_conflict_resolution(&write, &mut self.db, &node, &path, size) {
+        match run_conflict_resolution(&write, &mut self.db, &node, base_etag, &path, size) {
             // Whichever way it resolved, the bytes ended up safe.
             Ok(()) => {
                 write.desktop.set_status(crate::desktop::Status::Idle);
@@ -2342,10 +2391,23 @@ impl Worker {
             .ok_or_else(|| crate::Error::Other("this substrate has no network context".into()))
     }
 
-    /// List a directory on the server and reconcile it into the state.
-    fn list_remote(&mut self, object: ObjectId) -> crate::Result<()> {
+    /// List a directory on the server and reconcile it into the state, for
+    /// the flow running on `holder`.
+    fn list_remote(&mut self, holder: ObjectId, object: ObjectId) -> crate::Result<()> {
         let ctx = self.write_ctx()?;
-        run_reload_dir(&ctx, &mut self.db, object.0)
+        run_reload_dir(&ctx, &mut self.db, object.0, holder.0)
+    }
+
+    /// The background refresh: the same listing, run beside the machine, so it
+    /// must stay away from a directory the machine is changing.
+    fn refresh_beside(&mut self, object: ObjectId) -> (Completion, Payload) {
+        let listed = self
+            .write_ctx()
+            .and_then(|ctx| run_refresh_beside(&ctx, &mut self.db, object.0));
+        match listed {
+            Ok(()) => (Completion::Listed, Payload::None),
+            Err(e) => failed(&Job::ListRemote { object }, &e),
+        }
     }
 
     /// Fill the read cache with the object's current content.

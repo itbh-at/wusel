@@ -76,9 +76,9 @@ xref:how-to/install-a-package.adoc[Install a package] has the remaining routes.
 That is the only step where your distribution matters. Everything below is the
 same everywhere.
 
-Nothing GNOME is pulled in. The Nautilus extension and the Shell search provider
-are *suggested*, not required, so your package manager leaves them out — you get
-the mount and about five packages.
+No GNOME desktop is pulled in. The mount needs no desktop: `wusel` brings
+`fuse3` and nothing else, about four packages. The GNOME Files integration is a
+separate package, `wusel-nautilus`, which you do not need here.
 
 == Step 2 — Log in to your Nextcloud
 
@@ -91,7 +91,9 @@ It prints a URL. Open it, confirm in the browser, and come back to the terminal.
 You should see:
 
 ----
-✓ Logged in as <you> on <server>
+✓ Logged in as '<you>' on <server>
+  app password stored in the OS keyring
+  server: Nextcloud <version>
 ----
 
 Your real account password is never sent to Wusel. What it received is a
@@ -159,7 +161,7 @@ wusel ipc stat /Some.txt
 ----
 
 The `state` field reads `cached`. Before you read the file it would have said
-`online-only`. xref:reference/file-states.adoc[File states] lists all five
+`online-only`. xref:reference/file-states.adoc[File states] lists all eight
 values — this is the same answer GNOME's emblems are drawn from, over the same
 socket a Dolphin or Thunar plugin would use.
 
@@ -193,7 +195,7 @@ That file is now downloaded and exempt from eviction: readable with the network
 off. `wusel pin Documents` does the same for a whole folder, recursively, and
 `wusel unpin` releases it. `wusel pins` lists what you have pinned.
 
-On GNOME this is a right-click action. Here it is the command, and the command
+On GNOME this is a right-click menu entry. Here it is the command, and the command
 is the same thing the menu calls.
 
 == Step 7 — Watch what it is doing
@@ -212,8 +214,10 @@ web interface — or from your phone — and watch it react.
 
 If your server has the
 https://apps.nextcloud.com/apps/notify_push[`notify_push`] app, remote changes
-arrive within moments; without it, Wusel catches up within half a minute or so.
-Either way `ls ~/Wusel` shows the new state immediately.
+arrive within moments. Without it, Wusel re-lists a folder you open once its
+listing is older than half a minute, and checks the whole tree every five
+minutes. A file added or removed on the server shows in a file-manager window
+that is already open once you reload it.
 
 == Step 8 — If you are on KDE, exclude the mount from Baloo
 

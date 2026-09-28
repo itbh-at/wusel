@@ -1,0 +1,22 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 IT Beratung Hermann GmbH
+
+# On a real removal (not an upgrade) remove the cloud-provider registrations the
+# *binary* wrote at runtime for named accounts — the package never owned those,
+# so dpkg would otherwise leave them orphaned in /usr. The default account's
+# file is packaged and already gone with the rest. Mirrors the RPM's %postun.
+set -e
+
+case "$1" in
+    remove|purge)
+        rm -f /usr/share/applications/org.freedesktop.CloudProviders.wusel.*.desktop
+        if command -v update-desktop-database >/dev/null 2>&1; then
+            update-desktop-database /usr/share/applications >/dev/null 2>&1 || true
+        fi
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

@@ -40,8 +40,8 @@ tooling shows up as `error: linker 'cc' not found` — that is this step, not a
 bug.
 
 To build the Nautilus extension as well, add its development files:
-`nautilus-devel glib2-devel gcc make` on RPM-based systems,
-`libnautilus-extension-dev libglib2.0-dev gcc make` on Debian-based ones.
+`nautilus-devel glib2-devel gtk4-devel gcc make` on RPM-based systems,
+`libnautilus-extension-dev libglib2.0-dev libgtk-4-dev gcc make` on Debian-based ones.
 
 == 2. The toolchain
 
@@ -95,7 +95,7 @@ From here it is an ordinary command — `wusel login …`, `wusel mount` — wit
 
 == 5. Optional: the Nautilus extension
 
-The packages ship this; a source build does not. Building it by hand:
+The `wusel-nautilus` package ships this; a source build does not. Building it by hand:
 
 [source,sh]
 ----
@@ -106,7 +106,8 @@ nautilus -q           # restart Nautilus so it loads the extension
 ----
 
 `make install` also refreshes the icon cache; `make uninstall` removes both.
-`wusel` must be on the `PATH` for the menu actions to work. The `.so` is tied to
+The menu actions run `wusel`: the extension looks for it on Nautilus's `PATH`,
+then in `/usr/local/bin`, `/usr/bin` and `~/.local/bin`. The `.so` is tied to
 the Nautilus major version, so it is built against the Nautilus you have.
 
 The GNOME Shell search provider is registered separately, from

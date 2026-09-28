@@ -69,11 +69,12 @@ pub enum Step {
     LookChild,
     // State — what an emblem should show.
     StateRead,
-    // SetAttr — resize the buffer, set the mtime, or both.
+    // SetAttr — resize the buffer, set the mtime, the executable bit.
     AttrNode,
     AttrPrepare,
     AttrTruncate,
     AttrMtime,
+    AttrExec,
     AttrFinal,
     // Enumerate — list a directory.
     EnumNode,
@@ -97,15 +98,21 @@ pub enum Step {
     PubClear,
     PubError,
     PubDiscard,
-    // Remove.
+    // Remove — on the parent: resolve the child, hand the delete over.
     RemNode,
+    // Delete — on the child: the delete itself.
+    DelNode,
     RemRemote,
     RemBuffer,
     RemRows,
-    // Move.
+    // Move — on the parent: resolve the child, hand the move over.
     MovNode,
+    // Relocate — on the child: the move itself.
+    RelNode,
     MovRemote,
     MovRows,
+    // A Remove or Move parked on its parent while the hand-over runs.
+    Handover,
     // Refresh — the server said this changed.
     RefNode,
     RefHydrate,
@@ -130,6 +137,11 @@ pub enum Next {
     /// The flow was given up. Nobody is waiting any more, so there is nothing
     /// to answer — the object is simply released.
     Abandoned,
+    /// The work continues as `intent` on **another** object. Everyone waiting
+    /// here is handed over to that flow and answered by it; this flow stays
+    /// parked, keeping its own object busy, until the hand-over ends. See
+    /// [`Intent::Relocate`] for the one place this is used and why.
+    Handoff { object: ObjectId, intent: Intent },
 }
 
 /// Begin a script.
@@ -156,7 +168,7 @@ pub fn start(object: ObjectId, intent: Intent, waiter: RequestId, facts: &Facts)
         ),
         Intent::SetAttr { .. } => (Step::AttrNode, Next::Do(Job::ReadNode { object })),
         Intent::Enumerate => (Step::EnumNode, Next::Do(Job::ReadNode { object })),
-        Intent::Materialise { name, dir } => {
+        Intent::Materialise { name, dir, exec } => {
             if *dir {
                 // A directory has to exist on the server before anything can be
                 // put into it, so it is created there first.
@@ -177,6 +189,7 @@ pub fn start(object: ObjectId, intent: Intent, waiter: RequestId, facts: &Facts)
                         parent: object,
                         name: name.clone(),
                         dir: false,
+                        exec: *exec,
                     }),
                 )
             }
@@ -198,6 +211,10 @@ pub fn start(object: ObjectId, intent: Intent, waiter: RequestId, facts: &Facts)
                 name: from_name.clone(),
             }),
         ),
+        // Keyed on the object itself, so they read its own row — afresh, because
+        // they may have waited behind an upload that changed what that row says.
+        Intent::Relocate { .. } => (Step::RelNode, Next::Do(Job::ReadNode { object })),
+        Intent::Delete { .. } => (Step::DelNode, Next::Do(Job::ReadNode { object })),
         Intent::Refresh => (Step::RefNode, Next::Do(Job::ReadNode { object })),
         Intent::Relist => (Step::RelistRemote, Next::Do(Job::ListRemote { object })),
     };
@@ -210,6 +227,33 @@ pub fn start(object: ObjectId, intent: Intent, waiter: RequestId, facts: &Facts)
         carry: Carry::default(),
     };
     (flow, next)
+}
+
+/// The executable bit a `SetAttr` actually records. A directory's `x` is
+/// "may be entered", which is the server's permissions to decide and not a
+/// preference we could keep, so on a directory it is dropped.
+fn attr_exec(exec: Option<bool>, dir: bool) -> Option<bool> {
+    exec.filter(|_| !dir)
+}
+
+/// The last change a `SetAttr` makes, if it asks for one: the executable bit.
+/// Otherwise the row is read back, so the caller is answered with what the
+/// attributes actually became rather than what was asked for.
+///
+/// Takes the step rather than the flow: the caller is still borrowing the
+/// flow's intent, and disjoint fields are what the borrow checker lets both
+/// borrows coexist on.
+fn attr_exec_or_final(step: &mut Step, object: ObjectId, exec: Option<bool>, dir: bool) -> Next {
+    match attr_exec(exec, dir) {
+        Some(exec) => {
+            *step = Step::AttrExec;
+            Next::Do(Job::RecordExec { object, exec })
+        }
+        None => {
+            *step = Step::AttrFinal;
+            Next::Do(Job::ReadNode { object })
+        }
+    }
 }
 
 /// The three ways a publish ends before it begins.
@@ -398,7 +442,7 @@ pub fn advance(mut flow: Flow, completion: Completion, facts: &Facts) -> (Flow, 
 
         // --- SetAttr --------------------------------------------------------
         Step::AttrNode => match (completion, &flow.intent) {
-            (Completion::Node(n), Intent::SetAttr { size, mtime }) => {
+            (Completion::Node(n), Intent::SetAttr { size, mtime, exec }) => {
                 // As in the write path: the version this change starts from is
                 // the precondition its upload will assert. A truncate that
                 // forgets it turns every later save into an unconditional
@@ -429,9 +473,13 @@ pub fn advance(mut flow: Flow, completion: Completion, facts: &Facts) -> (Flow, 
                 } else if let Some(mtime) = *mtime {
                     flow.step = Step::AttrMtime;
                     Next::Do(Job::RecordMtime { object, mtime })
+                } else if let Some(exec) = attr_exec(*exec, n.dir) {
+                    flow.step = Step::AttrExec;
+                    Next::Do(Job::RecordExec { object, exec })
                 } else {
-                    // Everything else is accepted as a no-op, so the caller is
-                    // answered with the attributes it already has.
+                    // Everything else — the other mode bits, an owner, a
+                    // directory's mode — is accepted as a no-op, so the caller
+                    // is answered with the attributes it already has.
                     flow.step = Step::AttrFinal;
                     Next::Done
                 }
@@ -447,21 +495,22 @@ pub fn advance(mut flow: Flow, completion: Completion, facts: &Facts) -> (Flow, 
             _ => wrong_completion(),
         },
         Step::AttrTruncate => match &flow.intent {
-            Intent::SetAttr { mtime, .. } => match *mtime {
+            Intent::SetAttr { mtime, exec, .. } => match *mtime {
                 Some(mtime) => {
                     flow.step = Step::AttrMtime;
                     Next::Do(Job::RecordMtime { object, mtime })
                 }
-                None => {
-                    flow.step = Step::AttrFinal;
-                    Next::Do(Job::ReadNode { object })
-                }
+                None => attr_exec_or_final(&mut flow.step, object, *exec, flow.carry.node.dir),
             },
             _ => wrong_completion(),
         },
-        Step::AttrMtime => {
-            // Read the row back, so the caller is answered with what the
-            // attributes actually became rather than what was asked for.
+        Step::AttrMtime => match &flow.intent {
+            Intent::SetAttr { exec, .. } => {
+                attr_exec_or_final(&mut flow.step, object, *exec, flow.carry.node.dir)
+            }
+            _ => wrong_completion(),
+        },
+        Step::AttrExec => {
             flow.step = Step::AttrFinal;
             Next::Do(Job::ReadNode { object })
         }
@@ -619,7 +668,10 @@ pub fn advance(mut flow: Flow, completion: Completion, facts: &Facts) -> (Flow, 
                 // sub-script merges, or parks our bytes under a second name —
                 // it never drops them.
                 flow.step = Step::PubConflict;
-                Next::Do(Job::ResolveConflict { object })
+                Next::Do(Job::ResolveConflict {
+                    object,
+                    base_etag: facts.base_etag.clone(),
+                })
             }
             _ => wrong_completion(),
         },
@@ -628,14 +680,13 @@ pub fn advance(mut flow: Flow, completion: Completion, facts: &Facts) -> (Flow, 
             Next::Do(Job::StoreBlob { object })
         }
         Step::PubStore => {
-            if flow.carry.node.materialised {
+            if flow.carry.node.identified {
                 flow.step = Step::PubClear;
                 Next::Do(Job::ClearPending { object })
             } else {
-                // It had no server identity before this upload. Re-listing the
-                // parent is what gives the row its server-assigned file id —
-                // without which a later rename or delete would think the object
-                // exists only locally.
+                // Its server id is not known yet — a first upload, or an earlier
+                // one whose relist failed. Re-listing the parent is what gives the
+                // row that id.
                 flow.step = Step::PubReload;
                 Next::Do(Job::ListRemote {
                     object: flow.carry.node.parent,
@@ -657,23 +708,47 @@ pub fn advance(mut flow: Flow, completion: Completion, facts: &Facts) -> (Flow, 
         Step::PubDiscard => Next::Done,
 
         // --- Remove --------------------------------------------------------
+        //
+        // Like Move: keyed on the parent, so it cannot see an upload of the file
+        // still in flight. Dropping the rows underneath that upload let it land
+        // anyway and bring the file back. So this only resolves the child and
+        // hands the delete over to it (see `Intent::Delete`), parking the parent.
         Step::RemNode => match completion {
             Completion::Node(n) => {
-                let child = n.id;
-                let materialised = n.materialised;
-                let found = n.found;
+                if n.found {
+                    let child = n.id;
+                    flow.carry.node = n;
+                    flow.step = Step::Handover;
+                    Next::Handoff {
+                        object: child,
+                        intent: Intent::Delete {
+                            from_parent: object,
+                        },
+                    }
+                } else {
+                    Next::Fail(Failure::NotFound)
+                }
+            }
+            _ => wrong_completion(),
+        },
+        // Runs on the child, behind anything it was already doing — so an
+        // upload in flight has landed by now, and the row says so.
+        Step::DelNode => match completion {
+            Completion::Node(n) => {
+                let (found, materialised) = (n.found, n.materialised);
                 flow.carry.node = n;
                 if !found {
+                    // Gone already, while this waited its turn.
                     Next::Fail(Failure::NotFound)
                 } else if materialised {
                     flow.step = Step::RemRemote;
-                    Next::Do(Job::DeleteRemote { object: child })
+                    Next::Do(Job::DeleteRemote { object })
                 } else {
                     // Never published, so there is nothing on the server to
                     // delete — a created-and-deleted temp file costs no
                     // round-trip at all.
                     flow.step = Step::RemBuffer;
-                    Next::Do(Job::DiscardBuffer { object: child })
+                    Next::Do(Job::DiscardBuffer { object })
                 }
             }
             _ => wrong_completion(),
@@ -693,6 +768,15 @@ pub fn advance(mut flow: Flow, completion: Completion, facts: &Facts) -> (Flow, 
         Step::RemRows => Next::Done,
 
         // --- Move ----------------------------------------------------------
+        //
+        // The kernel names a rename by (parent, name), so this flow runs on the
+        // parent and cannot see what the file itself is doing — above all an
+        // upload of it still in flight, which reads the file's path when it
+        // starts. Deciding and moving here raced that upload: the rows moved
+        // underneath it and the bytes landed under the old name. So this flow
+        // only resolves the child and hands the move over to it (see
+        // `Intent::Relocate`); the parent stays parked meanwhile, as the kernel
+        // itself keeps the directory locked for the length of a rename.
         Step::MovNode => match (completion, &flow.intent) {
             (
                 Completion::Node(n),
@@ -700,16 +784,51 @@ pub fn advance(mut flow: Flow, completion: Completion, facts: &Facts) -> (Flow, 
                     to_parent, to_name, ..
                 },
             ) => {
-                let child = n.id;
+                if n.found {
+                    let child = n.id;
+                    let intent = Intent::Relocate {
+                        from_parent: object,
+                        to_parent: *to_parent,
+                        to_name: to_name.clone(),
+                    };
+                    flow.carry.node = n;
+                    flow.step = Step::Handover;
+                    Next::Handoff {
+                        object: child,
+                        intent,
+                    }
+                } else {
+                    Next::Fail(Failure::NotFound)
+                }
+            }
+            _ => wrong_completion(),
+        },
+        // Parked with nothing outstanding, so no completion can arrive here; the
+        // machine ends this flow when the hand-over does.
+        Step::Handover => wrong_completion(),
+
+        // --- Relocate ------------------------------------------------------
+        //
+        // Runs on the child, in its own queue — so by the time it starts, any
+        // upload of this file that was in flight has finished, and the row read
+        // here says where the file really is now.
+        Step::RelNode => match (completion, &flow.intent) {
+            (
+                Completion::Node(n),
+                Intent::Relocate {
+                    to_parent, to_name, ..
+                },
+            ) => {
                 let (found, materialised) = (n.found, n.materialised);
                 flow.carry.node = n;
                 let (to_parent, to_name) = (*to_parent, to_name.clone());
                 if !found {
+                    // Removed while this waited its turn.
                     Next::Fail(Failure::NotFound)
                 } else if materialised {
                     flow.step = Step::MovRemote;
                     Next::Do(Job::MoveRemote {
-                        object: child,
+                        object,
                         to_parent,
                         to_name,
                     })
@@ -719,7 +838,7 @@ pub fn advance(mut flow: Flow, completion: Completion, facts: &Facts) -> (Flow, 
                     // office-suite atomic save.
                     flow.step = Step::MovRows;
                     Next::Do(Job::MoveRows {
-                        object: child,
+                        object,
                         to_parent,
                         to_name,
                     })
@@ -728,15 +847,13 @@ pub fn advance(mut flow: Flow, completion: Completion, facts: &Facts) -> (Flow, 
             _ => wrong_completion(),
         },
         Step::MovRemote => match &flow.intent {
-            Intent::Move {
+            Intent::Relocate {
                 to_parent, to_name, ..
             } => {
                 let (to_parent, to_name) = (*to_parent, to_name.clone());
                 flow.step = Step::MovRows;
                 Next::Do(Job::MoveRows {
-                    // The child the first step resolved — never the parent this
-                    // flow is keyed on.
-                    object: flow.carry.node.id,
+                    object,
                     to_parent,
                     to_name,
                 })
@@ -819,6 +936,8 @@ fn write_bytes(intent: &Intent, object: ObjectId) -> Next {
         | Intent::Publish
         | Intent::Remove { .. }
         | Intent::Move { .. }
+        | Intent::Relocate { .. }
+        | Intent::Delete { .. }
         | Intent::Refresh
         | Intent::Lookup { .. }
         | Intent::State

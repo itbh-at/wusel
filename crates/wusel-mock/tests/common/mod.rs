@@ -473,17 +473,23 @@ impl Engine {
     }
 
     pub fn create(&self, parent: u64, name: &str) -> Result<NodeRow, Outcome> {
-        self.made(parent, name, false)
+        self.made(parent, name, false, false)
+    }
+
+    /// `open(O_CREAT, 0755)`: a file created executable.
+    pub fn create_exec(&self, parent: u64, name: &str) -> Result<NodeRow, Outcome> {
+        self.made(parent, name, false, true)
     }
 
     pub fn mkdir(&self, parent: u64, name: &str) -> Result<NodeRow, Outcome> {
-        self.made(parent, name, true)
+        self.made(parent, name, true, false)
     }
 
-    fn made(&self, parent: u64, name: &str, dir: bool) -> Result<NodeRow, Outcome> {
+    fn made(&self, parent: u64, name: &str, dir: bool, exec: bool) -> Result<NodeRow, Outcome> {
         let intent = Intent::Materialise {
             name: name.to_string(),
             dir,
+            exec,
         };
         match self.run(parent, intent) {
             (Outcome::Ok, Payload::Node(n)) => Ok(*n),
@@ -526,6 +532,7 @@ impl Engine {
             Intent::SetAttr {
                 size: Some(size),
                 mtime: None,
+                exec: None,
             },
         ) {
             (Outcome::Ok, _) => Ok(()),
@@ -539,9 +546,27 @@ impl Engine {
             Intent::SetAttr {
                 size: None,
                 mtime: Some(mtime),
+                exec: None,
             },
         ) {
             (Outcome::Ok, _) => Ok(()),
+            (other, _) => Err(other),
+        }
+    }
+
+    /// `chmod`, as far as the engine keeps it: the executable bit. Answers
+    /// with the attributes the change produced.
+    pub fn set_exec(&self, ino: u64, exec: bool) -> Result<NodeRow, Outcome> {
+        match self.run(
+            ino,
+            Intent::SetAttr {
+                size: None,
+                mtime: None,
+                exec: Some(exec),
+            },
+        ) {
+            (Outcome::Ok, Payload::Node(n)) => Ok(*n),
+            (Outcome::Ok, _) => Err(Outcome::Failed(wusel_fsm::Failure::Io)),
             (other, _) => Err(other),
         }
     }

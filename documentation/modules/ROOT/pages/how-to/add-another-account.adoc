@@ -43,14 +43,16 @@ wusel accounts                  # list them
 wusel account remove work       # delete a named profile
 ----
 
-`remove` deletes that account's credentials, state and cache. The Nextcloud
-server is untouched.
+`remove` deletes that account's configuration directory (`config.toml`,
+`credentials.json`, `pins.json`), its app password in the OS keyring, its state
+and its cache. It does not unmount a running instance — stop that first — and it
+refuses the `default` account. The Nextcloud server is untouched.
 
 == Two rules
 
 Two accounts may not share or nest a mountpoint — Linux would over-mount and
-hide the first — so `mount` refuses to start where its target equals, contains,
-or sits inside another active mount.
+hide the first — so `mount` refuses to start where its target equals or
+contains any active mount, or sits inside another Wusel mount.
 
 Mounting the *same* server and user under two accounts is allowed but warned
 about: two read-write mounts of one account edit the same server files through

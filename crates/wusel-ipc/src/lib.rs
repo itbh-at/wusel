@@ -537,6 +537,7 @@ fn dispatch(
                 Intent::Materialise {
                     name,
                     dir: request.dir,
+                    exec: request.exec.unwrap_or(false),
                 },
             ) {
                 (Outcome::Ok, Payload::Node(node)) => {
@@ -605,6 +606,7 @@ fn dispatch(
                 Intent::SetAttr {
                     size: request.size,
                     mtime: request.mtime,
+                    exec: request.exec,
                 },
             ) {
                 (Outcome::Ok, Payload::Node(node)) => {
@@ -629,6 +631,19 @@ fn dispatch(
             Ok(()) => (Response::done(), None),
             Err(e) => (Response::error(pin_failure_kind(&e)), None),
         },
+        "update" => match driver.update(&request.path) {
+            Ok(count) => (Response::updated(count as u64), None),
+            Err(e) => (Response::error(pin_failure_kind(&e)), None),
+        },
+        "weburl" => {
+            // `reveal` rides in on the `flag` request field: the reveal link opens
+            // the parent folder with the item highlighted, the plain link opens the
+            // item itself.
+            match driver.web_url(&request.path, request.reveal) {
+                Ok(url) => (Response::web_url(url), None),
+                Err(_) => (Response::error(ErrorKind::NotFound), None),
+            }
+        }
         // An unknown op is the client's mistake, not a missing object.
         _ => (Response::error(ErrorKind::BadRequest), None),
     }
@@ -644,18 +659,18 @@ fn pin_state(driver: &Driver, node: &NodeRow) -> (bool, bool) {
     (pinned, stale)
 }
 
-/// Both decoration axes for the wire, asked of the engine exactly as the FUSE
-/// frontend asks them — one `Intent::State` round-trip carrying the sync state
-/// and the group-folder flag together, because they come from the same database
-/// read. That is the per-object cost a file manager pays for every visible
+/// Both decoration axes for the wire — one `Intent::State` round-trip carrying
+/// the sync state and the group-folder flag together, because they come from
+/// the same database read. That is the per-object cost a file manager pays for every visible
 /// file's emblem; a client offsets it with a cache the change stream keeps warm
 /// (see the status-protocol ADR under `explanation/`).
 ///
 /// The engine's state is an `Option` for a reason: a directory has no content of
 /// its own and so no emblem, yet it can still be a group-folder root. So a
 /// missing state falls to the neutral default while the kind travels regardless
-/// — which is the whole point of keeping the two axes apart. FUSE draws the same
-/// distinction by serving `user.wusel.state` and `user.wusel.kind` separately.
+/// — which is the whole point of keeping the two axes apart. The FUSE mount
+/// serves no extended attributes, so this socket is the only place a file
+/// manager reads either axis from.
 fn state_and_kind(driver: &Driver, node: &NodeRow) -> (Option<wire::SyncState>, wire::Kind) {
     use wusel_core::runtime::Payload;
     match driver.call(wusel_fsm::ObjectId(node.inode), Intent::State) {
@@ -704,6 +719,7 @@ fn node_response(
         stale,
         state,
         folder_kind,
+        node.exec,
     )
 }
 
@@ -747,6 +763,7 @@ fn entry_of(
         stale,
         state,
         folder_kind,
+        exec: node.exec,
     }
 }
 

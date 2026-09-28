@@ -161,20 +161,33 @@ targets:
           NSExtensionFileProviderDocumentGroup: $(WUSEL_APP_GROUP)
           NSExtensionFileProviderSupportsEnumeration: true
           # Finder right-click actions. The extension implements
-          # NSFileProviderCustomAction. Both actions are always offered
-          # (TRUEPREDICATE): a File Provider activation rule cannot read our pinned
-          # state (its predicate does not see the item's userInfo), so we cannot
-          # hide the irrelevant one — and pin/unpin are idempotent, so offering
-          # both is harmless. The Name is the localization key resolved from
-          # Localizable.strings (en/de) — a File Provider action name localizes
-          # through Localizable.strings, not InfoPlist.strings.
+          # NSFileProviderCustomAction. Each activation rule is evaluated over the
+          # selection as the collection `fileproviderItems`, reading the keys
+          # WuselItem publishes in `userInfo` (pinned, updatable, folder) — so the
+          # menu offers only what fits: pin *or* unpin, "Update Now" only where a
+          # pin is not kept, web actions on a single item, "Open Folder" on a file.
+          # Finder silently drops an action whose rule it cannot evaluate, so a
+          # wrong form shows as a missing entry, not an error. The Name is the
+          # localization key resolved from Localizable.strings (en/de).
           NSExtensionFileProviderActions:
             - NSExtensionFileProviderActionIdentifier: at.itbh.wusel.action.makeAvailableOffline
               NSExtensionFileProviderActionName: Make Available Offline
-              NSExtensionFileProviderActionActivationRule: TRUEPREDICATE
+              NSExtensionFileProviderActionActivationRule: 'SUBQUERY(fileproviderItems, $i, $i.userInfo.pinned != YES).@count > 0'
             - NSExtensionFileProviderActionIdentifier: at.itbh.wusel.action.removeOfflineAvailability
               NSExtensionFileProviderActionName: Remove Offline Availability
-              NSExtensionFileProviderActionActivationRule: TRUEPREDICATE
+              NSExtensionFileProviderActionActivationRule: 'SUBQUERY(fileproviderItems, $i, $i.userInfo.pinned == YES).@count > 0'
+            - NSExtensionFileProviderActionIdentifier: at.itbh.wusel.action.updateNow
+              NSExtensionFileProviderActionName: Update Now
+              NSExtensionFileProviderActionActivationRule: 'SUBQUERY(fileproviderItems, $i, $i.userInfo.updatable == YES).@count > 0'
+            - NSExtensionFileProviderActionIdentifier: at.itbh.wusel.action.openInNextcloud
+              NSExtensionFileProviderActionName: Open in Nextcloud
+              NSExtensionFileProviderActionActivationRule: 'fileproviderItems.@count == 1'
+            - NSExtensionFileProviderActionIdentifier: at.itbh.wusel.action.revealInNextcloud
+              NSExtensionFileProviderActionName: Open Folder in Nextcloud
+              NSExtensionFileProviderActionActivationRule: 'fileproviderItems.@count == 1 AND SUBQUERY(fileproviderItems, $i, $i.userInfo.folder == YES).@count == 0'
+            - NSExtensionFileProviderActionIdentifier: at.itbh.wusel.action.copyInternalLink
+              NSExtensionFileProviderActionName: Copy Internal Link
+              NSExtensionFileProviderActionActivationRule: 'fileproviderItems.@count == 1'
           # A Finder emblem for offline-available (pinned) items, so the user can
           # tell them apart from on-demand ones. The item lists this decoration's
           # identifier when pinned (see WuselItem / NSFileProviderItemDecorating);

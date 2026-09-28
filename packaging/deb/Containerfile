@@ -17,7 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         git ca-certificates \
         build-essential debhelper \
         cargo rustc \
-        libnautilus-extension-dev libglib2.0-dev libfuse3-dev pkgconf \
+        libnautilus-extension-dev libglib2.0-dev libgtk-4-dev libfuse3-dev pkgconf \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /work

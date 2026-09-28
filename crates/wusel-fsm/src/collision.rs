@@ -53,6 +53,12 @@ pub enum Collision {
 /// safe one: running in turn is always correct, merely sometimes slower than it
 /// had to be. Join and Abort are the optimisations, and they are opt-in per row
 /// precisely because getting them wrong loses work.
+///
+/// A row only protects anything if the two flows meet on the same object. A
+/// rename or a remove arrives keyed on the parent directory, while the upload
+/// and the refresh run on the file, so those rows are reached through
+/// [`Intent::Relocate`] and [`Intent::Delete`] — the form the operation takes
+/// once it has been handed to the file itself.
 #[must_use]
 pub fn collision(running: &Flow, arriving: &Intent, facts: &Facts) -> Collision {
     // Row 9 first, because it holds whatever is running: an unsaved local edit
@@ -85,6 +91,8 @@ pub fn collision(running: &Flow, arriving: &Intent, facts: &Facts) -> Collision 
             | Intent::Publish
             | Intent::Remove { .. }
             | Intent::Move { .. }
+            | Intent::Relocate { .. }
+            | Intent::Delete { .. }
             | Intent::Refresh
             | Intent::Lookup { .. }
             | Intent::State
@@ -104,6 +112,8 @@ pub fn collision(running: &Flow, arriving: &Intent, facts: &Facts) -> Collision 
             | Intent::Publish
             | Intent::Remove { .. }
             | Intent::Move { .. }
+            | Intent::Relocate { .. }
+            | Intent::Delete { .. }
             | Intent::Refresh
             | Intent::Lookup { .. }
             | Intent::State
@@ -124,6 +134,8 @@ pub fn collision(running: &Flow, arriving: &Intent, facts: &Facts) -> Collision 
             | Intent::Publish
             | Intent::Remove { .. }
             | Intent::Move { .. }
+            | Intent::Relocate { .. }
+            | Intent::Delete { .. }
             | Intent::Refresh
             | Intent::Lookup { .. }
             | Intent::State
@@ -144,6 +156,8 @@ pub fn collision(running: &Flow, arriving: &Intent, facts: &Facts) -> Collision 
             | Intent::Publish
             | Intent::Remove { .. }
             | Intent::Move { .. }
+            | Intent::Relocate { .. }
+            | Intent::Delete { .. }
             | Intent::Refresh
             | Intent::Lookup { .. }
             | Intent::State
@@ -162,6 +176,8 @@ pub fn collision(running: &Flow, arriving: &Intent, facts: &Facts) -> Collision 
             | Intent::Publish
             | Intent::Remove { .. }
             | Intent::Move { .. }
+            | Intent::Relocate { .. }
+            | Intent::Delete { .. }
             | Intent::Refresh
             | Intent::Lookup { .. }
             | Intent::State
@@ -172,7 +188,9 @@ pub fn collision(running: &Flow, arriving: &Intent, facts: &Facts) -> Collision 
         // A background refresh. It is speculative work by definition, so an
         // arrival that makes it pointless wins.
         Intent::Refresh => match arriving {
-            Intent::Remove { .. } => Collision::Abort,
+            // `Delete` is how a remove actually reaches the file being
+            // refreshed (see the note on reachability above).
+            Intent::Remove { .. } | Intent::Delete { .. } => Collision::Abort,
             Intent::Refresh => Collision::Skip, // at most one pending refresh
             Intent::Fetch { .. }
             | Intent::Write { .. }
@@ -181,6 +199,7 @@ pub fn collision(running: &Flow, arriving: &Intent, facts: &Facts) -> Collision 
             | Intent::Materialise { .. }
             | Intent::Publish
             | Intent::Move { .. }
+            | Intent::Relocate { .. }
             | Intent::Lookup { .. }
             | Intent::State
             | Intent::Relist
@@ -193,6 +212,8 @@ pub fn collision(running: &Flow, arriving: &Intent, facts: &Facts) -> Collision 
         | Intent::Materialise { .. }
         | Intent::Remove { .. }
         | Intent::Move { .. }
+        | Intent::Relocate { .. }
+        | Intent::Delete { .. }
         | Intent::Lookup { .. }
         | Intent::State
         | Intent::SetAttr { .. } => Collision::Queue,

@@ -119,8 +119,11 @@ WUSEL_NOTICE_JSON='{"kind":"upload-failed","severity":"error","path":"x","reason
 * The hook runs with a bounded timeout (currently 10 seconds); a script that
   hangs longer is killed, logged, and skipped for that notice — it never blocks
   a notice or the mount.
-* A missing script, a non-executable one, or a non-zero exit is logged and
-  otherwise has no effect — never a reason the mount stops working.
+* A missing or non-executable script is logged as a warning; a non-zero exit
+  is logged only at debug level (`RUST_LOG=wusel_desktop=debug`). None of them
+  has any other effect — never a reason the mount stops working.
+* The script's standard output and error are discarded. To see what it does,
+  have it write to a file or to `logger` itself.
 * The hook fires for every notice, with no built-in rate limiting beyond what
   already applies to notices themselves (e.g. one notice per hundreds of
   pinned files going stale together, not hundreds of hook invocations).

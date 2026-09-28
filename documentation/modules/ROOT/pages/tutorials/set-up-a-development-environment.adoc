@@ -46,8 +46,8 @@ sudo apt install build-essential pkg-config libfuse3-dev fuse3 gnome-keyring dbu
 ----
 
 If you plan to touch the file-manager extension, add its development files too:
-`nautilus-devel glib2-devel make` (RPM-based) or
-`libnautilus-extension-dev libglib2.0-dev make` (Debian-based).
+`nautilus-devel glib2-devel gtk4-devel make` (RPM-based) or
+`libnautilus-extension-dev libglib2.0-dev libgtk-4-dev make` (Debian-based).
 
 == Step 2 — The toolchain, via mise
 
@@ -122,13 +122,28 @@ mkdir -p /tmp/fake-cloud && echo hello > /tmp/fake-cloud/Some.txt
 mise run mock -- --root /tmp/fake-cloud
 ----
 
-In a second terminal, build with the mount compiled in, log in against the mock,
-and mount it:
+The mock serves the user `alice` at `http://127.0.0.1:8080` and accepts any
+password. It has no Login Flow v2, so `wusel login` cannot run against it;
+instead, write the credentials file that `login` would have written. Point the
+XDG directories at a scratch location first, so this stays apart from any real
+account you have.
+
+In a second terminal:
+
+[source,sh]
+----
+export XDG_CONFIG_HOME=/tmp/wusel-dev/config XDG_STATE_HOME=/tmp/wusel-dev/state XDG_CACHE_HOME=/tmp/wusel-dev/cache
+mkdir -p "$XDG_CONFIG_HOME/wusel"
+printf '{"server":"http://127.0.0.1:8080","loginName":"alice","appPassword":"x","in_keyring":false}\n' \
+  > "$XDG_CONFIG_HOME/wusel/credentials.json"
+chmod 600 "$XDG_CONFIG_HOME/wusel/credentials.json"
+----
+
+Then build with the mount compiled in, and mount:
 
 [source,sh]
 ----
 mise run build-fuse
-cargo run -p wusel -- login http://127.0.0.1:8080
 cargo run -p wusel --features fuse -- mount /tmp/mnt
 ----
 
@@ -153,10 +168,16 @@ Press kbd:[Ctrl+C] in the mount's terminal to unmount. If it is ever left stale,
 `fusermount3 -u /tmp/mnt`.
 
 Because the mock mirrors a real directory, staging a test case is `echo` and
-`rm` in `/tmp/fake-cloud` rather than writing XML. Two markers in a *filename*
-provoke behaviour that is otherwise hard to arrange: `*.fail-once` makes the
-first `PUT` answer 500, and `*.no-etag*` makes `PUT` and `MOVE` answer without
-an `ETag`.
+`rm` in `/tmp/fake-cloud` rather than writing XML. Markers in a *name* provoke
+behaviour that is otherwise hard to arrange:
+
+* `*.fail-once` — the first `PUT` answers 500, then it succeeds.
+* `*.fail-perm` — every `PUT` answers 403.
+* `*.no-etag*` — `PUT` and `MOVE` answer without an `ETag`.
+* `*.lost-once.*` — the first `PUT` lands, then answers 504.
+* `*.relist-fails` (a directory) — after the first `PUT` into it, its next
+  listing answers 503, once.
+* `*.proxy-403*` — a chunked upload assembles, but its final `MOVE` answers 403.
 
 == Step 6 — The full mount test
 
@@ -166,21 +187,30 @@ mise run fuse-test
 ----
 
 This mounts the whole stack against the in-process mock and drives it through
-the kernel — `ls`, `cat`, `stat`, `statfs`, unmount. It runs in a container,
-which is why it is not part of `mise run test`.
+the kernel — `ls`, `cat`, `stat`, `statfs`, unmount. The same run covers
+`wusel-desktop`'s D-Bus and notify-hook path, lints `wusel-fuse`, and checks the
+network-home relocation. It runs in a podman container with `/dev/fuse`, which
+is why it is not part of `mise run test` — and why it needs `podman` installed.
 
 == What to run before you push
 
 [source,sh]
 ----
 mise run fmt-check
+mise run headers-check
+mise run shellcheck
 mise run clippy
 mise run check
 mise run test
+mise run build-fuse
 ----
 
-These four are exactly what CI runs, through the same mise tasks and the same
+These seven are exactly what CI runs, through the same mise tasks and the same
 pinned toolchain — there is no separate CI script that can drift.
+
+`mise run setup-hooks` makes git do this for you: a `pre-commit` hook formats
+what you commit, and a `pre-push` hook runs the gate above — with `fuse-test`
+in place of `build-fuse` — before a branch is pushed.
 
 Two more exist for when they are relevant: `mise run e2e-local` drives the whole
 thing against a *real* Nextcloud in a container, and `mise run docs-diagrams`
@@ -196,6 +226,6 @@ a stale picture).
   intent, and why the deciding thread performs no I/O.
 * xref:reference/operation-scripts.adoc[Operation scripts] — which callback
   becomes which intent, one diagram per operation.
-* xref:project/contributing.adoc[Contributing] — branches, commit messages, and
-  what a merge request needs.
+* xref:project/contributing.adoc[Contributing] — what is expected of a
+  contribution, and what CI runs on it.
 ****

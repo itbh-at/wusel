@@ -256,6 +256,51 @@ impl Driver {
         self.provider().unpin(path).map(|_| ())
     }
 
+    /// Bring a pinned path's offline copy back in step with the server, in place.
+    /// Mirrors `wusel update`; returns how many files were re-fetched (0 if it was
+    /// already current). This is the "Update now" a frontend offers on a
+    /// `pinned-stale`/`pinned-pending` item.
+    ///
+    /// A path that is not pinned is a no-op (`Ok(0)`), not an error: the macOS
+    /// Finder action is offered when *any* selected item is due, so a mixed
+    /// selection also reaches items that are not pinned — those must do nothing
+    /// quietly rather than fail the whole action.
+    ///
+    /// # Errors
+    /// If the refresh cannot reach the server or the pin target does not resolve.
+    pub fn update(&self, path: &str) -> wusel_core::Result<usize> {
+        let mut provider = self.provider();
+        if !provider.is_pinned(path.trim_matches('/'))? {
+            return Ok(0);
+        }
+        provider.refresh(path)
+    }
+
+    /// The Nextcloud *web* URL for `path` — the object link (`…/f/<id>`, which
+    /// opens a file in the web viewer or navigates into a folder) or, with
+    /// `reveal`, the "show in its folder" link that opens the parent with the item
+    /// highlighted. Built from local metadata only (the object's file id plus the
+    /// instance base), so it is offline and instant — a frontend spawns it on a
+    /// menu click. Credentials never leave the engine: the frontend asks for the
+    /// finished string.
+    ///
+    /// # Errors
+    /// If `path` does not resolve, or has no file id yet (a deferred create not
+    /// flushed — nothing on the server to link to).
+    pub fn web_url(&self, path: &str, reveal: bool) -> wusel_core::Result<String> {
+        let node = self
+            .provider()
+            .resolve(path)?
+            .ok_or(wusel_core::Error::NotFound)?;
+        let file_id = node.file_id.ok_or(wusel_core::Error::NotFound)?;
+        let server = self.provider().server_url().to_string();
+        Ok(if reveal {
+            wusel_core::web::reveal_url(&server, file_id, &rooted_parent(path))
+        } else {
+            wusel_core::web::object_url(&server, file_id)
+        })
+    }
+
     /// Whether `path` is currently kept offline. A cheap read over the pin store,
     /// so a frontend can label its "make available offline" action.
     ///
@@ -301,5 +346,15 @@ impl Driver {
             }
         }
         Some(object)
+    }
+}
+
+/// The rooted, account-relative parent of `path`, for a reveal link's `?dir=`:
+/// `Docs/plan.txt` → `/Docs`, a name at the root → `/`. Mirrors the CLI's
+/// `parent_dir` so both frontends build the same link.
+fn rooted_parent(path: &str) -> String {
+    match path.trim_matches('/').rsplit_once('/') {
+        Some((parent, _)) => format!("/{parent}"),
+        None => "/".to_string(),
     }
 }

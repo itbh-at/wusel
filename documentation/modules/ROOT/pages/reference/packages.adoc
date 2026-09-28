@@ -4,11 +4,23 @@
 ////
 
 = Packages
-:description: Which package file is built for which distribution, what it depends on, and every file it installs.
+:description: Which packages are built for which distribution, what they depend on, and every file they install.
 
 Every `v*` tag builds packages for `x86_64` and `aarch64` and attaches them to a
 https://github.com/itbh-at/wusel/releases/latest[GitHub Release]. To actually
 install one, see xref:how-to/install-a-package.adoc[Install a package].
+
+Wusel comes as two packages:
+
+`wusel`:: the mount — the binary, the systemd user service, and the desktop
+  integration the binary provides itself over D-Bus: notifications, the Files
+  sidebar entry and the GNOME Shell search provider.
+`wusel-nautilus`:: the GNOME Files (Nautilus) integration — per-file emblems and
+  the *Wusel* context menu. It requires `wusel` of exactly the same version.
+
+Integration with a file manager is always its own package, named
+`wusel-<file manager>`, so a machine installs only the file-manager libraries
+it actually uses.
 
 == The repository
 
@@ -48,11 +60,13 @@ package manager verifies every package against it, and updates arrive with the
 rest of the system.
 
 Arch is not in the build service. The `PKGBUILD` under `packaging/aur/` builds
-locally; the AUR itself is a xref:project/roadmap.adoc[roadmap] item.
+on your machine, from the release tarball of the version in its `pkgver` —
+currently `0.2.2`, behind the other packages — not from the checkout it sits in.
+The AUR itself is a xref:project/roadmap.adoc[roadmap] item.
 
 == Single files, per release
 
-Every `v*` tag also attaches one package per format and architecture to its
+Every `v*` tag also attaches both packages, per format and architecture, to its
 https://github.com/itbh-at/wusel/releases/latest[GitHub Release]. These exist
 for machines that cannot add a repository, and for distributions the build
 service does not target.
@@ -61,12 +75,14 @@ service does not target.
 |===
 | File | Format | Built for
 
-| `wusel-<version>-1.fc44.<arch>.rpm`
+| `wusel-<version>-1.fc44.<arch>.rpm`,
+  `wusel-nautilus-<version>-1.fc44.<arch>.rpm`
 | RPM
 | Fedora 44. The `fc44` is not decoration — the package is linked against that
   release's libraries.
 
-| `wusel_<version>_<arch>_debian13.deb`
+| `wusel_<version>_<arch>_debian13.deb`,
+  `wusel-nautilus_<version>_<arch>_debian13.deb`
 | Debian package
 | Debian 13 (trixie), and Ubuntu releases close enough to it. A `.deb` filename
   carries no distribution of its own, which is why the target is spelled into
@@ -79,25 +95,40 @@ xref:how-to/install-from-source.adoc[Install from source].
 
 == Dependencies
 
-Only one dependency is stated outright:
+The mount needs no desktop. `wusel` states one dependency outright:
 
 `fuse3`:: for the setuid `fusermount3` helper that an unprivileged mount needs.
 
-The shared libraries the binary and the Nautilus extension link against are
-resolved automatically as soname dependencies, so they are not listed by name.
+The binary links only libc, libm and libgcc_s. Notifications, the sidebar entry
+and the search provider are the `wusel` binary speaking D-Bus, which it does
+without any library — the Shell activates the search provider on demand. So
+`wusel` brings `fuse3` and nothing else: about four packages on a minimal
+Fedora or Debian.
 
-The GNOME pieces — `nautilus` and `gnome-shell` — are *suggested*, not required
-and not recommended. Neither `dnf` nor `apt` installs a suggestion by default, so
-a server or a KDE machine gets the mount and about five packages, not a desktop
-stack. What such a machine loses is the sidebar entry, the emblems and the Shell
-search; the mount itself is unaffected. The search provider in particular links
-no GNOME library at all — it is the `wusel` binary answering D-Bus, which the
-Shell activates on demand.
+`wusel-nautilus` requires `wusel` of the same version and the libraries the
+extension links against — the Nautilus extension library and GLib — resolved
+automatically as soname dependencies. It brings only what Nautilus itself uses:
+two more packages on Fedora, nine more on a minimal Debian, none of them GTK.
+The extension is compiled against GTK but does not link it; the few clipboard
+calls it makes resolve inside Nautilus, which has GTK loaded.
 
-NOTE: Before 0.2.2 these were `Recommends`, which both package managers *do*
-install by default.
+`wusel` *suggests* `wusel-nautilus` and `gnome-shell` — not required and not
+recommended (on Arch, optional dependencies). Neither `dnf` nor `apt` installs
+a suggestion by default, so a server or a KDE machine gets the mount and no
+desktop stack. What such a machine loses is the emblems and the context menu;
+the mount itself is unaffected.
 
-== What a package installs
+The RPM subpackage also declares `Supplements: (wusel and nautilus)`: where
+Nautilus is installed, `dnf` and `zypper` install `wusel-nautilus` along with
+`wusel` on their own. Debian and Ubuntu have no such mechanism, so there
+`wusel-nautilus` is installed by name.
+
+NOTE: Before 0.2.2 the GNOME pieces were `Recommends`, which both package
+managers *do* install by default.
+
+== What the packages install
+
+=== `wusel`
 
 [cols="2,3",options="header"]
 |===
@@ -109,15 +140,6 @@ install by default.
 | `/usr/lib/systemd/user/wusel@.service`
 | The systemd *user* service template. One instance per account:
   `wusel@default`, `wusel@work`.
-
-| `/usr/lib*/nautilus/extensions-4/libwusel-nautilus.so`
-| The native Nautilus extension: per-file emblems and the *Make Available
-  Offline* / *Free Up Space* menu. Tied to the Nautilus major version, so it is
-  built against the target distribution's own Nautilus.
-
-| `/usr/share/icons/hicolor/scalable/emblems/wusel-emblem-*.svg`
-| The emblem icons the extension draws. See
-  xref:reference/file-states.adoc[File states].
 
 | `/usr/share/icons/hicolor/scalable/apps/at.itbh.Wusel.svg`
 | The full-colour application icon — the app-grid / launcher entry and the search
@@ -140,7 +162,37 @@ install by default.
 | `/usr/share/applications/org.freedesktop.CloudProviders.wusel.default.desktop`
 | The Files sidebar registration for the *default* account. Named accounts
   register their own with `wusel desktop install-provider`.
+
+| `/usr/share/licenses/wusel/LICENSE`, `/usr/share/doc/wusel/README.md`
+| Licence and README (RPM and Arch). The `.deb` ships
+  `/usr/share/doc/wusel/copyright` and its changelog instead.
 |===
+
+=== `wusel-nautilus`
+
+[cols="2,3",options="header"]
+|===
+| Path | What it is
+
+| `/usr/lib*/nautilus/extensions-4/libwusel-nautilus.so` (on Debian and Ubuntu
+  `/usr/lib/<triplet>/nautilus/extensions-4/`)
+| The native Nautilus extension: per-file emblems and a *Wusel* context submenu —
+  *Make Available Offline* / *Stop Keeping Offline*, *Update Now*, *Open in
+  Nextcloud*, *Open Folder in Nextcloud*, *Copy Internal Link*. Tied to the Nautilus major version, so it is
+  built against the target distribution's own Nautilus.
+
+| `/usr/share/icons/hicolor/scalable/emblems/wusel-emblem-*.svg`
+| The emblem icons the extension draws. See
+  xref:reference/file-states.adoc[File states].
+
+| `/usr/share/licenses/wusel-nautilus/LICENSE`
+| Licence (Arch). The `.deb` ships `/usr/share/doc/wusel-nautilus/copyright`
+  instead.
+|===
+
+Removing `wusel` — not upgrading it — also deletes the sidebar
+registrations `wusel desktop install-provider` wrote for named accounts, which
+the package never owned. All three formats do this.
 
 Nothing is installed into a home directory. Everything Wusel writes per user is
 created at run time; see

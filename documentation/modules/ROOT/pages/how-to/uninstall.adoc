@@ -13,19 +13,26 @@ leaves the mountpoint behind.
 [source,sh]
 ----
 systemctl --user disable --now wusel@default   # unmount now, and stop auto-mounting
-sudo dnf remove wusel                           # or: sudo apt remove wusel
+sudo dnf remove wusel wusel-nautilus            # or: sudo apt remove wusel wusel-nautilus
 ----
 
 Repeat the first line for every named account you enabled.
+
+On `dnf` and `apt`, removing `wusel` takes `wusel-nautilus` with it, because
+it depends on `wusel`; naming both does the same. On Arch, name both:
+`sudo pacman -R wusel wusel-nautilus`.
 
 Your Nextcloud is untouched throughout. Wusel only ever mounted it.
 
 == What removal takes with it
 
-Everything the package owns: the binary, the systemd unit template, the Nautilus
-extension and its emblem icons, the search provider, and the default account's
-sidebar registration. Sidebar registrations that Wusel wrote for *named*
-accounts are cleaned up too, by a removal scriptlet.
+Everything the packages own: the binary, the systemd unit template, the search
+provider and the default account's sidebar registration from `wusel`; the
+Nautilus extension and its emblem icons from `wusel-nautilus`. Sidebar registrations that Wusel wrote for *named*
+accounts
+(`/usr/share/applications/org.freedesktop.CloudProviders.wusel.*.desktop`) are
+cleaned up too, by the `wusel` package's removal scriptlet — the RPM's `%postun`, the
+DEB's `postrm`, the Arch package's `post_remove`.
 
 == What is deliberately left behind
 
@@ -34,6 +41,8 @@ Your per-user data:
 * `~/.config/wusel` — configuration, credentials and pins
 * `~/.local/state/wusel` — the state database
 * `~/.cache/wusel` — downloaded file contents
+* `/var/tmp/wusel-<uid>/` — the state database, if Wusel moved it there because
+  your home directory is on a network filesystem
 
 Packages never touch files in a home directory, and keeping these means a later
 reinstall picks up exactly where you left off, with no new login.
@@ -48,6 +57,7 @@ When you want a genuinely clean slate — reinstalling because something is brok
 systemctl --user disable --now wusel@default             # if not already done
 systemctl --user reset-failed 'wusel@*' 2>/dev/null || true
 rm -rf ~/.config/wusel ~/.local/state/wusel ~/.cache/wusel
+rm -rf /var/tmp/wusel-$(id -u)                           # only exists if the database was relocated
 secret-tool clear service wusel 2>/dev/null || true      # the app password in the keyring
 ----
 
@@ -77,14 +87,24 @@ This tidies it up even though the unit file is already gone.
 
 == A source install
 
-There is no package to remove. Disable the service, then delete the binary you
-installed and, if you built it, the Nautilus extension:
+There is no package to remove, and no scriptlet cleans up after you. Disable the
+service, then remove what you installed by hand — the sidebar registrations
+first, while the binary that removes them is still there:
 
 [source,sh]
 ----
 systemctl --user disable --now wusel@default
-sudo rm -f /usr/local/bin/wusel        # or ~/.local/bin/wusel
+rm -f ~/.config/systemd/user/wusel@.service      # the unit `wusel service enable` wrote
+systemctl --user daemon-reload
+sudo wusel desktop uninstall-provider            # add --account NAME for each named account
+sudo rm -f /usr/local/bin/wusel                  # or ~/.local/bin/wusel
 cd /path/to/wusel/integration/nautilus && sudo make uninstall
+sudo /path/to/wusel/integration/gnome-search/install.sh --uninstall
 ----
 
-Then the per-user data above, if you want it gone.
+Skip the lines for the pieces you never installed: the sidebar registration
+exists only if you ran `sudo wusel desktop install-provider`, the search
+provider only if you ran `integration/gnome-search/install.sh`.
+
+Then the per-user data above — including `/var/tmp/wusel-<uid>/` — if you want
+it gone.

@@ -22,20 +22,37 @@ A pyramid — we do not boot a Nextcloud for every run.
 * *Purpose-built fake servers (no Nextcloud, no mocking crate).* Protocols that
   are not WebDAV get a few lines of hand-rolled `tokio` server in the test itself:
   the `notify_push` websocket and the self-signed-TLS handshake. No HTTP-mocking
-  dependency is pulled in for this — see the dependency policy in
-  xref:explanation/architecture.adoc[Architecture].
+  dependency is pulled in for this: the project keeps third-party dependencies
+  to as few as possible.
 * *Standalone WebDAV mock (`wusel-mock`).* A tiny binary crate that serves a **real
   directory** as a Nextcloud-style user root (PROPFIND Depth 0/1, range GET, and the
   write verbs). It is pure Rust with a single dependency (`tokio`) — deliberately no
   Python and no mocking framework, to keep the project to one language and few
   dependencies. Because it mirrors a directory on disk, exercising change detection
   is just `echo`/`rm` in that directory, and fixtures are staged by creating files
-  rather than by writing XML. Two fault-injection markers in a file's *name* provoke
-  server behaviour that is otherwise hard to stage: `*.fail-once` (the first `PUT`
-  answers 500) and `*.no-etag*` (`PUT`/`MOVE` answer without an `ETag`). Start it
-  with `mise run mock` (`--root DIR`), point a mount at it, or let the integration
-  tests under `crates/wusel-mock/tests/` drive the real client against it — that is
-  where every server-facing engine test lives.
+  rather than by writing XML. Fault-injection markers in a file's *name* provoke
+  server behaviour that is otherwise hard to stage:
++
+--
+** `*.fail-once` — the first `PUT` answers 500, then it succeeds;
+** `*.fail-perm` — every `PUT` answers 403, a permanent refusal;
+** `*.no-etag*` — `PUT`/`MOVE` answer without an `ETag`;
+** `*.lost-once.*` — the first `PUT` lands, then is answered 504, as if the
+   answer were lost on the way back;
+** `*.relist-fails` (a directory) — after the first `PUT` into it, its next
+   listing answers 503, once;
+** `*.proxy-403*` — a chunked upload assembles, but the final `MOVE` is answered
+   403, like a proxy mangling it.
+--
++
+Environment variables add latency: `WUSEL_MOCK_GET_DELAY_MS`,
+`WUSEL_MOCK_PUT_DELAY_MS` and `WUSEL_MOCK_PROPFIND_DELAY_MS` delay every answer
+of that kind; `WUSEL_MOCK_GROUP_FOLDERS` (comma-separated) marks directories as
+group folders. Start it with `mise run mock` (`--root DIR`), point a mount at
+it, or let the integration tests under `crates/wusel-mock/tests/` drive the real
+client against it — that is where most server-facing engine tests live; the
+socket frontend's tests (`crates/wusel-ipc/tests/`) and the mount tests
+(`crates/wusel-fuse/tests/`) run against the same mock.
 
 All three tiers run under `mise run test` — they are ordinary `cargo test` cases
 (the standalone mock via an integration test; `wusel-mock` is also a library, so
@@ -54,33 +71,45 @@ says so rather than testing less than it claims.
 It buys two things. The credential tests answer the same on an unlocked GNOME
 desktop and in a bare container, instead of depending on whether the machine
 happens to have a Secret Service. And no test can touch your own login keyring —
-the same account key the product uses. See _Credential storage_ in
-xref:explanation/architecture.adoc[Architecture] for how the keyring's failure modes are
-covered without a keyring at all.
+the same account key the product uses. See _How that fallback is tested_ in
+xref:explanation/credentials-and-trust.adoc[Credentials and trust] for how the
+keyring's failure modes are covered without a keyring at all.
 ====
 
-* *Real FUSE mount (Linux, `/dev/fuse`).* `mise run fuse-test` mounts the full
-  stack — engine + FUSE — against the in-process `wusel-mock` and drives it through
-  the kernel: `ls`, `cat`, `stat`, `statfs`, then unmount. It needs a Linux
-  container, so it is not part of the native `mise run test`; run it via podman
-  (see below). This is the automated counterpart to the manual mount check.
+* *Real FUSE mount (Linux, `/dev/fuse`).* `mise run fuse-test`, run on the host,
+  builds the podman dev container and runs the Linux-only gate inside it: the
+  `wusel-fuse` test suites, which mount the full stack — engine + FUSE — against
+  the in-process `wusel-mock` and drive it through the kernel (reads, writes,
+  renames, directory streams, attributes, `statfs`, concurrent reads, unmount);
+  the `wusel-desktop` tests, including the notify hook with no session bus;
+  clippy on both crates; and `scripts/check-network-home.sh`, which proves the
+  network-home relocation in a mount namespace. It needs `/dev/fuse` and a
+  privileged container, so it is not part of the native `mise run test`, and CI
+  does not run it. This is the automated counterpart to the manual mount check.
 * *Real Nextcloud — automated, nightly.* `scripts/e2e-nextcloud.sh` drives a
   FUSE-mounted `wusel` against a *real* Nextcloud container: read/hydration,
   write/upload, pin, and the opt-in 3-way merge on a genuine 412 conflict. This
   is the tier a mock cannot stand in for (ETag propagation, chunked-upload NG,
   the server's own conditional-request behaviour). Run it locally with
-  `mise run e2e-local` (podman); in CI it is the *E2E* workflow, see below. The
+  `mise run e2e-local` (podman); in CI it is the *E2E* workflow, see
+  xref:project/contributing.adoc#_what_ci_will_run_on_your_change[What CI will run on your change]. The
   local run uses one server — override it with
   `NC_IMAGE=nextcloud:33-apache mise run e2e-local` to reproduce a matrix leg.
+  Locally, a Caddy reverse proxy with its own CA sits in front of the server by
+  default, so the run goes through TLS, `[tls] ca_cert` and HTTP/2; a final gate
+  reads the proxy's access log and fails unless every Wusel request used
+  HTTP/2. `E2E_TLS=0` talks plain HTTP to the server directly, as CI does;
+  `E2E_HTTP1=1` keeps the proxy but sets `[tls] http1_only`, the baseline to hold
+  HTTP/2's timings against.
 +
-The responsiveness checks throttle the link with `tc`, which needs NET_ADMIN and
-an interface whose root qdisc can be displaced. The dev container has both; a CI
-runner has neither, so there those steps are *skipped* — announced as loudly as a
-failure would be, and counted in the closing line. They are a local tier by
-design, not a gap that crept in.
-  Anything the script still cannot cover — live `notify_push`, the desktop
-  integration in a real session — stays a manual check against our own instance
-  (see xref:tutorials/on-gnome.adoc[the GNOME tutorial]).
+The responsiveness checks throttle the link with `tc` (`netem`), which needs
+NET_ADMIN and an interface whose root qdisc can be displaced. The dev container
+has both; a CI runner has neither — see _The rule underneath all of it_ below
+for how that is handled.
++
+Anything the script still cannot cover — live `notify_push`, the desktop
+integration in a real session — stays a manual check against our own instance
+(see xref:tutorials/on-gnome.adoc[the GNOME tutorial]).
 
 == The rule underneath all of it
 
@@ -104,3 +133,7 @@ xref:explanation/concurrency.adoc[Concurrency].
 Live `notify_push` against a real server, and the desktop integration in a real
 session. Both stay manual checks against our own instance. There is no honest
 way to automate a notification appearing on somebody's screen.
+
+The macOS frontend's Swift code — the File Provider extension and the agent —
+has no automated tests. The socket it speaks is covered from the Rust side, by
+the `wusel-ipc` tests against the mock.

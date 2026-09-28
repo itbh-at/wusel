@@ -15,7 +15,7 @@ members = [
 # simply does not get it, so a new field added below is only live once the crate
 # manifests reference it.
 [workspace.package]
-version = "0.4.1"
+version = "0.5.0"
 edition = "2021"
 # Distro packaging (RPM/DEB from source, COPR/OBS/AUR) needs this to be the true
 # floor, not "whatever mise happened to pin at scaffold time" (it was 1.97, an
@@ -69,6 +69,10 @@ reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls-native-roots",
     "json",
     "stream",
+    # HTTP/2 over TLS, negotiated by ALPN: one connection multiplexes the many
+    # small PROPFINDs and range GETs a file manager fires at once. Where a
+    # reverse proxy mishandles it, `[tls] http1_only` turns it off per account.
+    "http2",
 ] }
 # WebSocket over the same reqwest client — one HTTP/TLS stack for everything
 # (WebDAV, OCS, Login, notify_push), so TLS is configured in exactly one place.

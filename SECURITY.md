@@ -45,6 +45,10 @@ release a fix before disclosing publicly.
   decisions, the WebDAV/OCS client, the SQLite state and the blob cache;
 - the FUSE frontend: path handling, permission mapping, anything that lets one
   local user reach another's mount or cached data;
+- the socket frontend (`wusel-ipc`, `wusel serve`): who may connect to the
+  socket and what a client can make the engine do;
+- the macOS frontend (`macos/`, experimental): the agent app and the File
+  Provider extension;
 - the desktop integration (`integration/`, `wusel-desktop`): the D-Bus surfaces,
   the Nautilus extension, the GNOME Shell search provider;
 - the packaging (`packaging/`): file ownership and modes, the systemd unit,

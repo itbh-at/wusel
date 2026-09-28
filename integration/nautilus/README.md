@@ -21,8 +21,12 @@ file's state from the daemon's status socket and adds:
 
 Development packages:
 
-- Fedora: `sudo dnf install nautilus-devel glib2-devel gcc make`
-- Debian/Ubuntu: `sudo apt install libnautilus-extension-dev libglib2.0-dev gcc make`
+- Fedora: `sudo dnf install nautilus-devel glib2-devel gtk4-devel gcc make`
+- Debian/Ubuntu: `sudo apt install libnautilus-extension-dev libglib2.0-dev libgtk-4-dev gcc make`
+
+GTK is needed for its headers only: the extension is compiled against it but
+not linked, because the few `gdk_*` clipboard calls resolve inside Nautilus,
+which has GTK loaded.
 
 ```sh
 make
@@ -30,8 +34,9 @@ sudo make install   # into $(pkg-config --variable=extensiondir libnautilus-exte
 nautilus -q         # restart Nautilus so it loads the extension
 ```
 
-`make uninstall` removes it. Packaging (the RPM today, Debian planned) builds and installs the same
-`.so`, so end users never run `make`.
+`make uninstall` removes it. The distribution packages ship the same `.so` as
+their own package, `wusel-nautilus` (RPM subpackage, Debian/Ubuntu binary
+package, Arch split package), so end users never run `make`.
 
 ## Notes
 

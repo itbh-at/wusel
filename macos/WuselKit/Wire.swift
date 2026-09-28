@@ -33,8 +33,14 @@ struct Request: Encodable {
     var size: UInt64?
     /// `setattr`: the new modification time (Unix seconds).
     var mtime: Int64?
+    /// `create`/`setattr`: the executable bit. Kept in the engine's local state
+    /// only — WebDAV has no mode bits, so it never reaches the server.
+    var exec: Bool?
     /// `changes`: replay the change log from this sequence anchor onward.
     var since: UInt64?
+    /// `weburl`: ask for the "reveal in its folder" link instead of the object
+    /// link. Absent (the default) asks for the object link.
+    var reveal: Bool?
 }
 
 /// The per-object sync state, the neutral axis every frontend projects onto its
@@ -84,6 +90,9 @@ struct Entry: Decodable {
     let state: SyncState?
     /// Whether the object is a Team/Group folder root.
     let folderKind: FolderKind
+    /// Whether the file is executable (local state). Absent from an older
+    /// serve, so decoded with a `false` default.
+    let exec: Bool
 
     enum CodingKeys: String, CodingKey {
         case name
@@ -96,6 +105,7 @@ struct Entry: Decodable {
         case stale
         case state
         case folderKind = "folder_kind"
+        case exec
     }
 
     init(from decoder: Decoder) throws {
@@ -114,6 +124,7 @@ struct Entry: Decodable {
         state = rawState.flatMap(SyncState.init(rawValue:))
         let rawKind = try c.decodeIfPresent(String.self, forKey: .folderKind)
         folderKind = rawKind.flatMap(FolderKind.init(rawValue:)) ?? .plain
+        exec = try c.decodeIfPresent(Bool.self, forKey: .exec) ?? false
     }
 }
 
@@ -137,6 +148,9 @@ struct NodeInfo: Decodable {
     let state: SyncState?
     /// Whether the object is a Team/Group folder root.
     let folderKind: FolderKind
+    /// Whether the file is executable (local state). Absent from an older
+    /// serve, so decoded with a `false` default.
+    let exec: Bool
 
     enum CodingKeys: String, CodingKey {
         case name
@@ -149,6 +163,7 @@ struct NodeInfo: Decodable {
         case stale
         case state
         case folderKind = "folder_kind"
+        case exec
     }
 
     init(from decoder: Decoder) throws {
@@ -167,6 +182,7 @@ struct NodeInfo: Decodable {
         state = rawState.flatMap(SyncState.init(rawValue:))
         let rawKind = try c.decodeIfPresent(String.self, forKey: .folderKind)
         folderKind = rawKind.flatMap(FolderKind.init(rawValue:)) ?? .plain
+        exec = try c.decodeIfPresent(Bool.self, forKey: .exec) ?? false
     }
 }
 
@@ -222,10 +238,16 @@ enum Response: Decodable {
     /// The reply to `reachable`: whether the daemon currently has positive
     /// evidence the server is reachable.
     case reachable(Bool)
+    /// The reply to `update`: how many files the in-place refresh re-fetched
+    /// (`0` if the offline copy was already current).
+    case updated(count: UInt64)
+    /// The reply to `weburl`: the Nextcloud web link for the requested path.
+    case webURL(String)
 
     private enum CodingKeys: String, CodingKey {
         case kind, len, error, change, path, seq, changes, severity, title, body, reachable
         case noticeKind = "notice_kind"
+        case count, url
     }
 
     init(from decoder: Decoder) throws {
@@ -260,6 +282,10 @@ enum Response: Decodable {
                 body: try c.decode(String.self, forKey: .body))
         case "reachable":
             self = .reachable(try c.decode(Bool.self, forKey: .reachable))
+        case "updated":
+            self = .updated(count: try c.decode(UInt64.self, forKey: .count))
+        case "web_url":
+            self = .webURL(try c.decode(String.self, forKey: .url))
         default:
             throw WireError.badRequest
         }

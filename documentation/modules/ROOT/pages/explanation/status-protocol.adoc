@@ -34,8 +34,8 @@ answers and a stored attribute cannot.
 
 There is one source of status, the engine, and one way to ask it: the
 `wusel-ipc` Unix-domain socket the daemon already serves. Every file manager
-integration — the macOS File Provider extension today, a Nautilus plugin next,
-KDE's Dolphin and the Windows shell later — is a *thin projector*: it asks the
+integration — the macOS File Provider extension and the Nautilus extension
+today, KDE's Dolphin and the Windows shell later — is a *thin projector*: it asks the
 socket for an object's status and maps the answer onto its own decoration
 vocabulary. None of them link the engine, embed sync logic, or invent their own
 status; none of them write anything onto the file.
@@ -107,9 +107,12 @@ client can badge a group-folder root *and* show its sync emblem.
 Version the wire::
 The clients will not upgrade in lockstep — a system Nautilus plugin and a
 sandboxed File Provider extension update on entirely different schedules. A
-schema version on the wire lets an old client and a new daemon (or the reverse)
-detect the mismatch and refuse it, instead of silently mis-reading a field.
-Additive fields with defaults are not a break; a changed shape is.
+schema version on the wire would let an old client and a new daemon (or the
+reverse) detect the mismatch and refuse it, instead of silently mis-reading a
+field. Additive fields with defaults are not a break; a changed shape is. The
+number exists (`wire::SCHEMA`), but nothing sends or checks it yet: the
+negotiation is planned, not implemented. Until then only additive changes are
+made.
 
 == Why the client must cache
 
@@ -132,12 +135,13 @@ is tens of milliseconds of synchronous stutter in the draw path — so a cache i
 not an optimisation here, it is a requirement. Two things make it cheap and
 correct:
 
-* *One listing primes the whole folder.* `enumerate` already carries each
-  child's `state` and `folder_kind`, so drawing a freshly-opened folder is a
-  single round-trip that fills the cache for every file in it — not one `stat`
-  per file.
-* *The change stream keeps it warm.* The cache is invalidated by the `watch` /
-  `changes` events the engine already emits, so a hit stays correct without
+* *One listing can prime the whole folder.* `enumerate` already carries each
+  child's `state` and `folder_kind`, so a client that lists a freshly-opened
+  folder fills its cache for every file in it with a single round-trip — not one
+  `stat` per file.
+* *A change signal keeps it warm.* The cache is invalidated when the engine
+  reports a change — the `watch` / `changes` stream on the socket, or the
+  daemon's D-Bus `FileChanged` signal — so a hit stays correct without
   re-asking. A cache that drifts would draw a stale emblem — the whole risk of
   caching — which is why the prototype asserts the cached answer equals the
   socket's.
@@ -153,8 +157,10 @@ contract was on the wire before the engine could fill it, and filling it changed
 one function in `wusel-ipc` and nothing in any client — which is the case for
 fixing a protocol before its implementations, made concrete.
 
-The Nautilus extension speaks the socket, with the cache the prototype
-measured, and the extended attributes have been removed — there is no second
+The Nautilus extension speaks the socket: it asks with one `stat` per file,
+caches the answer, and drops a cached entry when the daemon's D-Bus
+`FileChanged` signal names that path. It does not prime from `enumerate` or
+subscribe to `watch`. The extended attributes have been removed — there is no second
 channel left to keep in step. The xref:reference/file-states.adoc[File states]
 reference accordingly describes *what a client renders*, not the interface it
 reads: the interface is this protocol.

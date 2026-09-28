@@ -156,7 +156,8 @@ pub trait ContentSource: Send + Sync {
     /// received all `node.size` bytes. Default: a series of [`FETCH_CHUNK`] range
     /// reads via [`read`](Self::read). A source backed by a single HTTP request
     /// (see [`LiveWebDav`]) overrides this to stream one whole-file GET, so
-    /// hydrating a file costs one request instead of one per chunk.
+    /// hydrating a file costs one request instead of one per chunk;
+    /// [`CachingSource`] delegates to that and keeps the result as a blob.
     fn stream_to(&self, node: &NodeRow, out: &mut File) -> Result<()> {
         stream_full(self, node, out)
     }
@@ -178,8 +179,9 @@ pub trait ContentSource: Send + Sync {
     }
 
     /// Write the node's **full** content to `dest`, streaming — so it works for
-    /// files of any size (`u64` throughout) with only one chunk in memory. This
-    /// seeds a write buffer's base. Default: via [`stream_to`](Self::stream_to).
+    /// files of any size (`u64` throughout) with only one chunk in memory. The
+    /// runtime's write buffer does not come through here; it calls
+    /// [`stream_to`](Self::stream_to) itself. Default: via `stream_to`.
     fn hydrate_to(&self, node: &NodeRow, dest: &Path) -> Result<()> {
         let mut out = File::create(dest)?;
         if let Err(e) = self.stream_to(node, &mut out) {
@@ -1283,15 +1285,70 @@ impl ContentSource for CachingSource {
         // publishes a blob (see `read_windowed`). That is welcome — the bytes
         // are on disk anyway — but it means the cache may be warm afterwards.
         // Larger files read in exact `FETCH_CHUNK` strides, which bypass the
-        // window entirely and cache nothing. Either way the caller decides
-        // whether to *deliberately* cache this base (see the write path, which
-        // stores it for a later 3-way merge).
+        // window entirely and cache nothing. The 3-way merge base is seeded by
+        // `stream_to`, which fills the write buffer — not by this method.
         let mut out = File::create(dest)?;
         if let Err(e) = stream_full(self, node, &mut out) {
             drop(out);
             let _ = std::fs::remove_file(dest); // never leave a truncated base
             return Err(e);
         }
+        Ok(())
+    }
+
+    /// Fill a write buffer: the version the edit starts from, which is also the
+    /// base a later 3-way merge needs.
+    ///
+    /// Two things at once, because they are the same bytes:
+    ///
+    /// * **One request.** Without this override the trait default would stream
+    ///   through [`read`](ContentSource::read), one range GET per
+    ///   [`FETCH_CHUNK`]. Here the whole file comes from the inner source's own
+    ///   `stream_to` — a single GET for [`LiveWebDav`].
+    /// * **A merge base.** The download lands as a cache blob under the node's
+    ///   ETag before it is copied into `out`, so when the upload later meets a
+    ///   412, [`cached_bytes`](ContentSource::cached_bytes) finds exactly the
+    ///   version the edit rests on. Without a base the conflict could only ever
+    ///   become a conflict copy.
+    ///
+    /// A fresh blob costs no request at all. A file larger than the whole cache
+    /// budget skips the blob and streams straight into `out`: eviction would
+    /// drop it at once, and staging it would only double the disk it takes.
+    ///
+    /// No outdated-copy fallback on a network failure, unlike `read`: a buffer
+    /// seeded from an outdated blob would name the row's ETag as its base while
+    /// resting on older bytes, and the upload would silently replace the newer
+    /// server version.
+    fn stream_to(&self, node: &NodeRow, out: &mut File) -> Result<()> {
+        let Some(file_id) = node.file_id else {
+            return self.inner.stream_to(node, out); // no stable key → no blob
+        };
+        if self.max_bytes.is_some_and(|max| node.size > max) {
+            return self.inner.stream_to(node, out);
+        }
+        let blob = self.dir.join(file_id.to_string());
+        let lock = self.fetch_lock(file_id);
+        let opened = {
+            // Same per-file lock as a pin, so a concurrent reader's hydration
+            // and this fill share one download instead of racing on `.part`.
+            let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+            let fetched = if self.is_fresh(&blob, &node.etag) {
+                Ok(())
+            } else {
+                self.fetch_whole(&blob, node)
+            };
+            // Open under the lock: an open handle keeps the bytes readable even
+            // if eviction unlinks the blob a moment later (Unix semantics).
+            fetched.and_then(|()| File::open(&blob).map_err(crate::Error::from))
+        };
+        drop(lock);
+        self.gc_fetch_lock(file_id);
+        let mut src = opened?;
+        touch(&blob); // just used — keep it ahead of LRU eviction
+        std::io::copy(&mut src, out)?;
+        out.flush()?;
+        // A fresh blob may have pushed the cache over budget.
+        self.enforce_budget();
         Ok(())
     }
 }
@@ -1408,6 +1465,7 @@ mod tests {
             file_id: Some(42),
             permissions: String::new(),
             group_root: false,
+            exec: false,
         }
     }
 
@@ -2268,6 +2326,134 @@ mod tests {
             ((FETCH_CHUNK as u64) % 251) as u8
         );
         assert_eq!(got[size as usize - 1], (((size - 1) % 251) as u8));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A source that tells whole-file streams apart from range reads, as a
+    /// [`LiveWebDav`] does — one GET versus one per chunk.
+    struct Streaming {
+        streams: Arc<AtomicUsize>,
+        reads: Arc<AtomicUsize>,
+        data: Vec<u8>,
+        fail: bool,
+    }
+    impl Streaming {
+        fn new(data: &[u8]) -> (Self, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+            let streams = Arc::new(AtomicUsize::new(0));
+            let reads = Arc::new(AtomicUsize::new(0));
+            let src = Self {
+                streams: streams.clone(),
+                reads: reads.clone(),
+                data: data.to_vec(),
+                fail: false,
+            };
+            (src, streams, reads)
+        }
+    }
+    impl ContentSource for Streaming {
+        fn read(&self, _node: &NodeRow, offset: u64, len: u32) -> Result<Vec<u8>> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            let start = (offset as usize).min(self.data.len());
+            let end = std::cmp::min(start + len as usize, self.data.len());
+            Ok(self.data[start..end].to_vec())
+        }
+        fn stream_to(&self, _node: &NodeRow, out: &mut File) -> Result<()> {
+            self.streams.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                // A transport error: the kind `read` answers with an outdated copy.
+                return Err(crate::Error::Http("connection reset".into()));
+            }
+            out.write_all(&self.data)?;
+            Ok(())
+        }
+    }
+
+    /// Fill a scratch file through `cache.stream_to` and return its bytes.
+    fn fill_buffer(cache: &CachingSource, n: &NodeRow, path: &Path) -> Result<Vec<u8>> {
+        let mut out = File::create(path)?;
+        cache.stream_to(n, &mut out)?;
+        drop(out);
+        Ok(std::fs::read(path)?)
+    }
+
+    #[test]
+    fn a_write_buffer_fill_is_one_stream_and_seeds_the_merge_base() {
+        let dir = std::env::temp_dir().join(format!("wusel-fill-one-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Larger than one chunk: the trait default would issue several reads.
+        let size = FETCH_CHUNK as usize * 2 + 1234;
+        let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+        let (inner, streams, reads) = Streaming::new(&data);
+        let cache = CachingSource::new(Box::new(inner), dir.join("cache"), None, None, None);
+        let n = node(size as u64, "etag-1");
+        assert!(cache.cached_bytes(&n).is_none(), "cold: no merge base yet");
+
+        let got = fill_buffer(&cache, &n, &dir.join("buf")).unwrap();
+        assert!(got == data, "the buffer holds the whole file");
+        assert_eq!(streams.load(Ordering::SeqCst), 1, "one whole-file stream");
+        assert_eq!(reads.load(Ordering::SeqCst), 0, "no per-chunk range reads");
+        assert!(
+            cache.cached_bytes(&n).is_some_and(|b| b == data),
+            "the fill leaves the version it started from as the merge base"
+        );
+
+        // A second fill is served from that blob — no request at all.
+        let again = fill_buffer(&cache, &n, &dir.join("buf2")).unwrap();
+        assert!(again == data);
+        assert_eq!(streams.load(Ordering::SeqCst), 1, "fresh blob → no fetch");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_write_buffer_fill_larger_than_the_cache_budget_leaves_no_blob() {
+        let dir = std::env::temp_dir().join(format!("wusel-fill-big-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let data = b"more than the budget".to_vec();
+        let (inner, streams, _) = Streaming::new(&data);
+        let cache = CachingSource::new(Box::new(inner), dir.join("cache"), Some(4), None, None);
+        let n = node(data.len() as u64, "etag-1");
+
+        let got = fill_buffer(&cache, &n, &dir.join("buf")).unwrap();
+        assert_eq!(got, data);
+        assert_eq!(streams.load(Ordering::SeqCst), 1);
+        assert!(
+            !dir.join("cache").join("42").exists(),
+            "not staged in the cache"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_failed_write_buffer_fill_publishes_nothing_and_serves_no_outdated_copy() {
+        let dir = std::env::temp_dir().join(format!("wusel-fill-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache_dir = dir.join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        // An outdated copy on disk: the server has moved on to etag-2.
+        std::fs::write(cache_dir.join("42"), b"old").unwrap();
+        std::fs::write(cache_dir.join("42.etag"), "etag-1").unwrap();
+
+        let (mut inner, _, _) = Streaming::new(b"new");
+        inner.fail = true;
+        let cache = CachingSource::new(Box::new(inner), cache_dir.clone(), None, None, None);
+        let n = node(3, "etag-2");
+
+        // The read path would fall back to "old"; a buffer must not, or its
+        // upload would name etag-2 as the base of an edit made on etag-1.
+        assert!(fill_buffer(&cache, &n, &dir.join("buf")).is_err());
+        assert!(cache.cached_bytes(&n).is_none(), "no merge base published");
+        assert!(
+            !cache_dir.join("42.part").exists(),
+            "no partial download left"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

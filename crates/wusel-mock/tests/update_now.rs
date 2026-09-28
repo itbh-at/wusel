@@ -61,6 +61,14 @@ fn updating_refuses_what_it_does_not_promise_and_is_idempotent() {
         "and it is still protected after an update"
     );
 
+    // No path and no account-wide pin: "update" means every pin there is —
+    // here the one on kept.txt, already current.
+    assert_eq!(
+        engine.provider().refresh("").unwrap(),
+        0,
+        "every pin is visited, none needs fetching"
+    );
+
     // The whole account is a legitimate target: it is where a pin can also sit.
     engine.pin("").unwrap();
     assert!(
@@ -68,6 +76,12 @@ fn updating_refuses_what_it_does_not_promise_and_is_idempotent() {
         "the account-wide pin can be brought up to date too"
     );
     let _ = ROOT_INODE;
+
+    // With nothing pinned at all, there is nothing to update — said, not
+    // silently answered with "0 files".
+    engine.provider().unpin("").unwrap();
+    engine.provider().unpin("kept.txt").unwrap();
+    assert!(engine.provider().refresh("").is_err(), "no pins → refused");
 
     drop(engine);
     std::fs::remove_dir_all(&base).ok();

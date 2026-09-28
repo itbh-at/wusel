@@ -14,7 +14,7 @@
 # actual release tag would contain, which is the point of testing this way.
 #
 # Run this ON Fedora, with rpm-build, gcc, make, pkgconf, nautilus-devel,
-# glib2-devel, fuse3-devel, AND rust >= 1.85 / cargo installed via `dnf`
+# glib2-devel, gtk4-devel, fuse3-devel, AND rust >= 1.85 / cargo installed via `dnf`
 # specifically — not just on PATH. The `cargo vendor` step below happily uses
 # mise's pinned toolchain if present, but `rpmbuild --rebuild` runs its own
 # %build in a buildroot that resolves wusel.spec's BuildRequires only against

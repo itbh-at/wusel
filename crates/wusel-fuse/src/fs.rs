@@ -483,8 +483,8 @@ impl Filesystem for NcFs {
         _req: &Request_,
         parent: INodeNo,
         name: &OsStr,
-        _mode: u32,
-        _umask: u32,
+        mode: u32,
+        umask: u32,
         _flags: i32,
         reply: ReplyCreate,
     ) {
@@ -500,6 +500,12 @@ impl Filesystem for NcFs {
             Intent::Materialise {
                 name: name.to_string(),
                 dir: false,
+                // `cp`, `install`, `tar` and `unzip` create an executable file
+                // with its mode rather than a `chmod` afterwards. The umask is
+                // applied here too: whether the kernel already did depends on
+                // a capability we do not negotiate, and applying it twice is
+                // harmless.
+                exec: is_exec_mode(mode & !umask),
             },
         );
     }
@@ -528,8 +534,28 @@ impl Filesystem for NcFs {
             Intent::Materialise {
                 name: name.to_string(),
                 dir: true,
+                exec: false,
             },
         );
+    }
+
+    /// FIFOs, sockets and devices have no counterpart on the server. `EPERM` is
+    /// what `mknod(2)` names for "the filesystem does not support this type of
+    /// node"; left to the library default the caller got `ENOSYS`, which reads
+    /// as a broken mount. Regular files are created through `create`, so a bare
+    /// `mknod` of one is refused alike. `symlink` and `link` are left to the
+    /// library, whose default is already `EPERM`.
+    fn mknod(
+        &self,
+        _req: &Request_,
+        _parent: INodeNo,
+        _name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        _rdev: u32,
+        reply: ReplyEntry,
+    ) {
+        reply.error(Errno::EPERM);
     }
 
     fn unlink(&self, _req: &Request_, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
@@ -572,7 +598,7 @@ impl Filesystem for NcFs {
         &self,
         _req: &Request_,
         ino: INodeNo,
-        _mode: Option<u32>,
+        mode: Option<u32>,
         _uid: Option<u32>,
         _gid: Option<u32>,
         size: Option<u64>,
@@ -593,7 +619,15 @@ impl Filesystem for NcFs {
             TimeOrNow::SpecificTime(t) => unix_from_system_time(t),
             TimeOrNow::Now => unix_from_system_time(SystemTime::now()),
         });
-        self.go(Pending::Attr(reply), ino.0, Intent::SetAttr { size, mtime });
+        // Of a mode only the executable bit is kept (see `NodeRow::exec`); the
+        // write bits follow the server's permissions, and the rest has no
+        // meaning here. An owner change is accepted and ignored alike.
+        let exec = mode.map(is_exec_mode);
+        self.go(
+            Pending::Attr(reply),
+            ino.0,
+            Intent::SetAttr { size, mtime, exec },
+        );
     }
 
     fn flush(
@@ -659,6 +693,12 @@ impl NcFs {
     }
 }
 
+/// Whether a mode asks for the file to be executable — by anyone. The mount has
+/// a single user, so `u+x` and `a+x` mean the same thing here.
+fn is_exec_mode(mode: u32) -> bool {
+    mode & 0o111 != 0
+}
+
 /// Build FUSE attributes from a state row.
 pub(crate) fn to_attr(node: &NodeRow) -> FileAttr {
     let t = system_time_from_unix(node.mtime);
@@ -672,6 +712,8 @@ pub(crate) fn to_attr(node: &NodeRow) -> FileAttr {
         (false, true) => (FileType::RegularFile, 0o644, 1),
         (false, false) => (FileType::RegularFile, 0o444, 1),
     };
+    // The executable bit is ours, not the server's: kept locally by `chmod`.
+    let perm = if node.exec { perm | 0o111 } else { perm };
     FileAttr {
         ino: INodeNo(node.inode),
         size: node.size,
@@ -829,7 +871,15 @@ pub fn mount_with(
     // `#[non_exhaustive]`, so it must be built from `default()` and mutated, not a
     // struct literal.
     let mut config = Config::default();
-    config.mount_options = vec![MountOption::FSName("wusel".into())];
+    // `DefaultPermissions` has the kernel check the mode bits itself. Without
+    // it, `access(2)` is sent to us, which does not implement it, and the
+    // kernel then allows every check — `test -x` said "executable" for every
+    // file while `execve` refused it. The mode reports the same write bits the
+    // engine enforces, so for writes the kernel only answers earlier.
+    config.mount_options = vec![
+        MountOption::FSName("wusel".into()),
+        MountOption::DefaultPermissions,
+    ];
     // NOTE: `x-gvfs-notrash` is deliberately NOT passed here. fuser puts a
     // `CUSTOM` option into the kernel mount-data string, and the FUSE kernel
     // rejects the unknown option — the mount then never comes up (proved by the
@@ -971,9 +1021,11 @@ pub fn mount_with(
                     // user is navigating.
                     //
                     // They are disabled here to confirm that and to give a usable
-                    // build. What is lost is only *live* appearance of add/removes
-                    // in an already-open window — the kernel picks them up on its
-                    // own one-second attribute/entry TTL, and on the next reload.
+                    // build. What is lost is small: a `stat` or re-read sees a
+                    // server-side change after the entry/attribute TTL instead of
+                    // at once. They never made an add or remove appear in an open
+                    // window — no FUSE notification raises an inotify event on the
+                    // directory a file manager watches (see keeping-in-sync.adoc).
                     // The desktop emblem refresh (`file_changed`) is kept: it goes
                     // through the file manager's own extension, not the kernel, so
                     // it cannot cause this.

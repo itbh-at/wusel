@@ -20,6 +20,13 @@
 //! The WebSocket rides the same reqwest client as every other call (via
 //! `reqwest-websocket`), so it inherits one TLS configuration (see [`crate::tls`]).
 //!
+//! The event carries no path, and a connection that was down missed every
+//! event in between. So authenticating — at start and after every reconnect —
+//! kicks the same sync walk an event does: what changed while nobody listened is
+//! caught up at once rather than on the next event. And where no events arrive
+//! at all (no notify_push on the server, or its endpoint unreachable),
+//! [`poll_while_disconnected`] kicks the walk on a timer instead.
+//!
 //! ## Threading
 //!
 //! The listener runs on its **own** OS thread with its own single-threaded tokio
@@ -133,6 +140,13 @@ impl PushStatus {
         self.set_phase(PushPhase::Connected);
     }
 
+    /// The current phase — what [`poll_while_disconnected`] asks before every
+    /// poll.
+    #[must_use]
+    pub fn phase(&self) -> PushPhase {
+        self.lock().phase
+    }
+
     /// The state as plain data for the wire.
     #[must_use]
     pub fn snapshot(&self) -> PushReport {
@@ -214,6 +228,43 @@ pub fn spawn(
     }
 }
 
+/// Kick the sync walk every `every` while notify_push is not connected — the
+/// fallback for a server without the app, or with an endpoint that cannot be
+/// reached.
+///
+/// Without it such a mount only ever learns of a remote change by accident:
+/// a directory is re-listed when it is next opened after its TTL, but nothing
+/// re-checks a pinned file nobody opens, so its offline copy would stay behind
+/// indefinitely. The walk is cheap when nothing changed — one `PROPFIND` of the
+/// root, whose ETag Nextcloud moves whenever anything below it does — and it
+/// descends only into what did change.
+///
+/// While the socket is connected the events do this job and the poller only
+/// looks at the phase. It runs on its own thread (a sleep loop needs no
+/// runtime) and ends when the syncer does, i.e. when the trigger's receiver is
+/// gone.
+pub fn poll_while_disconnected(
+    status: Arc<PushStatus>,
+    sync_trigger: std::sync::mpsc::Sender<()>,
+    every: Duration,
+) {
+    let spawned = std::thread::Builder::new()
+        .name("wusel-sync-poll".into())
+        .spawn(move || loop {
+            std::thread::sleep(every);
+            if status.phase() == PushPhase::Connected {
+                continue;
+            }
+            tracing::debug!("notify_push not connected — polling for remote changes");
+            if sync_trigger.send(()).is_err() {
+                break; // the syncer is gone, and with it the mount
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::warn!(%e, "could not start the sync poller — remote changes are noticed on access only");
+    }
+}
+
 /// Discover the endpoint once, then keep a connection alive with backoff.
 #[allow(clippy::too_many_arguments)]
 async fn run(
@@ -227,7 +278,16 @@ async fn run(
     health: Option<&crate::health::Reachability>,
     status: &PushStatus,
 ) {
-    let client = match tls::client(tls_settings) {
+    // HTTP/1.1 for this client, whatever the account's setting: a WebSocket is
+    // an HTTP/1.1 `Upgrade`, and a connection that ALPN has already moved to
+    // HTTP/2 cannot carry one (reqwest-websocket has no RFC 8441 support and
+    // refuses the answer). Its other requests — the capability lookup and the
+    // reachability probe — are single, small and gain nothing from HTTP/2.
+    let push_settings = TlsSettings {
+        http1_only: true,
+        ..tls_settings.clone()
+    };
+    let client = match tls::client(&push_settings) {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(%e, "notify_push: no HTTP client");
@@ -246,7 +306,9 @@ async fn run(
     let endpoint = match info.push_websocket {
         Some(url) => url,
         None => {
-            tracing::info!("notify_push not available — relying on TTL revalidation");
+            tracing::info!(
+                "notify_push not available — relying on TTL revalidation and periodic polling"
+            );
             status.set_phase(PushPhase::Unavailable);
             return;
         }
@@ -302,8 +364,9 @@ async fn run(
                         tracing::warn!(
                             %endpoint, error = %e,
                             "notify_push: the server answers but its WebSocket endpoint does not \
-                             ({WS_GIVE_UP_AFTER} failures in a row) — falling back to TTL \
-                             polling and retrying every {DEGRADED_BACKOFF_SECS}s. `wusel doctor` \
+                             ({WS_GIVE_UP_AFTER} failures in a row) — falling back to TTL revalidation \
+                             and periodic polling, retrying the socket every \
+                             {DEGRADED_BACKOFF_SECS}s. `wusel doctor` \
                              names the likely cause (notify_push's base_endpoint, or a reverse \
                              proxy without WebSocket upgrades)"
                         );
@@ -433,7 +496,7 @@ async fn discover(
                 backoff = (backoff * 2).min(MAX_BACKOFF_SECS);
             }
             Err(e) => {
-                tracing::warn!(%e, "notify_push: capability lookup refused — relying on TTL");
+                tracing::warn!(%e, "notify_push: capability lookup refused — relying on TTL and periodic polling");
                 status.failed(&e);
                 status.set_phase(PushPhase::Unavailable);
                 return None;
@@ -509,6 +572,10 @@ async fn listen_once(
                     }
                     status.connected();
                     tracing::info!("notify_push: authenticated");
+                    // Catch up: events sent while this connection did not exist
+                    // — before the start, during an outage — are lost for good,
+                    // and the walk is how their changes are found anyway.
+                    let _ = sync_trigger.send(());
                 } else if is_file_event(text) {
                     invalidate_after.store(now_secs(), Ordering::SeqCst);
                     // Kick the background syncer to find *what* changed (the event
@@ -580,6 +647,36 @@ fn now_secs() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Polling is the fallback, not a second channel: it kicks the walk while
+    /// the socket is down and stays quiet while events arrive.
+    #[test]
+    fn the_poller_kicks_the_walk_only_while_disconnected() {
+        let status = Arc::new(PushStatus::default());
+        status.set_phase(PushPhase::Unavailable);
+        let (tx, rx) = std::sync::mpsc::channel();
+        poll_while_disconnected(Arc::clone(&status), tx, Duration::from_millis(20));
+
+        assert!(
+            rx.recv_timeout(Duration::from_secs(2)).is_ok(),
+            "no notify_push → the walk is kicked"
+        );
+
+        status.connected();
+        while rx.try_recv().is_ok() {} // drain what was sent before the switch
+        std::thread::sleep(Duration::from_millis(30)); // one poll in flight may land
+        while rx.try_recv().is_ok() {}
+        assert!(
+            rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "connected → events do the job, the poller stays quiet"
+        );
+
+        status.set_phase(PushPhase::Reconnecting);
+        assert!(
+            rx.recv_timeout(Duration::from_secs(2)).is_ok(),
+            "a lost connection → polling resumes"
+        );
+    }
 
     /// The state `doctor` reads must tell a run of failures from a healthy
     /// connection, and forget the run once the connection is back.

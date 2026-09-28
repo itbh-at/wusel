@@ -70,9 +70,10 @@ mise run test
 mise run clippy
 ----
 
-That covers `wusel-core` — authentication, WebDAV, the cache, the state
-database, the sync logic — and the CLI around it. The FUSE frontend is compiled
-out.
+That covers every crate but `wusel-fuse`: the decision core (`wusel-fsm`), the
+engine (`wusel-core` — authentication, WebDAV, the cache, the state database,
+the sync logic), the socket frontend (`wusel-ipc`), the mock server and the CLI
+around them. The FUSE frontend is compiled out.
 
 == The mount, in a container
 
@@ -81,16 +82,18 @@ provides through its Linux VM:
 
 [source,sh]
 ----
-mise run fuse-build     # build the container image
+mise run fuse-build     # build the container image and compile wusel with FUSE
 mise run fuse-shell     # a Linux shell with /dev/fuse
+mise run fuse-test      # the Linux-only test suite, in its own container
 ----
 
-Inside that shell:
+All three run on the Mac; each starts its own container. Inside the shell from
+`fuse-shell`, log in once (credentials and state persist under
+`/private/tmp/wusel-devhome` on the Mac) and mount:
 
 [source,sh]
 ----
 cargo run -p wusel --features fuse -- mount /mnt/nc
-mise run fuse-test      # the containerised FUSE suite
 ----
 
 IMPORTANT: The mount then lives *inside* podman's Linux VM. It is not a drive on

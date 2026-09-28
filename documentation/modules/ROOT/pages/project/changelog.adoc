@@ -14,6 +14,99 @@ the RPM is terse because a package changelog is, this page has room to say why.
 The format follows https://keepachangelog.com/en/1.1.0/[Keep a Changelog]; the
 project uses https://semver.org/[Semantic Versioning].
 
+== 0.5.0 — 2026-09-28
+
+=== Added
+
+* **HTTP/2.** Over HTTPS the client now negotiates HTTP/2 where the server
+  offers it, so the many small requests a file manager fires at once share one
+  multiplexed connection. Earlier builds spoke HTTP/1.1 only — `[tls]
+  http1_only` had no effect; it now does what it says. The notify_push
+  WebSocket stays on HTTP/1.1.
+
+* **Periodic polling when live updates are missing.** While `notify_push` is not
+  installed on the server or not connected, the sync walk runs every
+  `[sync] poll_secs` seconds (default 300, `0` turns it off). While it is
+  connected, server events drive the walk and the poller stays idle. See
+  xref:reference/configuration.adoc[Configuration].
+
+* **Catch-up after every notify_push (re)connect.** Each successful
+  authentication on the push socket — at start and after every reconnect — runs
+  the sync walk once, so changes made while the connection was down show up.
+
+* **A "Wusel" submenu in GNOME Files.** The context-menu entries are grouped
+  under one "Wusel" entry, with new ones beside them: make a *folder* available
+  offline (or stop keeping it offline), "Open in Nextcloud", "Copy Internal
+  Link", and, for a single file, "Open Folder in Nextcloud".
+
+* **`wusel web url [--reveal] PATH`** prints the Nextcloud web link for a file or
+  folder — what the file-manager web actions use. See
+  xref:reference/cli.adoc[CLI reference].
+
+* **The executable bit is kept.** `chmod +x`, or creating a file with an
+  executable mode, is recorded locally and shown in the file's mode; it survives
+  renames, atomic saves, uploads and new server versions. It is never uploaded.
+
+* **Experimental macOS:** Finder offers "Update Now", "Open in Nextcloud", "Open
+  Folder in Nextcloud" and "Copy Internal Link" next to the offline actions, all
+  prefixed "Wusel", and shows only the actions that fit the selection. The
+  executable bit reaches Finder too.
+
+=== Changed
+
+* **`wusel update` without a path updates every pin**, not only a whole-account
+  pin. Pins inside a pinned folder are covered by that folder; a pin that fails
+  does not stop the others, and the failures are reported together at the end.
+  With nothing pinned it refuses.
+
+* **FIFOs, sockets and device nodes are refused with `EPERM`** instead of
+  `ENOSYS`, which read as a broken mount.
+
+* **The GNOME Files integration is its own package, `wusel-nautilus`** — the
+  extension and its emblem icons, as a DEB binary package, an RPM subpackage and
+  an Arch split package. `wusel` needs `fuse3` and nothing else, about four
+  packages: notifications, the sidebar entry and the Shell search speak D-Bus
+  from inside the binary. `wusel-nautilus` brings only what Nautilus itself
+  uses, and no GTK. `wusel` suggests it; on Fedora and openSUSE the subpackage
+  supplements `wusel` and `nautilus`, so `dnf` and `zypper` install it by
+  themselves wherever GNOME Files is. Each release attaches both packages. See
+  xref:reference/packages.adoc[Packages].
++
+*Upgrading on Debian or Ubuntu:* `apt` has no such mechanism. After the
+upgrade, GNOME Files shows no emblems and no *Wusel* context menu until you
+install the new package: `sudo apt install wusel-nautilus`.
+
+=== Fixed
+
+* **The text merge no longer loses the server's edit.** With `[sync] text_merge`
+  on, a conflict that Wusel had already learned about — the normal case with
+  `notify_push` — either fell back to a conflicted copy or, when the server's
+  new version was already in the cache, merged against that version and
+  silently overwrote the server's change. The merge now always starts from the
+  version the local edit was based on.
+
+* **`wusel account remove` also deletes the account's app password from the
+  keyring**, instead of leaving it behind.
+
+* **Warnings from the socket frontend are logged.** The default log filter now
+  includes `wusel_ipc`.
+
+* **No conflicted copy of your own upload.** When the answer to an upload was
+  lost, the next attempt met the file the first one had created and parked a
+  conflicted copy of Wusel's own bytes. The same bytes are now adopted, and an
+  empty file where one was being created is overwritten on exactly that version;
+  a different file is still a real conflict.
+
+* **Renaming or deleting a new file while it uploads** waits for the upload
+  instead of racing it, so a rename or an atomic save (`sed -i`) of a
+  just-created file lands correctly.
+
+* **Removing the DEB or Arch package removes the sidebar entries of named
+  accounts**, as the RPM already did.
+
+* **Experimental macOS:** a folder created on the server while its parent was
+  open now appears in Finder.
+
 == 0.4.1 — 2026-09-14
 
 === Added
@@ -87,7 +180,7 @@ project uses https://semver.org/[Semantic Versioning].
 * Desktop polish: the launcher no longer says "(Nextcloud)", and the app-grid
   icons are corrected.
 
-== 0.3.2 — 2026-08-27
+== 0.3.2 — 2026-09-02
 
 === Fixed
 
@@ -143,7 +236,7 @@ distributions the build service does not target.
   unaffected, which is why 0.3.0 shipped with two of four distributions quietly
   broken.
 
-== 0.3.0 — 2026-08-25
+== 0.3.0 — 2026-08-26
 
 === Added
 

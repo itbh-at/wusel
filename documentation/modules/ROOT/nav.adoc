@@ -24,6 +24,7 @@
 
 .How-to — working on Wusel
 * xref:how-to/build-a-package.adoc[Build a package]
+* xref:how-to/cut-a-release.adoc[Cut a release]
 * xref:how-to/develop-on-macos.adoc[Develop on macOS]
 
 .Reference
@@ -33,6 +34,7 @@
 * xref:reference/files-and-directories.adoc[Files and directories]
 * xref:reference/platform-support.adoc[Platform support]
 * xref:reference/file-states.adoc[File states]
+* xref:reference/file-attributes.adoc[File attributes]
 * xref:reference/limitations.adoc[Known limitations]
 * xref:reference/operation-scripts.adoc[Operation scripts]
 

@@ -1,0 +1,81 @@
+////
+  // SPDX-License-Identifier: Apache-2.0
+  // Copyright 2026 IT Beratung Hermann GmbH
+////
+
+= File attributes in the mount
+:description: What the mount does with modes, owners, links, extended attributes and locks — which of them are kept, where, and which are refused.
+
+Nextcloud stores a file's name, content, modification time and the server's
+permissions. It stores no POSIX mode, no owner and no extended attributes, so
+the mount answers for those itself. Everything on this page is local to the
+machine the mount runs on and is never sent to the server.
+
+== Modes
+
+[cols="1,3",options="header"]
+|===
+| Bits | Behaviour
+
+| Read and write
+| Follow the server's permissions: `0644` for a file you may change, `0444` for
+  one you may not (a read-only share), `0755` / `0555` for a directory. `chmod`
+  does not change them.
+
+| Executable, on a file
+| Kept in the local state. `chmod +x` makes a file executable, `chmod -x` takes
+  it away, and a file created with the bit (`cp`, `install`, `tar`, `unzip`) has
+  it from the start. Any of the three `x` bits sets it, and the mode then shows
+  all three.
+
+| Executable, on a directory
+| Always set: a directory has to be enterable. `chmod` does not change it.
+
+| setuid, setgid, sticky
+| Not kept.
+|===
+
+The executable bit stays with the file through a rename, an atomic save (`sed
+-i`, editors that write a temporary and rename it over the file), its upload,
+and a newer version arriving from the server. It is lost with the file's local
+record: when the file is deleted and created again, renamed on another device,
+or when `wusel cache clear` drops the folder's metadata.
+
+It is never synchronised. On another machine the same file is not executable
+until it is marked so there, and nothing arriving from the server — from
+another device, a share or the web interface — is ever executable. This is the
+same as the official desktop client.
+
+The kernel checks the mode bits itself, so `test -x` and `access(2)` agree with
+what running the file does.
+
+On the experimental macOS frontend the bit is the File Provider's
+`userExecutable` flag, kept by the same engine state.
+
+== Owner and group
+
+Every entry belongs to the user running the mount. Ownership is never changed.
+The kernel checks a `chown` or `chgrp` before Wusel sees it, as on any Linux
+filesystem: changing the owner to another user fails with `EPERM` unless you are
+root. What the kernel lets through — root, or your own uid and one of your own
+groups — succeeds and changes nothing.
+
+== Links and special files
+
+Symbolic links, hard links, FIFOs, sockets and device nodes have no counterpart
+on the server. Creating one fails with `EPERM`, the error POSIX names for "this
+filesystem does not support this kind of node", and nothing is left behind.
+
+Tools that create links have a switch for such filesystems: `npm install
+--no-bin-links` puts no symbolic links into `node_modules/.bin`, and `git`
+detects the refusal by itself and checks symbolic links out as plain files.
+
+== Extended attributes
+
+Not supported. `getxattr` and `setxattr` fail with `EOPNOTSUPP`, which `cp`,
+`rsync` and file managers treat as "this filesystem has none" and carry on.
+
+== File locks
+
+`flock(2)` and `fcntl(2)` locks work and are local to the machine: another
+device, or the web interface, does not see them.

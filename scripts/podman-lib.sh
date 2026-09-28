@@ -14,8 +14,9 @@
 #  1. The VM sees $REPO as-is (repo under /Users, /private or /var/folders —
 #     podman's standard macOS shares).
 #  2. The repo lives on an extra disk under /Volumes/<disk> that is shared into
-#     the VM at /var/mnt/<disk> (one-time setup, see development.adoc
-#     "Building from an external disk"). Building in place there keeps the
+#     the VM at /var/mnt/<disk> (one-time setup, see
+#     documentation/modules/ROOT/pages/how-to/develop-on-macos.adoc,
+#     "If your checkout is on an external disk"). Building in place there keeps the
 #     build cache off the boot disk and incremental.
 #  3. Fallback: mirror to /private/tmp/wusel-linux via rsync. Container-side
 #     changes never reach the original tree, and podman-build.sh drops the

@@ -29,9 +29,10 @@ override_dh_auto_install:
 	install -Dm755 target/release/wusel debian/wusel/usr/bin/wusel
 	install -Dm644 packaging/rpm/wusel@.service debian/wusel/usr/lib/systemd/user/wusel@.service
 
-	# Extension + emblems at the paths pkg-config reports for *this* system —
-	# same Makefile target the AUR PKGBUILD uses, same reason (see its README).
-	$(MAKE) -C integration/nautilus install DESTDIR=$(CURDIR)/debian/wusel
+	# Extension + emblems, into their own package, at the paths pkg-config
+	# reports for *this* system — same Makefile target the AUR PKGBUILD uses,
+	# same reason (see its README).
+	$(MAKE) -C integration/nautilus install DESTDIR=$(CURDIR)/debian/wusel-nautilus
 
 	install -Dm644 integration/icons/at.itbh.Wusel.svg \
 	    debian/wusel/usr/share/icons/hicolor/scalable/apps/at.itbh.Wusel.svg

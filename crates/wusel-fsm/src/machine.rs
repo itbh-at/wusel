@@ -13,7 +13,7 @@ use std::collections::{HashMap, VecDeque};
 
 use crate::collision::{collision, Collision};
 use crate::registry::{Buffer, Registry};
-use crate::script::{advance, start, Flow, Next};
+use crate::script::{advance, start, Flow, Next, Step};
 use crate::{Completion, Failure, Intent, Job, ObjectId, Request, RequestId};
 
 /// How a flow ended, for everyone who was waiting on it.
@@ -77,6 +77,27 @@ pub enum Action {
         requests: Vec<RequestId>,
         outcome: Outcome,
     },
+}
+
+/// The parent a hand-over keeps parked, when `intent` is one (see
+/// [`Next::Handoff`]); its ending — however it ends — releases that parent.
+fn handed_over_from(intent: &Intent) -> Option<ObjectId> {
+    match intent {
+        Intent::Relocate { from_parent, .. } | Intent::Delete { from_parent } => Some(*from_parent),
+        Intent::Fetch { .. }
+        | Intent::Write { .. }
+        | Intent::Stat
+        | Intent::Lookup { .. }
+        | Intent::State
+        | Intent::SetAttr { .. }
+        | Intent::Enumerate
+        | Intent::Materialise { .. }
+        | Intent::Publish
+        | Intent::Remove { .. }
+        | Intent::Move { .. }
+        | Intent::Refresh
+        | Intent::Relist => None,
+    }
 }
 
 /// The answer an abandoned request is owed: an error the dead caller will never
@@ -148,6 +169,12 @@ pub struct Machine {
     /// asynchronous write-back) or held until the upload actually lands (the
     /// synchronous fallback). Only [`Next::AnswerThen`] reads it.
     async_upload: bool,
+    /// Parents whose hand-over has ended and which are owed their release (see
+    /// [`Next::Handoff`]). Collected rather than released on the spot: the flow
+    /// that ends a hand-over is itself mid-`settle`, and releasing the parent
+    /// there could start work on the very object being settled. Drained at the
+    /// end of each entry point, when every object's bookkeeping is whole again.
+    releases: Vec<ObjectId>,
 }
 
 impl Default for Machine {
@@ -164,6 +191,7 @@ impl Machine {
             beside: HashMap::new(),
             registry: Registry::new(),
             async_upload: true,
+            releases: Vec::new(),
         }
     }
 
@@ -188,6 +216,17 @@ impl Machine {
     #[must_use]
     pub fn is_busy(&self, object: ObjectId) -> bool {
         self.busy.contains_key(&object)
+    }
+
+    /// Every object whose running or parked flow changes state (see
+    /// [`Intent::changes_state`]) — what a listing beside the machine has to
+    /// stay away from. Readers are left out: a directory being browsed must not
+    /// keep its listing from ever being applied.
+    pub fn changing_objects(&self) -> impl Iterator<Item = ObjectId> + '_ {
+        self.busy
+            .iter()
+            .filter(|(_, busy)| busy.flow.intent.changes_state())
+            .map(|(object, _)| *object)
     }
 
     /// A read-only snapshot of what every object is doing.
@@ -224,6 +263,12 @@ impl Machine {
 
     /// A request arrived from a dispatch thread.
     pub fn on_request(&mut self, request: Request) -> Vec<Action> {
+        let mut actions = self.request(request);
+        self.release_ended(&mut actions);
+        actions
+    }
+
+    fn request(&mut self, request: Request) -> Vec<Action> {
         let object = request.object;
 
         if !self.busy.contains_key(&object) {
@@ -300,6 +345,12 @@ impl Machine {
     /// gone — which is how the caller tells a live request from one that had
     /// finished while the abandon message was on its way.
     pub fn abandon(&mut self, request: RequestId) -> Vec<Action> {
+        let mut actions = self.abandon_request(request);
+        self.release_ended(&mut actions);
+        actions
+    }
+
+    fn abandon_request(&mut self, request: RequestId) -> Vec<Action> {
         for (object, busy) in &mut self.busy {
             // Riding along on the running flow.
             if let Some(i) = busy.flow.waiters.iter().position(|w| *w == request) {
@@ -312,7 +363,15 @@ impl Machine {
             // Queued behind the running flow, never started — still parked, so
             // still owed an answer.
             if let Some(i) = busy.queue.iter().position(|r| r.id == request) {
-                busy.queue.remove(i);
+                // A hand-over that never got to run still has its parent parked
+                // on it, and nothing else would ever let that parent go.
+                if let Some(parent) = busy
+                    .queue
+                    .remove(i)
+                    .and_then(|r| handed_over_from(&r.intent))
+                {
+                    self.releases.push(parent);
+                }
                 return vec![answer_interrupted(*object, request)];
             }
         }
@@ -321,6 +380,12 @@ impl Machine {
 
     /// A step finished.
     pub fn on_completion(&mut self, object: ObjectId, completion: Completion) -> Vec<Action> {
+        let mut actions = self.completion(object, completion);
+        self.release_ended(&mut actions);
+        actions
+    }
+
+    fn completion(&mut self, object: ObjectId, completion: Completion) -> Vec<Action> {
         let Some(busy) = self.busy.remove(&object) else {
             // Nothing is running for this object. Reachable only if an executor
             // answers twice; dropping it is the harmless reading.
@@ -458,6 +523,38 @@ impl Machine {
                     );
                     return actions;
                 }
+                Next::Handoff { object: to, intent } => {
+                    debug_assert_ne!(to, object, "a hand-over goes to another object");
+                    // Park this flow — busy, nothing outstanding — until the
+                    // hand-over ends (`release_parked`). For a rename or a delete
+                    // that keeps the directory occupied for the whole operation,
+                    // which is what keeps a background refresh from reconciling a
+                    // listing taken halfway through it.
+                    let waiters = std::mem::take(&mut flow.waiters);
+                    self.busy.insert(
+                        object,
+                        Busy {
+                            flow,
+                            outstanding: None,
+                            queue,
+                        },
+                    );
+                    // The waiters travel under their own tickets, so they are
+                    // answered by the flow that actually does the work — once
+                    // `to` gets round to it, behind whatever it is already doing.
+                    if waiters.is_empty() {
+                        actions.push(Action::Schedule { object: to, intent });
+                    } else {
+                        for id in waiters {
+                            actions.extend(self.request(Request {
+                                id,
+                                object: to,
+                                intent: intent.clone(),
+                            }));
+                        }
+                    }
+                    return actions;
+                }
                 Next::Done | Next::Fail(_) | Next::Abandoned => {
                     // Abandoned normally answers nobody — the flow was given up
                     // *because* whoever wanted it is gone. Anyone still waiting
@@ -469,7 +566,7 @@ impl Machine {
                         Next::Done => Some(Outcome::Ok),
                         Next::Fail(f) => Some(Outcome::Failed(f)),
                         Next::Abandoned => Some(Outcome::Failed(Failure::Interrupted)),
-                        Next::Do(_) | Next::AnswerThen(_) => None,
+                        Next::Do(_) | Next::AnswerThen(_) | Next::Handoff { .. } => None,
                     } {
                         if !flow.waiters.is_empty() {
                             actions.push(Action::Answer {
@@ -485,7 +582,7 @@ impl Machine {
                     // because a failed upload must not fail the rename: the
                     // local rename is already committed, and reporting failure
                     // would tell the kernel it never happened.
-                    if matches!(flow.intent, Intent::Move { .. })
+                    if matches!(flow.intent, Intent::Relocate { .. })
                         && !flow.carry.node.materialised
                         && flow.carry.node.id != ObjectId::default()
                     {
@@ -493,6 +590,11 @@ impl Machine {
                             object: flow.carry.node.id,
                             intent: Intent::Publish,
                         });
+                    }
+                    // A hand-over ending — however it ended — releases the
+                    // directory parked on it.
+                    if let Some(parent) = handed_over_from(&flow.intent) {
+                        self.releases.push(parent);
                     }
                     // A listing that was served past its revalidation interval
                     // owes the next caller a fresher one — beside the machine,
@@ -513,6 +615,34 @@ impl Machine {
                 }
             }
         }
+    }
+
+    /// Release every parent whose hand-over ended during this entry point.
+    ///
+    /// A loop, not a single pass: releasing a parent starts whatever queued
+    /// behind it, and that may itself end a hand-over.
+    fn release_ended(&mut self, actions: &mut Vec<Action>) {
+        while let Some(parent) = self.releases.pop() {
+            actions.extend(self.release_parked(parent));
+        }
+    }
+
+    /// End the flow `parent` is parked on and start whatever queued behind it.
+    ///
+    /// Only a flow parked on a hand-over is ended here — anything else running
+    /// for that object is not ours to cut short, so a release that finds none
+    /// does nothing. Its waiters left with the hand-over, so ending it answers
+    /// nobody; they are answered by the flow that did the work.
+    fn release_parked(&mut self, parent: ObjectId) -> Vec<Action> {
+        let parked = self
+            .busy
+            .get(&parent)
+            .is_some_and(|b| b.flow.step == Step::Handover && b.outstanding.is_none());
+        if !parked {
+            return Vec::new();
+        }
+        let Busy { flow, queue, .. } = self.busy.remove(&parent).expect("checked just above");
+        self.settle(parent, flow, Next::Done, queue)
     }
 
     /// What a finished step means for the buffer bookkeeping.
@@ -555,6 +685,13 @@ impl Machine {
             Job::DiscardBuffer { object } => {
                 self.registry.close(*object);
             }
+            // The upload landed: the buffer's content is on the server as this
+            // version now. If a later step fails and the buffer is kept, the
+            // next upload is based on it — not on the empty "never there" a new
+            // file started from, which would collide with our own file.
+            Job::RecordVersion { object, etag, .. } => {
+                self.registry.set_base_etag(*object, etag);
+            }
             Job::ReadNode { .. }
             | Job::ReadChildren { .. }
             | Job::ReadBuffer { .. }
@@ -564,7 +701,6 @@ impl Machine {
             | Job::BufferSize { .. }
             | Job::Upload { .. }
             | Job::ResolveConflict { .. }
-            | Job::RecordVersion { .. }
             | Job::StoreBlob { .. }
             | Job::HydrateCache { .. }
             | Job::InsertNode { .. }
@@ -576,6 +712,8 @@ impl Machine {
             | Job::MarkPending { .. }
             | Job::ClearPending { .. }
             | Job::SetUploadError { .. }
+            // The executable bit is state only: it travels with no upload.
+            | Job::RecordExec { .. }
             | Job::ReadChild { .. }
             | Job::ReadState { .. } => {}
         }
